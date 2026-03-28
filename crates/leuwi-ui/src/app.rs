@@ -2,16 +2,14 @@ use makepad_widgets::*;
 use arboard::Clipboard;
 
 use crate::tab_manager::{TabManager, SplitDir};
-use crate::terminal_view;
 use crate::menu;
 
 live_design! {
     use link::theme::*;
     use link::widgets::*;
-    // TerminalGrid will be added when custom Makepad draw pipeline is ready
 
     // Dark Green Theme
-    LEUWI_BG      = #x0A1410FF   // opaque dark green (transparency via compositor)
+    LEUWI_BG      = #x0A1410FF
     LEUWI_FG      = #xB8D4CCFF
     LEUWI_GREEN   = #x00FF88FF
     LEUWI_TAB_BG  = #x060F0BFF
@@ -131,7 +129,7 @@ live_design! {
                         terminal_output = <Label> {
                             width: Fill,
                             text: ""
-                            draw_text: { color: (LEUWI_FG), text_style: { font_size: 13.0, line_spacing: 1.5 } }
+                            draw_text: { color: (LEUWI_FG), text_style: { font_size: 13.0 } }
                         }
                     }
 
@@ -151,7 +149,7 @@ live_design! {
                         terminal_output2 = <Label> {
                             width: Fill,
                             text: ""
-                            draw_text: { color: (LEUWI_FG), text_style: { font_size: 13.0, line_spacing: 1.5 } }
+                            draw_text: { color: (LEUWI_FG), text_style: { font_size: 13.0 } }
                         }
                     }
                 }
@@ -228,21 +226,14 @@ impl LeuwiApp {
         if self.initialized { return; }
         self.initialized = true;
 
-        // Remove OS title bar after window appears (GNOME Wayland via XWayland)
         #[cfg(target_os = "linux")]
         {
             std::thread::spawn(|| {
-                // Wait for window to fully initialize
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                // Try multiple times in case window isn't ready yet
-                for _ in 0..5 {
-                    let result = std::process::Command::new("xprop")
-                        .args(["-name", "Leuwi Panjang", "-f", "_MOTIF_WM_HINTS", "32c",
-                               "-set", "_MOTIF_WM_HINTS", "0x2, 0x0, 0x0, 0x0, 0x0"])
-                        .output();
-                    if result.is_ok() { break; }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let _ = std::process::Command::new("xprop")
+                    .args(["-name", "Leuwi Panjang", "-f", "_MOTIF_WM_HINTS", "32c",
+                           "-set", "_MOTIF_WM_HINTS", "0x2, 0x0, 0x0, 0x0, 0x0"])
+                    .output();
             });
         }
 
@@ -387,15 +378,13 @@ impl AppMain for LeuwiApp {
                 if let Some(tabs) = &self.tabs {
                     let tab = tabs.active_tab();
 
-                    // Pane 1
-                    let lines1 = tab.panes[0].render_colored_text();
-                    let text1 = terminal_view::colored_lines_to_text(&lines1);
+                    // Pane 1 text
+                    let text1 = tab.panes[0].render_text();
                     self.ui.label(id!(terminal_output)).set_text(cx, &text1);
 
-                    // Pane 2 (if split)
+                    // Pane 2 text (if split)
                     if tab.is_split() && tab.panes.len() > 1 {
-                        let lines2 = tab.panes[1].render_colored_text();
-                        let text2 = terminal_view::colored_lines_to_text(&lines2);
+                        let text2 = tab.panes[1].render_text();
                         self.ui.label(id!(terminal_output2)).set_text(cx, &text2);
                     }
 
@@ -503,31 +492,11 @@ impl AppMain for LeuwiApp {
                     }
                 }
 
-                // Shift+PageUp/Down = scroll, Shift+Home/End = top/bottom
+                // Shift+PageUp/Down = scroll
                 if ke.modifiers.shift {
                     match ke.key_code {
-                        KeyCode::PageUp => {
-                            if let Some(tabs) = &mut self.tabs {
-                                tabs.active_tab_mut().active_pane_mut().scroll_up(20);
-                            }
-                            return;
-                        }
-                        KeyCode::PageDown => {
-                            if let Some(tabs) = &mut self.tabs {
-                                tabs.active_tab_mut().active_pane_mut().scroll_down(20);
-                            }
-                            return;
-                        }
-                        KeyCode::Home => {
-                            if let Some(tabs) = &mut self.tabs {
-                                tabs.active_tab_mut().active_pane_mut().scroll_up(99999);
-                            }
-                            return;
-                        }
-                        KeyCode::End => {
-                            if let Some(tabs) = &mut self.tabs {
-                                tabs.active_tab_mut().active_pane_mut().scroll_to_bottom();
-                            }
+                        KeyCode::PageUp | KeyCode::PageDown => {
+                            // TODO: scrollback
                             return;
                         }
                         _ => {}
