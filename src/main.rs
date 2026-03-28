@@ -30,8 +30,8 @@ struct Config {
 
 fn default_shell() -> String { std::env::var("SHELL").unwrap_or("/bin/zsh".into()) }
 fn default_font_size() -> f64 { 12.0 }
-fn default_cols() -> usize { 125 }
-fn default_rows() -> usize { 36 }
+fn default_cols() -> usize { 115 }
+fn default_rows() -> usize { 33 }
 fn default_scrollback() -> usize { 5000 }
 fn default_bg() -> String { "#1E1E1E".into() }
 fn default_fg() -> String { "#C5C8C6".into() }
@@ -667,8 +667,8 @@ impl Widget for TermView {
             None => return DrawStep::done(),
         };
 
-        let cw = 8.5_f64;
-        let ch = 18.0_f64;
+        let cw = 9.2_f64;
+        let ch = 20.0_f64;
         let pad_x = 12.0;
         let pad_y = 8.0;
 
@@ -858,6 +858,31 @@ live_design! {
                         draw_text: { color: #x6E7681, text_style: { font_size: 8.5 } }
                     }
                 }
+
+                // Menu panel (hidden, shown on ≡ click)
+                menu_panel = <View> {
+                    visible: false
+                    width: 260, height: Fill
+                    show_bg: true
+                    draw_bg: { color: #x181818 }
+                    flow: Down
+                    padding: { top: 10, left: 14, right: 14 }
+
+                    menu_title = <Label> {
+                        text: "Leuwi Panjang"
+                        draw_text: { color: #x58A6FF, text_style: { font_size: 12.0 } }
+                    }
+                    menu_ver = <Label> {
+                        text: "v0.1.0-dev"
+                        draw_text: { color: #x6E7681, text_style: { font_size: 9.0 } }
+                        margin: { bottom: 10 }
+                    }
+                    menu_content = <Label> {
+                        width: Fill
+                        text: ""
+                        draw_text: { color: #xC5C8C6, text_style: { font_size: 10.0 } }
+                    }
+                }
             }
         }
     }
@@ -875,7 +900,8 @@ pub struct App {
     // Split is now per-tab (stored in TermTab.split)
     #[rust] split_active: bool,
     #[rust] config: Config,
-    #[rust] key_handled: bool,  // prevent double-input from KeyDown+TextInput
+    #[rust] key_handled: bool,
+    #[rust] menu_open: bool,
 }
 
 impl LiveRegister for App {
@@ -1015,9 +1041,9 @@ impl App {
     }
 
     fn handle_resize(&mut self, width: f64, height: f64) {
-        let chrome_h = 32.0 + 20.0; // caption + status bar
-        let cw = 8.5;
-        let ch = 18.0;
+        let chrome_h = 32.0 + 20.0;
+        let cw = 9.2;
+        let ch = 20.0;
         let cols = ((width - 24.0) / cw).max(20.0) as usize;
         let rows = ((height - chrome_h) / ch).max(5.0) as usize;
         for tab in &mut self.tabs {
@@ -1035,6 +1061,50 @@ impl MatchEvent for App {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         if self.ui.button(id!(plus_btn)).clicked(actions) {
             self.new_tab(cx);
+        }
+        if self.ui.button(id!(menu_btn)).clicked(actions) {
+            self.menu_open = !self.menu_open;
+            self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
+            if self.menu_open {
+                let menu = format!(
+"━━━ Terminal ━━━━━━━━━━━━━━━━━━━━
+  New Tab          Ctrl+Shift+T
+  Close Tab        Ctrl+Shift+W
+  Next Tab         Ctrl+Tab
+
+━━━ Split ━━━━━━━━━━━━━━━━━━━━━━
+  Split Vertical   Ctrl+Shift+D
+  Split Horizontal Ctrl+Shift+E
+  Switch Pane      Alt+Left/Right
+
+━━━ Edit ━━━━━━━━━━━━━━━━━━━━━━━
+  Copy             Ctrl+Shift+C
+  Paste            Ctrl+Shift+V
+
+━━━ Config ━━━━━━━━━━━━━━━━━━━━━
+  Shell: {}
+  Font: {}pt
+  Grid: {}x{}
+  Scrollback: {} lines
+  Config: ~/.config/leuwi-panjang/
+
+━━━ About ━━━━━━━━━━━━━━━━━━━━━━
+  Leuwi Panjang Terminal
+  Pure Rust + Makepad
+  github.com/situkangsayur/
+      leuwi-panjang
+  License: GPL-3.0
+
+  Close: Alt+F4  |  Esc: close menu",
+                    self.config.shell,
+                    self.config.font_size,
+                    self.config.cols,
+                    self.config.rows,
+                    self.config.scrollback,
+                );
+                self.ui.label(id!(menu_content)).set_text(cx, &menu);
+            }
+            self.ui.redraw(cx);
         }
     }
 }
@@ -1058,6 +1128,13 @@ impl AppMain for App {
                 self.ui.redraw(cx);
             }
             Event::KeyDown(ke) => {
+                // Escape closes menu
+                if ke.key_code == KeyCode::Escape && self.menu_open {
+                    self.menu_open = false;
+                    self.ui.view(id!(menu_panel)).set_visible(cx, false);
+                    self.ui.redraw(cx);
+                    return;
+                }
                 // Ctrl+Shift shortcuts
                 if ke.modifiers.control && ke.modifiers.shift {
                     match ke.key_code {
@@ -1613,5 +1690,112 @@ mod tests {
         assert_eq!(shift_char('['), '{');
         assert_eq!(shift_char('\\'), '|');
         assert_eq!(shift_char('`'), '~');
+    }
+
+    // ── Background colors ──
+    #[test]
+    fn test_sgr_bg_256() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[48;5;100mX");
+        assert_eq!(g.cells[0][0].bg, 100);
+    }
+
+    #[test]
+    fn test_sgr_bright_bg() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[103mX"); // bright yellow bg
+        assert_eq!(g.cells[0][0].bg, 11);
+    }
+
+    // ── Scrollback rendering ──
+    #[test]
+    fn test_scrollback_content() {
+        let mut g = new_grid(10, 3);
+        g.process(b"A\r\nB\r\nC\r\nD\r\nE");
+        assert!(g.scrollback.len() >= 2);
+        assert_eq!(g.scrollback[0][0].ch, 'A');
+    }
+
+    // ── Erase characters ──
+    #[test]
+    fn test_erase_chars() {
+        let mut g = new_grid(80, 24);
+        g.process(b"ABCDE");
+        g.cur_c = 1;
+        g.process(b"\x1b[2X"); // erase 2 chars from pos 1
+        assert_eq!(g.cells[0][0].ch, 'A');
+        assert_eq!(g.cells[0][1].ch, ' ');
+        assert_eq!(g.cells[0][2].ch, ' ');
+        assert_eq!(g.cells[0][3].ch, 'D');
+    }
+
+    // ── Cursor column absolute ──
+    #[test]
+    fn test_csi_cha() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[15G"); // cursor to column 15
+        assert_eq!(g.cur_c, 14); // 0-based
+    }
+
+    // ── Cursor vertical absolute ──
+    #[test]
+    fn test_csi_vpa() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[10d"); // cursor to row 10
+        assert_eq!(g.cur_r, 9);
+    }
+
+    // ── Newline in scroll region ──
+    #[test]
+    fn test_newline_in_scroll_region() {
+        let mut g = new_grid(80, 10);
+        g.scroll_top = 2;
+        g.scroll_bottom = 5;
+        g.cur_r = 5; // at bottom of scroll region
+        g.process(b"X");
+        g.newline(); // should scroll within region
+        assert_eq!(g.cur_r, 5); // stays at bottom
+    }
+
+    // ── Multiple SGR params ──
+    #[test]
+    fn test_sgr_multiple_params() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[1;31;42mX"); // bold + red fg + green bg
+        assert!(g.cells[0][0].bold);
+        assert_eq!(g.cells[0][0].fg, 1);
+        assert_eq!(g.cells[0][0].bg, 2);
+    }
+
+    // ── Cursor next/prev line ──
+    #[test]
+    fn test_csi_cnl_cpl() {
+        let mut g = new_grid(80, 24);
+        g.cur_r = 5; g.cur_c = 10;
+        g.process(b"\x1b[2E"); // CNL: next 2 lines, col 0
+        assert_eq!(g.cur_r, 7);
+        assert_eq!(g.cur_c, 0);
+        g.process(b"\x1b[3F"); // CPL: prev 3 lines, col 0
+        assert_eq!(g.cur_r, 4);
+        assert_eq!(g.cur_c, 0);
+    }
+
+    // ── Tab stop ──
+    #[test]
+    fn test_tab_alignment() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\tX");
+        assert_eq!(g.cur_c, 9); // tab to 8, X at 8, cur at 9
+    }
+
+    // ── Config toml ──
+    #[test]
+    fn test_config_toml_parse() {
+        let toml_str = "shell = \"/bin/bash\"\nfont_size = 14.0\ncols = 100\nrows = 30\nscrollback = 3000\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.shell, "/bin/bash");
+        assert_eq!(cfg.font_size, 14.0);
+        assert_eq!(cfg.cols, 100);
+        assert_eq!(cfg.scrollback, 3000);
     }
 }
