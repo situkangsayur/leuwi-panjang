@@ -2,14 +2,16 @@ use makepad_widgets::*;
 use arboard::Clipboard;
 
 use crate::tab_manager::{TabManager, SplitDir};
+use crate::terminal_view;
 use crate::menu;
 
 live_design! {
     use link::theme::*;
     use link::widgets::*;
+    // TerminalGrid will be added when custom Makepad draw pipeline is ready
 
     // Dark Green Theme
-    LEUWI_BG      = #x0A1410FF
+    LEUWI_BG      = #x0A1410D9   // 85% opacity (D9 = 217/255 = 0.85)
     LEUWI_FG      = #xB8D4CCFF
     LEUWI_GREEN   = #x00FF88FF
     LEUWI_TAB_BG  = #x060F0BFF
@@ -21,7 +23,6 @@ live_design! {
     TERM_STYLE = {
         font_size: 13.0,
         line_spacing: 1.5,
-        font: { path: dep("crate://makepad-widgets/resources/LiberationMono-Regular.ttf") }
     }
 
     LeuwiTab = <Button> {
@@ -384,13 +385,15 @@ impl AppMain for LeuwiApp {
                 if let Some(tabs) = &self.tabs {
                     let tab = tabs.active_tab();
 
-                    // Pane 1 text
-                    let text1 = tab.panes[0].render_text();
+                    // Pane 1
+                    let lines1 = tab.panes[0].render_colored_text();
+                    let text1 = terminal_view::colored_lines_to_text(&lines1);
                     self.ui.label(id!(terminal_output)).set_text(cx, &text1);
 
-                    // Pane 2 text (if split)
+                    // Pane 2 (if split)
                     if tab.is_split() && tab.panes.len() > 1 {
-                        let text2 = tab.panes[1].render_text();
+                        let lines2 = tab.panes[1].render_colored_text();
+                        let text2 = terminal_view::colored_lines_to_text(&lines2);
                         self.ui.label(id!(terminal_output2)).set_text(cx, &text2);
                     }
 
