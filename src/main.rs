@@ -269,8 +269,12 @@ live_design! {
                     text: ""
                     draw_text: {
                         color: #xC5C8C6
-                        text_style: (THEME_FONT_CODE) {
+                        text_style: {
                             font_size: 11.0
+                            line_spacing: 1.35
+                            font_family: {
+                                latin = font("crate://makepad-widgets/resources/LiberationMono-Regular.ttf", 0.0, 0.0)
+                            }
                         }
                     }
                 }
