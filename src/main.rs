@@ -28,7 +28,7 @@ struct TermGrid {
 }
 
 impl Default for TermGrid {
-    fn default() -> Self { Self::new(140, 38) }
+    fn default() -> Self { Self::new(110, 33) }
 }
 
 impl TermGrid {
@@ -254,8 +254,8 @@ impl Widget for TermView {
             None => return DrawStep::done(),
         };
 
-        let cw = 7.5_f64;   // LiberationMono 12pt cell width
-        let ch = 17.0_f64;  // line height
+        let cw = 9.5_f64;   // wide enough to prevent any overlap
+        let ch = 20.0_f64;  // tall line height for clarity
         let px = rect.pos.x + 12.0;
         let py = rect.pos.y + 8.0;
 
@@ -394,14 +394,15 @@ impl App {
         self.ui.term_view(id!(terminal)).set_grid(self.grid.clone());
 
         let pty_system = portable_pty::native_pty_system();
-        let size = portable_pty::PtySize { rows: 38, cols: 140, pixel_width: 0, pixel_height: 0 };
+        let size = portable_pty::PtySize { rows: 33, cols: 110, pixel_width: 0, pixel_height: 0 };
         let pair = pty_system.openpty(size).unwrap();
 
         let mut cmd = portable_pty::CommandBuilder::new("/bin/zsh");
         cmd.args(["--no-globalrcs", "--no-rcs"]);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        // Simple prompt
+        // Simple prompt — both PS1 and PROMPT for bash/zsh compat
+        cmd.env("PROMPT", "$ ");
         cmd.env("PS1", "$ ");
         cmd.env("RPROMPT", "");
         cmd.env("LS_COLORS", "di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=33;40:cd=33;40:*.tar=1;31:*.gz=1;31:*.zip=1;31:*.jpg=1;35:*.png=1;35:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.toml=33:*.json=33:*.md=37:*.sh=32");
