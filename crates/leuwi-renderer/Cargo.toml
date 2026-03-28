@@ -7,6 +7,5 @@ license.workspace = true
 
 [dependencies]
 leuwi-terminal = { workspace = true }
-makepad-widgets = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

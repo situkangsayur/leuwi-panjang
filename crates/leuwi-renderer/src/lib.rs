@@ -4,9 +4,7 @@
 // Each cell is drawn as a colored rectangle (background) + text glyph.
 // The cursor, selection, and decorations are overlaid.
 
-use makepad_widgets::*;
-use leuwi_terminal::{Grid, Cell};
-use leuwi_terminal::cell::Color as TermColor;
+// Renderer stub — rendering now handled by VTE widget in GTK4
 
 live_design! {
     use link::theme::*;
