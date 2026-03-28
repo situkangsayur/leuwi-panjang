@@ -215,6 +215,13 @@ struct TermGrid {
     // Scroll region
     scroll_top: usize,
     scroll_bottom: usize,
+    // Selection (mouse drag)
+    sel_start: Option<(usize, usize)>, // (row, col)
+    sel_end: Option<(usize, usize)>,
+    // Window title from OSC
+    title: String,
+    // Bell flag
+    bell: bool,
 }
 
 impl Default for TermGrid {
@@ -232,6 +239,8 @@ impl TermGrid {
             alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
             saved_cur_r: 0, saved_cur_c: 0,
             scroll_top: 0, scroll_bottom: rows.saturating_sub(1),
+            sel_start: None, sel_end: None,
+            title: String::new(), bell: false,
         }
     }
 
@@ -345,6 +354,52 @@ impl TermGrid {
             }
         }
         results
+    }
+
+    fn start_select(&mut self, row: usize, col: usize) {
+        self.sel_start = Some((row, col));
+        self.sel_end = None;
+    }
+
+    fn update_select(&mut self, row: usize, col: usize) {
+        self.sel_end = Some((row, col));
+    }
+
+    fn get_selection_text(&self) -> Option<String> {
+        let (s, e) = match (self.sel_start, self.sel_end) {
+            (Some(s), Some(e)) => if s.0 < e.0 || (s.0 == e.0 && s.1 <= e.1) { (s, e) } else { (e, s) },
+            _ => return None,
+        };
+        let mut text = String::new();
+        let all_rows: Vec<&Vec<Cell>> = self.scrollback.iter().chain(self.cells.iter()).collect();
+        for r in s.0..=e.0.min(all_rows.len().saturating_sub(1)) {
+            let cs = if r == s.0 { s.1 } else { 0 };
+            let ce = if r == e.0 { e.1 } else { all_rows[r].len().saturating_sub(1) };
+            for c in cs..=ce.min(all_rows[r].len().saturating_sub(1)) {
+                let ch = all_rows[r][c].ch;
+                text.push(if ch == ' ' || ch == '\0' { ' ' } else { ch });
+            }
+            if r < e.0 { text.push('\n'); }
+        }
+        let trimmed = text.trim_end().to_string();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    }
+
+    fn clear_select(&mut self) {
+        self.sel_start = None;
+        self.sel_end = None;
+    }
+
+    fn is_selected(&self, abs_row: usize, col: usize) -> bool {
+        let (s, e) = match (self.sel_start, self.sel_end) {
+            (Some(s), Some(e)) => if s.0 < e.0 || (s.0 == e.0 && s.1 <= e.1) { (s, e) } else { (e, s) },
+            _ => return false,
+        };
+        if abs_row < s.0 || abs_row > e.0 { return false; }
+        if abs_row == s.0 && abs_row == e.0 { return col >= s.1 && col <= e.1; }
+        if abs_row == s.0 { return col >= s.1; }
+        if abs_row == e.0 { return col <= e.1; }
+        true
     }
 
     fn render(&self) -> String {
@@ -572,7 +627,22 @@ impl TermGrid {
                                 i += 1; break;
                             }
                         }
-                        b']' => { i += 1; while i < data.len() { if data[i] == 0x07 { i += 1; break; } if data[i] == 0x1b { i += 2; break; } i += 1; } }
+                        b']' => {
+                            // OSC — parse title (OSC 0;title BEL or OSC 2;title BEL)
+                            i += 1;
+                            let mut osc_data = Vec::new();
+                            while i < data.len() {
+                                if data[i] == 0x07 { i += 1; break; }
+                                if data[i] == 0x1b && i+1 < data.len() && data[i+1] == b'\\' { i += 2; break; }
+                                osc_data.push(data[i]);
+                                i += 1;
+                            }
+                            if let Ok(s) = std::str::from_utf8(&osc_data) {
+                                if s.starts_with("0;") || s.starts_with("2;") {
+                                    self.title = s[2..].to_string();
+                                }
+                            }
+                        }
                         b'P' | b'_' | b'^' => { i += 1; while i < data.len() { if data[i] == 0x1b { i += 2; break; } if data[i] == 0x07 { i += 1; break; } i += 1; } }
                         b'(' | b')' | b'*' | b'+' => { i += 1; if i < data.len() { i += 1; } }
                         b'7' => { self.save_cursor(); }     // DECSC
@@ -592,7 +662,8 @@ impl TermGrid {
                 b'\r' => { self.cr(); i += 1; }
                 b'\x08' => { self.bs(); i += 1; }
                 b'\t' => { self.tab(); i += 1; }
-                0x00..=0x06 | 0x07 | 0x0e..=0x1a | 0x1c..=0x1f => { i += 1; }
+                0x07 => { self.bell = true; i += 1; } // BEL
+                0x00..=0x06 | 0x0e..=0x1a | 0x1c..=0x1f => { i += 1; }
                 _ => {
                     if data[i] < 0x80 { self.put(data[i] as char); i += 1; }
                     else {
@@ -664,11 +735,45 @@ pub struct TermView {
 
 impl Widget for TermView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
-        // Mouse wheel = scroll
-        if let Event::Scroll(se) = event {
-            let lines = (-se.scroll.y / 20.0) as i64;  // natural scroll (inverted)
-            self.scroll_offset = (self.scroll_offset + lines).max(0);
-            self.redraw(cx);
+        match event {
+            Event::Scroll(se) => {
+                let lines = (-se.scroll.y / 20.0) as i64;
+                self.scroll_offset = (self.scroll_offset + lines).max(0);
+                self.redraw(cx);
+            }
+            Event::MouseDown(me) => {
+                let cw = 9.2_f64;
+                let ch = 20.0_f64;
+                let col = ((me.abs.x - 12.0) / cw).max(0.0) as usize;
+                let screen_row = ((me.abs.y - 8.0) / ch).max(0.0) as usize;
+                if let Some(grid) = &self.grid_ref {
+                    let mut g = grid.lock().unwrap();
+                    let sb = g.scrollback.len();
+                    let view_rows = (g.rows).min(sb + g.rows);
+                    let start = (sb + g.rows).saturating_sub(view_rows + self.scroll_offset as usize);
+                    let abs_row = (start + screen_row).min(sb + g.rows - 1);
+                    let max_col = g.cols.saturating_sub(1);
+                    g.start_select(abs_row, col.min(max_col));
+                }
+                self.redraw(cx);
+            }
+            Event::MouseMove(me) => {
+                let cw = 9.2_f64;
+                let ch = 20.0_f64;
+                let col = ((me.abs.x - 12.0) / cw).max(0.0) as usize;
+                let screen_row = ((me.abs.y - 8.0) / ch).max(0.0) as usize;
+                if let Some(grid) = &self.grid_ref {
+                    let mut g = grid.lock().unwrap();
+                    let sb = g.scrollback.len();
+                    let view_rows = g.rows;
+                    let start = (sb + g.rows).saturating_sub(view_rows + self.scroll_offset as usize);
+                    let abs_row = (start + screen_row).min(sb + g.rows - 1);
+                    let max_col = g.cols.saturating_sub(1);
+                    g.update_select(abs_row, col.min(max_col));
+                }
+                self.redraw(cx);
+            }
+            _ => {}
         }
     }
 
@@ -726,14 +831,22 @@ impl Widget for TermView {
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
 
-                // Draw bg color if not default
-                if cell.bg != 255 {
+                // Selection highlight
+                let selected = grid.is_selected(abs_row, c);
+                if selected {
+                    self.draw_cursor.color = vec4(0.20, 0.40, 0.65, 0.6); // blue selection
+                    self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
+                }
+                // Draw bg color
+                else if cell.bg != 255 {
                     self.draw_cursor.color = ansi_to_vec4(cell.bg);
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
                 }
 
                 if cell.ch == ' ' { continue; }
-                self.draw_text.color = ansi_to_vec4(cell.fg);
+                // Bold = use bright variant (add 8 to color index if basic color)
+                let fg_idx = if cell.bold && cell.fg < 8 { cell.fg + 8 } else { cell.fg };
+                self.draw_text.color = ansi_to_vec4(fg_idx);
                 let s = cell.ch.encode_utf8(&mut char_buf);
                 self.draw_text.draw_abs(cx, dvec2(x, y), s);
             }
@@ -1017,7 +1130,10 @@ impl App {
 
     fn copy_to_clipboard(&self) {
         if let Some(tab) = self.tabs.get(self.active_tab) {
-            let text = tab.get_selected_text();
+            let grid = tab.grid.lock().unwrap();
+            // Try selection first, fallback to all visible text
+            let text = grid.get_selection_text().unwrap_or_else(|| grid.render());
+            drop(grid);
             if !text.is_empty() {
                 if let Ok(mut cb) = Clipboard::new() { let _ = cb.set_text(&text); }
             }
