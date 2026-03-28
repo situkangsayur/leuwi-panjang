@@ -21,16 +21,70 @@ fn load_css() {
     let provider = CssProvider::new();
     provider.load_from_data(
         r#"
-        window { background-color: rgba(10, 20, 16, 0.85); color: #B8D4CC; }
-        .header-custom { background-color: #060F0B; min-height: 34px; border-bottom: 1px solid #1A3A28; }
-        .header-custom button { color: #5C8A72; background: transparent; border: none; min-height: 28px; padding: 2px 8px; }
-        .header-custom button:hover { background-color: #0D1F17; color: #B8D4CC; }
-        .close-btn:hover { background-color: rgba(233, 69, 96, 0.5); }
-        notebook header { background-color: #060F0B; border: none; }
-        notebook header tab { background-color: #060F0B; color: #5C8A72; border: none; padding: 4px 14px; }
-        notebook header tab:checked { background-color: #0A1410; color: #B8D4CC; border-bottom: 2px solid #00FF88; }
-        notebook header tab:hover { background-color: #0D1F17; }
-        .status-bar { background-color: #060F0B; color: #5C8A72; padding: 2px 12px; font-size: 10px; border-top: 1px solid #1A3A28; }
+        window {
+            background-color: rgba(10, 20, 16, 0.85);
+            color: #B8D4CC;
+            border-radius: 12px;
+        }
+        window > box {
+            border-radius: 12px;
+        }
+        .header-custom {
+            background-color: #060F0B;
+            min-height: 34px;
+            border-bottom: 1px solid #1A3A28;
+            border-radius: 12px 12px 0 0;
+        }
+        .header-custom button {
+            color: #5C8A72;
+            background: transparent;
+            border: none;
+            min-height: 28px;
+            padding: 2px 10px;
+            border-radius: 6px;
+        }
+        .header-custom button:hover {
+            background-color: #0D1F17;
+            color: #B8D4CC;
+        }
+        .close-btn:hover {
+            background-color: rgba(233, 69, 96, 0.5);
+            border-radius: 6px;
+        }
+        notebook header {
+            background-color: #060F0B;
+            border: none;
+        }
+        notebook header tab {
+            background-color: #060F0B;
+            color: #5C8A72;
+            border: none;
+            padding: 4px 14px;
+            border-radius: 8px 8px 0 0;
+            margin: 2px 1px 0 1px;
+        }
+        notebook header tab:checked {
+            background-color: #0A1410;
+            color: #B8D4CC;
+            border-bottom: 2px solid #00FF88;
+        }
+        notebook header tab:hover {
+            background-color: #0D1F17;
+        }
+        notebook header tab button {
+            min-height: 16px;
+            min-width: 16px;
+            padding: 0;
+            border-radius: 4px;
+        }
+        .status-bar {
+            background-color: #060F0B;
+            color: #5C8A72;
+            padding: 2px 12px;
+            font-size: 10px;
+            border-top: 1px solid #1A3A28;
+            border-radius: 0 0 12px 12px;
+        }
         .status-green { color: #00FF88; }
         "#,
     );
