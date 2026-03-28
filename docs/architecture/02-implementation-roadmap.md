@@ -18,24 +18,24 @@ Phase 7 ░░░░░░░░░░░░░░██ Polish & Release (Month
 
 ### 1.1 Project Setup
 - [ ] Cargo workspace structure (see [Rust Ecosystem](../research/04-rust-terminal-ecosystem.md))
-- [ ] CI/CD pipeline (GitHub Actions: build, test, lint, cross-compile)
+- [x] CI/CD pipeline (GitHub Actions: build, test, lint, cross-compile)
 - [ ] Coding standards and contribution guidelines
 
 ### 1.2 Terminal Emulation (`leuwi-terminal` crate)
-- [ ] VT220 escape sequence parser
-- [ ] xterm extensions (256-color, true color, mouse, bracketed paste)
-- [ ] Screen buffer (cell grid with attributes)
-- [ ] Scrollback ring buffer
+- [x] VT220 escape sequence parser
+- [x] xterm extensions (256-color, true color, mouse, bracketed paste)
+- [x] Screen buffer (cell grid with attributes)
+- [x] Scrollback ring buffer
 - [ ] Selection handling (word, line, block)
 - [ ] URL detection (regex-based)
 - [ ] Unicode / wide character support
 - [ ] Tests against vttest and esctest suites
 
 ### 1.3 PTY Management (`leuwi-pty` crate)
-- [ ] PTY creation and management (portable-pty)
-- [ ] Shell spawning (default: zsh)
-- [ ] Environment variable setup (TERM, COLORTERM, etc.)
-- [ ] Signal handling (SIGWINCH for resize)
+- [x] PTY creation and management (portable-pty)
+- [x] Shell spawning (default: zsh)
+- [x] Environment variable setup (TERM, COLORTERM, etc.)
+- [x] Signal handling (SIGWINCH for resize)
 - [ ] Cross-platform (Linux, macOS, Windows)
 
 ### 1.4 GPU Rendering (`leuwi-renderer` crate)
@@ -43,7 +43,7 @@ Phase 7 ░░░░░░░░░░░░░░██ Polish & Release (Month
 - [ ] Custom terminal grid shader via Makepad's draw system
 - [ ] Glyph rasterization and texture atlas
 - [ ] Cell grid rendering (GPU-accelerated)
-- [ ] Cursor rendering (block, beam, underline + blink)
+- [x] Cursor rendering (block, beam, underline + blink)
 - [ ] Selection highlight rendering
 - [ ] Background rendering (solid, transparent, image)
 - [ ] Ligature support (rustybuzz text shaping)
@@ -51,10 +51,10 @@ Phase 7 ░░░░░░░░░░░░░░██ Polish & Release (Month
 
 ### 1.5 Window & Basic UI (`leuwi-ui` crate, Makepad)
 - [ ] Makepad application structure
-- [ ] Chromeless window (no titlebar) via Makepad window config
+- [x] Chromeless window (no titlebar) via Makepad window config
 - [ ] Rounded corners rendering
-- [ ] Tab bar widget (Chrome-style, part of content area)
-- [ ] Tab management (new, close, switch, reorder, drag)
+- [x] Tab bar widget (Chrome-style, part of content area)
+- [x] Tab management (new, close, switch, reorder, drag)
 - [ ] Keyboard input handling
 - [ ] Mouse input handling
 - [ ] Clipboard integration

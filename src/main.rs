@@ -1256,10 +1256,10 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        if self.ui.button(id!(plus_btn)).clicked(actions) {
+        if self.ui.button(id!(plus_btn)).clicked(&actions) {
             self.new_tab(cx);
         }
-        if self.ui.button(id!(menu_btn)).clicked(actions) {
+        if self.ui.button(id!(menu_btn)).clicked(&actions) {
             self.menu_open = !self.menu_open;
             self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
             if self.menu_open {
@@ -1332,6 +1332,54 @@ impl AppMain for App {
                 );
                 self.ui.label(id!(status_text)).set_text(cx, &tab_info);
                 self.ui.redraw(cx);
+            }
+            Event::Actions(actions) => {
+                if self.ui.button(id!(plus_btn)).clicked(&actions) {
+                    self.new_tab(cx);
+                }
+                if self.ui.button(id!(menu_btn)).clicked(&actions) {
+                    self.menu_open = !self.menu_open;
+                    self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
+                    if self.menu_open {
+                        let menu = format!(
+"━━━ Terminal ━━━━━━━━━━━━━━━━━━━━
+  New Tab          Ctrl+Shift+T
+  Close Tab        Ctrl+Shift+W
+  Next Tab         Ctrl+Tab
+
+━━━ Split ━━━━━━━━━━━━━━━━━━━━━━
+  Split Vertical   Ctrl+Shift+D
+  Split Horizontal Ctrl+Shift+E
+  Switch Pane      Alt+Left/Right
+
+━━━ Edit ━━━━━━━━━━━━━━━━━━━━━━━
+  Copy             Ctrl+Shift+C
+  Paste            Ctrl+Shift+V
+  Select All       Ctrl+Shift+A
+
+━━━ Config ━━━━━━━━━━━━━━━━━━━━━
+  Shell: {}
+  Font: {}pt | Cell: {}x{}
+  Grid: {}x{} | Scrollback: {}
+  Cursor: {} | Opacity: {}
+  ~/.config/leuwi-panjang/config.toml
+
+━━━ About ━━━━━━━━━━━━━━━━━━━━━━
+  Leuwi Panjang Terminal v0.1.0
+  Pure Rust + Makepad | GPL-3.0
+  github.com/situkangsayur/
+    leuwi-panjang
+
+  Esc: close menu | Alt+F4: quit",
+                            self.config.shell, self.config.font_size,
+                            self.config.cell_width, self.config.cell_height,
+                            self.config.cols, self.config.rows, self.config.scrollback,
+                            self.config.cursor_style, self.config.opacity,
+                        );
+                        self.ui.label(id!(menu_content)).set_text(cx, &menu);
+                    }
+                    self.ui.redraw(cx);
+                }
             }
             Event::KeyDown(ke) => {
                 // Escape closes menu
