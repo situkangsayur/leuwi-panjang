@@ -61,8 +61,33 @@ impl TermTab {
 
     fn get_selected_text(&self) -> String {
         let grid = self.grid.lock().unwrap();
-        // Return all visible text for now
         grid.render()
+    }
+
+    /// Get dynamic title from current prompt line (last line with content)
+    fn dynamic_title(&self) -> String {
+        let grid = self.grid.lock().unwrap();
+        // Find current prompt line — extract CWD from it
+        for r in (0..grid.rows).rev() {
+            let line: String = grid.cells[r].iter().map(|c| if c.ch == ' ' { ' ' } else { c.ch }).collect();
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            // Look for pattern: user@host /path %
+            if let Some(at_pos) = trimmed.find('@') {
+                if let Some(space_after) = trimmed[at_pos..].find(' ') {
+                    let after = &trimmed[at_pos + space_after + 1..];
+                    let path = after.split(' ').next().unwrap_or("~");
+                    // Get last component of path
+                    let name = path.rsplit('/').next().unwrap_or(path);
+                    if name.is_empty() || name == "%" || name == "$" {
+                        return path.to_string();
+                    }
+                    return name.to_string();
+                }
+            }
+            break;
+        }
+        self.title.clone()
     }
 }
 
@@ -408,6 +433,16 @@ impl TermViewRef {
             inner.scroll_offset = 0;
         }
     }
+    fn set_visible(&self, cx: &mut Cx, visible: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.walk = if visible {
+                Walk { width: Size::Fill, height: Size::Fill, ..inner.walk }
+            } else {
+                Walk { width: Size::Fixed(0.0), height: Size::Fixed(0.0), ..inner.walk }
+            };
+            inner.redraw(cx);
+        }
+    }
 }
 
 // ── Makepad App ────────────────────────────────────────────
@@ -471,10 +506,19 @@ live_design! {
             }
             window_menu = <WindowMenu> { main = Main { items: [] } }
             body = <View> {
-                width: Fill, height: Fill
+                width: Fill, height: Fill, flow: Right
                 show_bg: true
                 draw_bg: { color: #x1E1E1E }
                 terminal = <TermView> {}
+                split_bar = <View> {
+                    visible: false
+                    width: 2, height: Fill
+                    show_bg: true
+                    draw_bg: { color: #x333333 }
+                }
+                terminal2 = <TermView> {
+                    width: 0, height: 0
+                }
             }
         }
     }
@@ -489,6 +533,8 @@ pub struct App {
     #[rust] active_tab: usize,
     #[rust] started: bool,
     #[rust] tab_counter: usize,
+    #[rust] split_tab: Option<TermTab>,  // second pane (split)
+    #[rust] split_active: bool,          // is right pane focused
 }
 
 impl LiveRegister for App {
@@ -536,10 +582,39 @@ impl App {
 
     fn update_tab_label(&mut self, cx: &mut Cx) {
         let labels: Vec<String> = self.tabs.iter().enumerate().map(|(i, t)| {
-            if i == self.active_tab { format!(" ● {} ", t.title) } else { format!("   {}  ", t.title) }
+            let name = t.dynamic_title();
+            if i == self.active_tab {
+                format!(" ● {} ", name)
+            } else {
+                format!("   {}  ", name)
+            }
         }).collect();
         let text = labels.join("│");
         self.ui.button(id!(tab1)).set_text(cx, &text);
+    }
+
+    fn split_vertical(&mut self, cx: &mut Cx) {
+        if self.split_tab.is_some() { return; }
+        self.tab_counter += 1;
+        let tab = TermTab::spawn(self.tab_counter);
+        self.ui.term_view(id!(terminal2)).set_grid(tab.grid.clone());
+        self.split_tab = Some(tab);
+        self.split_active = true;
+        self.ui.view(id!(split_bar)).set_visible(cx, true);
+        self.ui.term_view(id!(terminal2)).set_visible(cx, true);
+    }
+
+    fn close_split(&mut self, cx: &mut Cx) {
+        self.split_tab = None;
+        self.split_active = false;
+        self.ui.view(id!(split_bar)).set_visible(cx, false);
+        self.ui.term_view(id!(terminal2)).set_visible(cx, false);
+    }
+
+    fn toggle_split_focus(&mut self) {
+        if self.split_tab.is_some() {
+            self.split_active = !self.split_active;
+        }
     }
 
     fn copy_to_clipboard(&self) {
@@ -579,15 +654,26 @@ impl AppMain for App {
         self.ui.handle_event(cx, event, &mut Scope::empty());
         match event {
             Event::Startup => { self.init(cx); }
-            Event::Timer(_) => { self.ui.redraw(cx); }
+            Event::Timer(_) => {
+                self.update_tab_label(cx);
+                self.ui.redraw(cx);
+            }
             Event::KeyDown(ke) => {
                 // Ctrl+Shift shortcuts
                 if ke.modifiers.control && ke.modifiers.shift {
                     match ke.key_code {
                         KeyCode::KeyT => { self.new_tab(cx); return; }
-                        KeyCode::KeyW => { self.close_active_tab(cx); return; }
+                        KeyCode::KeyW => {
+                            if self.split_tab.is_some() && self.split_active {
+                                self.close_split(cx);
+                            } else {
+                                self.close_active_tab(cx);
+                            }
+                            return;
+                        }
                         KeyCode::KeyC => { self.copy_to_clipboard(); return; }
                         KeyCode::KeyV => { self.paste_from_clipboard(); return; }
+                        KeyCode::KeyD => { self.split_vertical(cx); return; }
                         _ => {}
                     }
                 }
@@ -596,12 +682,30 @@ impl AppMain for App {
                     self.next_tab(cx);
                     return;
                 }
-                // Forward to active tab PTY
-                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    let b = key_to_bytes(ke);
-                    if !b.is_empty() { tab.write(&b); }
-                    // Reset scroll to bottom on keypress
-                    self.ui.term_view(id!(terminal)).reset_scroll();
+                // Alt+Arrow = switch panes
+                if ke.modifiers.alt {
+                    match ke.key_code {
+                        KeyCode::ArrowLeft | KeyCode::ArrowRight => {
+                            self.toggle_split_focus();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                // Forward to active pane PTY
+                let b = key_to_bytes(ke);
+                if !b.is_empty() {
+                    if self.split_active {
+                        if let Some(tab) = &mut self.split_tab {
+                            tab.write(&b);
+                            self.ui.term_view(id!(terminal2)).reset_scroll();
+                        }
+                    } else {
+                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                            tab.write(&b);
+                            self.ui.term_view(id!(terminal)).reset_scroll();
+                        }
+                    }
                 }
             }
             _ => {}
