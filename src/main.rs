@@ -28,7 +28,7 @@ struct TermGrid {
 }
 
 impl Default for TermGrid {
-    fn default() -> Self { Self::new(130, 36) }
+    fn default() -> Self { Self::new(140, 38) }
 }
 
 impl TermGrid {
@@ -254,8 +254,8 @@ impl Widget for TermView {
             None => return DrawStep::done(),
         };
 
-        let cw = 8.0_f64;   // wider for JetBrainsMono 11pt
-        let ch = 18.0_f64;  // taller line height
+        let cw = 7.5_f64;   // LiberationMono 12pt cell width
+        let ch = 17.0_f64;  // line height
         let px = rect.pos.x + 12.0;
         let py = rect.pos.y + 8.0;
 
@@ -341,10 +341,10 @@ live_design! {
         draw_text: {
             color: #xC5C8C6
             text_style: {
-                font_size: 11.0
-                line_spacing: 1.35
+                font_size: 12.0
+                line_spacing: 1.3
                 font_family: {
-                    latin = font("crate://self/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf", 0.0, 0.0)
+                    latin = font("crate://makepad-widgets/resources/LiberationMono-Regular.ttf", 0.0, 0.0)
                 }
             }
         }
@@ -421,15 +421,15 @@ impl App {
         self.ui.term_view(id!(terminal)).set_grid(self.grid.clone());
 
         let pty_system = portable_pty::native_pty_system();
-        let size = portable_pty::PtySize { rows: 36, cols: 130, pixel_width: 0, pixel_height: 0 };
+        let size = portable_pty::PtySize { rows: 38, cols: 140, pixel_width: 0, pixel_height: 0 };
         let pair = pty_system.openpty(size).unwrap();
 
         let mut cmd = portable_pty::CommandBuilder::new("/bin/zsh");
         cmd.args(["--no-globalrcs", "--no-rcs"]);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        // Colored prompt: green user, cyan host, yellow dir
-        cmd.env("PROMPT", "%F{2}%n%f@%F{6}%m%f %F{3}%~%f %# ");
+        // Simple white prompt — no colors in prompt itself
+        cmd.env("PROMPT", "%n@%m %~ %# ");
         cmd.env("RPROMPT", "");
         cmd.env("LS_COLORS", "di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=33;40:cd=33;40:*.tar=1;31:*.gz=1;31:*.zip=1;31:*.jpg=1;35:*.png=1;35:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.toml=33:*.json=33:*.md=37:*.sh=32");
         cmd.env("CLICOLOR", "1");
