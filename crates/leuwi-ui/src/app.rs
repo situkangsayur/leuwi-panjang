@@ -1,53 +1,53 @@
 use makepad_widgets::*;
-use leuwi_terminal::TerminalSession;
 use arboard::Clipboard;
+
+use crate::tab_manager::{TabManager, SplitDir};
+use crate::menu;
 
 live_design! {
     use link::theme::*;
     use link::widgets::*;
 
-    // Leuwi Panjang Dark Green Theme
-    LEUWI_BG      = #x0A1410FF   // deep dark green-black
-    LEUWI_FG      = #xB8D4CCFF   // light green-tinted gray text
-    LEUWI_GREEN   = #x00FF88FF   // bright neon green accent
-    LEUWI_DIM_GRN = #x1B6B3FFF   // dim green
-    LEUWI_TAB_BG  = #x060F0BFF   // tab bar background (darkest green-black)
-    LEUWI_TAB_ACT = #x0A1410FF   // active tab (same as bg)
-    LEUWI_BORDER  = #x1A3A28FF   // subtle green border
-    LEUWI_DIM     = #x5C8A72FF   // dim green-gray text
-    LEUWI_HOVER   = #x0D1F17FF   // hover state (slightly lighter green-dark)
+    // Dark Green Theme
+    LEUWI_BG      = #x0A1410FF
+    LEUWI_FG      = #xB8D4CCFF
+    LEUWI_GREEN   = #x00FF88FF
+    LEUWI_TAB_BG  = #x060F0BFF
+    LEUWI_TAB_ACT = #x0A1410FF
+    LEUWI_BORDER  = #x1A3A28FF
+    LEUWI_DIM     = #x5C8A72FF
+    LEUWI_HOVER   = #x0D1F17FF
 
-    // Terminal monospace text style
-    TERMINAL_TEXT_STYLE = {
+    TERM_STYLE = {
         font_size: 13.0,
         line_spacing: 1.5,
-        // Uses system monospace font (JetBrainsMono Nerd Font if available)
         font: { path: dep("crate://makepad-widgets/resources/LiberationMono-Regular.ttf") }
     }
 
-    // Tab button with visible text
     LeuwiTab = <Button> {
-        width: Fit,
-        height: Fill,
-        padding: { left: 16, right: 16, top: 0, bottom: 0 },
+        width: Fit, height: Fill,
+        padding: { left: 14, right: 14 },
         margin: { right: 1 },
         draw_bg: {
             color: (LEUWI_TAB_ACT)
-            instance hover: 0.0
-            fn pixel(self) -> vec4 {
-                return self.color;
-            }
+            fn pixel(self) -> vec4 { return self.color; }
         }
-        draw_text: {
-            color: (LEUWI_FG)
-            text_style: { font_size: 10.0 }
-        }
+        draw_text: { color: (LEUWI_FG), text_style: { font_size: 10.0 } }
     }
 
-    // Small text button
+    LeuwiTabInactive = <Button> {
+        width: Fit, height: Fill,
+        padding: { left: 14, right: 14 },
+        margin: { right: 1 },
+        draw_bg: {
+            color: (LEUWI_TAB_BG)
+            fn pixel(self) -> vec4 { return self.color; }
+        }
+        draw_text: { color: (LEUWI_DIM), text_style: { font_size: 10.0 } }
+    }
+
     LeuwiSmallBtn = <Button> {
-        width: 36,
-        height: Fill,
+        width: 36, height: Fill,
         padding: { left: 6, right: 6 },
         draw_bg: {
             color: #x00000000
@@ -55,10 +55,7 @@ live_design! {
                 return mix(self.color, #x30363D40, self.hover);
             }
         }
-        draw_text: {
-            color: (LEUWI_DIM)
-            text_style: { font_size: 12.0 }
-        }
+        draw_text: { color: (LEUWI_DIM), text_style: { font_size: 12.0 } }
     }
 
     LeuwiApp = {{LeuwiApp}} {
@@ -71,62 +68,45 @@ live_design! {
             },
             draw_bg: { color: (LEUWI_BG) }
 
-            // Hide the default Makepad menu
-            window_menu = <WindowMenu> {
-                main = Main { items: [] }
-            }
+            window_menu = <WindowMenu> { main = Main { items: [] } }
 
-            // Caption bar = our tab bar (Chrome-style)
-            // Override default to remove "Makepad" label
             caption_bar = <SolidView> {
                 visible: true,
                 flow: Right,
                 height: 34,
                 draw_bg: { color: (LEUWI_TAB_BG) }
 
-                // Override: hide default "Makepad" label completely
-                caption_label = <View> {
-                    visible: false,
-                    width: 0, height: 0,
-                }
+                caption_label = <View> { visible: false, width: 0, height: 0 }
 
-                // === Tabs (left) ===
                 tabs_area = <View> {
-                    width: Fill,
-                    height: Fill,
+                    width: Fill, height: Fill,
                     flow: Right,
                     align: { y: 1.0 },
                     padding: { left: 8, top: 4 },
 
-                    tab1 = <LeuwiTab> {
-                        text: "  Terminal 1  "
-                    }
+                    tab1 = <LeuwiTab> { text: " Terminal 1 " }
+                    tab2 = <LeuwiTabInactive> { visible: false, text: " Terminal 2 " }
+                    tab3 = <LeuwiTabInactive> { visible: false, text: " Terminal 3 " }
+                    tab4 = <LeuwiTabInactive> { visible: false, text: " Terminal 4 " }
+                    tab5 = <LeuwiTabInactive> { visible: false, text: " Terminal 5 " }
 
                     new_tab_btn = <LeuwiSmallBtn> {
-                        width: 30,
+                        width: 28,
                         text: "+"
-                        draw_text: {
-                            color: (LEUWI_DIM)
-                            text_style: { font_size: 16.0 }
-                        }
+                        draw_text: { color: (LEUWI_DIM), text_style: { font_size: 16.0 } }
                     }
                 }
 
-                // === Right side: menu + window controls ===
                 right_controls = <View> {
-                    width: Fit,
-                    height: Fill,
+                    width: Fit, height: Fill,
                     flow: Right,
                     align: { y: 0.5 },
 
                     menu_btn = <LeuwiSmallBtn> {
                         text: "≡"
-                        draw_text: {
-                            text_style: { font_size: 16.0 }
-                        }
+                        draw_text: { text_style: { font_size: 16.0 } }
                     }
 
-                    // Window control buttons
                     windows_buttons = <View> {
                         visible: true,
                         width: Fit, height: Fit,
@@ -140,146 +120,90 @@ live_design! {
 
             body = <View> {
                 width: Fill, height: Fill,
-                flow: Down,
-                spacing: 0,
+                flow: Down, spacing: 0,
 
-                // Terminal pane container (will hold split panes)
+                // Main terminal area
                 pane_container = <View> {
-                    width: Fill,
-                    height: Fill,
-                    flow: Right,
-                    spacing: 1,
+                    width: Fill, height: Fill,
+                    flow: Right, spacing: 0,
 
-                    // Primary terminal pane
-                    pane1 = <View> {
-                        width: Fill,
-                        height: Fill,
-                        flow: Down,
+                    pane1_view = <View> {
+                        width: Fill, height: Fill,
                         show_bg: true,
                         draw_bg: { color: (LEUWI_BG) }
-
-                        // Terminal output with proper padding
-                        terminal_scroll = <View> {
+                        padding: { top: 6, bottom: 4, left: 10, right: 10 },
+                        terminal_output = <Label> {
                             width: Fill,
-                            height: Fill,
-                            padding: { top: 8, bottom: 8, left: 12, right: 12 },
-
-                            terminal_output = <Label> {
-                                width: Fill,
-                                text: "Starting Leuwi Panjang Terminal..."
-                                draw_text: {
-                                    color: (LEUWI_FG),
-                                    text_style: (TERMINAL_TEXT_STYLE),
-                                }
-                            }
+                            text: ""
+                            draw_text: { color: (LEUWI_FG), text_style: (TERM_STYLE) }
                         }
                     }
 
-                    // Split divider (hidden by default, shown when split)
-                    split_divider_v = <View> {
+                    split_divider = <View> {
                         visible: false,
-                        width: 2,
-                        height: Fill,
+                        width: 2, height: Fill,
                         show_bg: true,
                         draw_bg: { color: (LEUWI_BORDER) }
                     }
 
-                    // Second pane (hidden, shown on vertical split)
-                    pane2 = <View> {
+                    pane2_view = <View> {
                         visible: false,
-                        width: Fill,
-                        height: Fill,
-                        flow: Down,
+                        width: Fill, height: Fill,
                         show_bg: true,
                         draw_bg: { color: (LEUWI_BG) }
-
-                        terminal_scroll2 = <View> {
+                        padding: { top: 6, bottom: 4, left: 10, right: 10 },
+                        terminal_output2 = <Label> {
                             width: Fill,
-                            height: Fill,
-                            padding: { top: 8, bottom: 8, left: 12, right: 12 },
-
-                            terminal_output2 = <Label> {
-                                width: Fill,
-                                text: ""
-                                draw_text: {
-                                    color: (LEUWI_FG),
-                                    text_style: (TERMINAL_TEXT_STYLE),
-                                }
-                            }
+                            text: ""
+                            draw_text: { color: (LEUWI_FG), text_style: (TERM_STYLE) }
                         }
                     }
                 }
 
-                // Menu panel (hidden by default, shown on ≡ click)
-                menu_overlay = <View> {
+                // Menu panel (right side, hidden)
+                menu_panel = <View> {
                     visible: false,
-                    width: 300,
-                    height: Fill,
+                    width: 300, height: Fill,
                     show_bg: true,
                     draw_bg: { color: (LEUWI_TAB_BG) }
-                    padding: { top: 8, bottom: 8, left: 0, right: 0 },
+                    padding: { top: 8, left: 0, right: 0 },
                     flow: Down,
 
                     menu_title = <Label> {
                         width: Fill,
-                        padding: { left: 16, right: 16, bottom: 8 },
+                        padding: { left: 16, bottom: 8 },
                         text: "Leuwi Panjang"
-                        draw_text: {
-                            color: (LEUWI_GREEN),
-                            text_style: { font_size: 13.0 }
-                        }
+                        draw_text: { color: (LEUWI_GREEN), text_style: { font_size: 13.0 } }
                     }
-
                     menu_content = <Label> {
                         width: Fill,
                         padding: { left: 16, right: 16 },
                         text: ""
-                        draw_text: {
-                            color: (LEUWI_FG),
-                            text_style: {
-                                font_size: 11.0,
-                                line_spacing: 1.6,
-                            }
-                        }
+                        draw_text: { color: (LEUWI_FG), text_style: { font_size: 11.0, line_spacing: 1.6 } }
                     }
                 }
 
                 // Status bar
                 status_bar = <View> {
-                    width: Fill,
-                    height: 22,
-                    flow: Right,
-                    align: { y: 0.5 },
+                    width: Fill, height: 22,
+                    flow: Right, align: { y: 0.5 },
                     padding: { left: 12, right: 12 },
                     show_bg: true,
                     draw_bg: { color: (LEUWI_TAB_BG) }
 
-                    // Green dot = connected
                     status_dot = <Label> {
                         text: "●"
-                        draw_text: {
-                            color: (LEUWI_GREEN),
-                            text_style: { font_size: 8.0 }
-                        }
+                        draw_text: { color: (LEUWI_GREEN), text_style: { font_size: 8.0 } }
                     }
-
                     status_text = <Label> {
                         margin: { left: 6 },
                         text: "leuwi-panjang v0.1.0"
-                        draw_text: {
-                            color: (LEUWI_DIM),
-                            text_style: { font_size: 9.0 }
-                        }
+                        draw_text: { color: (LEUWI_DIM), text_style: { font_size: 9.0 } }
                     }
-
                     <View> { width: Fill, height: Fill }
-
-                    clock_text = <Label> {
+                    status_info = <Label> {
                         text: ""
-                        draw_text: {
-                            color: (LEUWI_DIM),
-                            text_style: { font_size: 9.0 }
-                        }
+                        draw_text: { color: (LEUWI_DIM), text_style: { font_size: 9.0 } }
                     }
                 }
             }
@@ -289,26 +213,12 @@ live_design! {
 
 #[derive(Live, LiveHook)]
 pub struct LeuwiApp {
-    #[live]
-    ui: WidgetRef,
-    // Pane 1 (always active)
-    #[rust]
-    session: Option<TerminalSession>,
-    #[rust]
-    pty: Option<leuwi_pty::Pty>,
-    // Pane 2 (split)
-    #[rust]
-    session2: Option<TerminalSession>,
-    #[rust]
-    pty2: Option<leuwi_pty::Pty>,
-    #[rust]
-    split_active: bool,
-    #[rust]
-    active_pane: u8, // 0 = pane1, 1 = pane2
-    #[rust]
-    menu_open: bool,
-    #[rust]
-    initialized: bool,
+    #[live] ui: WidgetRef,
+    #[rust] tabs: Option<TabManager>,
+    #[rust] menu_open: bool,
+    #[rust] initialized: bool,
+    #[rust] last_width: f64,
+    #[rust] last_height: f64,
 }
 
 impl LiveRegister for LeuwiApp {
@@ -318,25 +228,17 @@ impl LiveRegister for LeuwiApp {
 }
 
 impl LeuwiApp {
-    fn initialize_terminal(&mut self, cx: &mut Cx) {
-        if self.initialized {
-            return;
-        }
+    fn init_terminal(&mut self, cx: &mut Cx) {
+        if self.initialized { return; }
         self.initialized = true;
 
-        // Remove OS window decorations (title bar) on Linux
-        // This runs xprop to set Motif hints — removes GNOME/KDE title bar
         #[cfg(target_os = "linux")]
         {
             std::thread::spawn(|| {
-                // Small delay to let window appear
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 let _ = std::process::Command::new("xprop")
-                    .args([
-                        "-name", "Leuwi Panjang",
-                        "-f", "_MOTIF_WM_HINTS", "32c",
-                        "-set", "_MOTIF_WM_HINTS", "0x2, 0x0, 0x0, 0x0, 0x0",
-                    ])
+                    .args(["-name", "Leuwi Panjang", "-f", "_MOTIF_WM_HINTS", "32c",
+                           "-set", "_MOTIF_WM_HINTS", "0x2, 0x0, 0x0, 0x0, 0x0"])
                     .output();
             });
         }
@@ -345,261 +247,129 @@ impl LeuwiApp {
         let cols: u16 = 120;
         let rows: u16 = 40;
 
-        let mut session = TerminalSession::new(
-            cols as usize,
-            rows as usize,
-            config.scrollback.lines as usize,
-        );
+        self.tabs = Some(TabManager::new(
+            &config.general.default_shell, cols, rows, config.scrollback.lines as usize,
+        ));
 
-        match leuwi_pty::Pty::spawn(&config.general.default_shell, cols, rows) {
-            Ok(pty) => {
-                session.start_reader(pty.clone_reader());
-                self.pty = Some(pty);
-                cx.start_interval(0.016);
-            }
-            Err(e) => {
-                eprintln!("Failed to spawn PTY: {e}");
-                session.process_bytes(
-                    format!("Error: Failed to spawn shell: {e}\r\n").as_bytes(),
-                );
-            }
-        }
-
-        self.session = Some(session);
+        cx.start_interval(0.016); // 60fps
     }
 
-    fn split_vertical(&mut self, cx: &mut Cx) {
-        if self.split_active {
-            return; // Already split
-        }
+    fn update_tab_ui(&mut self, cx: &mut Cx) {
+        let tabs = match &self.tabs { Some(t) => t, None => return };
+        let tab_ids = [id!(tab1), id!(tab2), id!(tab3), id!(tab4), id!(tab5)];
 
-        let config = leuwi_config::load_config();
-        let cols: u16 = 60;
-        let rows: u16 = 40;
-
-        let mut session2 = TerminalSession::new(
-            cols as usize,
-            rows as usize,
-            config.scrollback.lines as usize,
-        );
-
-        match leuwi_pty::Pty::spawn(&config.general.default_shell, cols, rows) {
-            Ok(pty) => {
-                session2.start_reader(pty.clone_reader());
-                self.pty2 = Some(pty);
-            }
-            Err(e) => {
-                eprintln!("Failed to spawn PTY for pane 2: {e}");
-                return;
+        for (i, tab_id) in tab_ids.iter().enumerate() {
+            if i < tabs.tab_count() {
+                self.ui.button(*tab_id).set_visible(cx, true);
+                let title = format!(" Terminal {} ", i + 1);
+                self.ui.button(*tab_id).set_text(cx, &title);
+            } else {
+                self.ui.button(*tab_id).set_visible(cx, false);
             }
         }
 
-        self.session2 = Some(session2);
-        self.split_active = true;
-        self.active_pane = 1; // Focus new pane
+        // Status info
+        let tab = tabs.active_tab();
+        let info = if tab.is_split() {
+            format!("Tab {} | Pane {}/{} | Split", tabs.active_tab + 1, tab.active_pane + 1, tab.pane_count())
+        } else {
+            format!("Tab {}/{}", tabs.active_tab + 1, tabs.tab_count())
+        };
+        self.ui.label(id!(status_info)).set_text(cx, &info);
+    }
 
-        // Show pane2 and divider
-        self.ui.view(id!(pane2)).set_visible(cx, true);
-        self.ui.view(id!(split_divider_v)).set_visible(cx, true);
+    fn update_split_ui(&mut self, cx: &mut Cx) {
+        let tabs = match &self.tabs { Some(t) => t, None => return };
+        let tab = tabs.active_tab();
+        let has_split = tab.is_split();
+
+        self.ui.view(id!(split_divider)).set_visible(cx, has_split);
+        self.ui.view(id!(pane2_view)).set_visible(cx, has_split);
+    }
+
+    fn toggle_menu(&mut self, cx: &mut Cx) {
+        self.menu_open = !self.menu_open;
+        self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
+        if self.menu_open {
+            let items = menu::build_main_menu();
+            let text = menu::menu_to_text(&items, 0);
+            self.ui.label(id!(menu_content)).set_text(cx, &text);
+        }
         self.ui.redraw(cx);
-    }
-
-    fn close_split(&mut self, cx: &mut Cx) {
-        if !self.split_active {
-            return;
-        }
-        if let Some(session2) = &self.session2 {
-            session2.stop();
-        }
-        self.session2 = None;
-        self.pty2 = None;
-        self.split_active = false;
-        self.active_pane = 0;
-
-        self.ui.view(id!(pane2)).set_visible(cx, false);
-        self.ui.view(id!(split_divider_v)).set_visible(cx, false);
-        self.ui.redraw(cx);
-    }
-
-    fn toggle_active_pane(&mut self) {
-        if self.split_active {
-            self.active_pane = if self.active_pane == 0 { 1 } else { 0 };
-        }
     }
 
     fn copy_selection(&self) {
-        let session = if self.active_pane == 1 && self.split_active {
-            self.session2.as_ref()
-        } else {
-            self.session.as_ref()
-        };
-
-        if let Some(session) = session {
-            let grid = session.grid.lock().unwrap();
-            let text = grid.get_selected_text()
-                .unwrap_or_else(|| grid.get_all_text());
-
-            if !text.is_empty() {
-                if let Ok(mut clipboard) = Clipboard::new() {
-                    let _ = clipboard.set_text(&text);
-                }
+        let tabs = match &self.tabs { Some(t) => t, None => return };
+        let text = tabs.active_tab().active_pane().copy_selected_or_all();
+        if !text.is_empty() {
+            if let Ok(mut cb) = Clipboard::new() {
+                let _ = cb.set_text(&text);
             }
         }
     }
 
     fn paste_clipboard(&mut self) {
         let text = match Clipboard::new() {
-            Ok(mut clipboard) => clipboard.get_text().unwrap_or_default(),
+            Ok(mut cb) => cb.get_text().unwrap_or_default(),
             Err(_) => return,
         };
+        if text.is_empty() { return; }
 
-        if text.is_empty() {
+        if let Some(tabs) = &mut self.tabs {
+            // Bracketed paste
+            tabs.write_active(b"\x1b[200~");
+            tabs.write_active(text.as_bytes());
+            tabs.write_active(b"\x1b[201~");
+        }
+    }
+
+    fn handle_resize(&mut self, cx: &mut Cx, width: f64, height: f64) {
+        if (width - self.last_width).abs() < 1.0 && (height - self.last_height).abs() < 1.0 {
             return;
         }
+        self.last_width = width;
+        self.last_height = height;
 
-        // Send paste with bracketed paste mode markers
-        let bracketed_start = b"\x1b[200~";
-        let bracketed_end = b"\x1b[201~";
+        // Calculate terminal grid size from window size
+        // Approximate: cell ~8px wide, ~18px tall, minus chrome
+        let chrome_height = 34.0 + 22.0; // tab bar + status bar
+        let padding = 20.0;
+        let cols = ((width - padding) / 8.0).max(20.0) as u16;
+        let rows = ((height - chrome_height - padding) / 18.0).max(5.0) as u16;
 
-        let pty = if self.active_pane == 1 && self.split_active {
-            self.pty2.as_mut()
-        } else {
-            self.pty.as_mut()
-        };
-
-        if let Some(pty) = pty {
-            let _ = pty.write(bracketed_start);
-            let _ = pty.write(text.as_bytes());
-            let _ = pty.write(bracketed_end);
+        if let Some(tabs) = &mut self.tabs {
+            tabs.resize(cols, rows);
         }
-    }
-
-    fn select_all_text(&self) {
-        let session = if self.active_pane == 1 && self.split_active {
-            self.session2.as_ref()
-        } else {
-            self.session.as_ref()
-        };
-
-        if let Some(session) = session {
-            let mut grid = session.grid.lock().unwrap();
-            grid.select_all();
-        }
-    }
-
-    fn start_mouse_selection(&self, me: &MouseDownEvent) {
-        // Convert mouse position to grid coordinates
-        // Approximate: padding left=12, top=8, cell ~8x18 pixels
-        let col = ((me.abs.x - 12.0) / 8.0).max(0.0) as usize;
-        let row = ((me.abs.y - 42.0) / 18.0).max(0.0) as usize; // 42 = tab bar(34) + padding(8)
-
-        let session = if self.active_pane == 1 && self.split_active {
-            self.session2.as_ref()
-        } else {
-            self.session.as_ref()
-        };
-
-        if let Some(session) = session {
-            let mut grid = session.grid.lock().unwrap();
-            grid.start_selection(row, col);
-        }
-    }
-
-    fn update_mouse_selection(&self, me: &MouseMoveEvent) {
-        let col = ((me.abs.x - 12.0) / 8.0).max(0.0) as usize;
-        let row = ((me.abs.y - 42.0) / 18.0).max(0.0) as usize;
-
-        let session = if self.active_pane == 1 && self.split_active {
-            self.session2.as_ref()
-        } else {
-            self.session.as_ref()
-        };
-
-        if let Some(session) = session {
-            let mut grid = session.grid.lock().unwrap();
-            grid.update_selection(row, col);
-        }
-    }
-
-    fn render_grid_to_text(&self) -> String {
-        let session = match &self.session {
-            Some(s) => s,
-            None => return "No session".to_string(),
-        };
-        Self::render_grid_to_text_session(session)
-    }
-
-    fn render_grid_to_text_session(session: &TerminalSession) -> String {
-        let grid = session.grid.lock().unwrap();
-        let cols = grid.cols();
-        let rows = grid.rows();
-        // Pre-allocate: each row = cols chars + newline
-        let mut output = String::with_capacity((cols + 1) * rows);
-
-        // Find last row with content (skip trailing empty rows)
-        let mut last_content_row = 0;
-        for row in 0..rows {
-            for col in 0..cols {
-                let c = grid.cell(row, col).c;
-                if c != '\0' && c != ' ' {
-                    last_content_row = row;
-                    break;
-                }
-            }
-        }
-
-        for row in 0..=last_content_row {
-            // Build row string — keep all characters for monospace alignment
-            let mut row_str = String::with_capacity(cols);
-            let mut last_non_space = 0;
-
-            for col in 0..cols {
-                let c = grid.cell(row, col).c;
-                let ch = if c == '\0' { ' ' } else { c };
-                row_str.push(ch);
-                if ch != ' ' {
-                    last_non_space = col + 1;
-                }
-            }
-
-            // Trim trailing spaces but keep minimum alignment
-            // For proper ls -la alignment, keep spaces up to last content
-            row_str.truncate(last_non_space);
-
-            output.push_str(&row_str);
-            if row < last_content_row {
-                output.push('\n');
-            }
-        }
-
-        output
-    }
-
-    fn toggle_menu(&mut self, cx: &mut Cx) {
-        self.menu_open = !self.menu_open;
-        self.ui.view(id!(menu_overlay)).set_visible(cx, self.menu_open);
-
-        if self.menu_open {
-            let menu_items = crate::menu::build_main_menu();
-            let text = crate::menu::menu_to_text(&menu_items, 0);
-            self.ui.label(id!(menu_content)).set_text(cx, &text);
-        }
-
-        self.ui.redraw(cx);
     }
 }
 
 impl MatchEvent for LeuwiApp {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        // Tab buttons
+        let tab_ids = [id!(tab1), id!(tab2), id!(tab3), id!(tab4), id!(tab5)];
+        for (i, tab_id) in tab_ids.iter().enumerate() {
+            if self.ui.button(*tab_id).clicked(actions) {
+                if let Some(tabs) = &mut self.tabs {
+                    tabs.switch_tab(i);
+                    self.update_split_ui(cx);
+                    self.ui.redraw(cx);
+                }
+            }
+        }
+
         if self.ui.button(id!(new_tab_btn)).clicked(actions) {
-            // TODO: new tab
+            if let Some(tabs) = &mut self.tabs {
+                tabs.new_tab();
+                self.update_tab_ui(cx);
+                self.update_split_ui(cx);
+                self.ui.redraw(cx);
+            }
         }
         if self.ui.button(id!(menu_btn)).clicked(actions) {
             self.toggle_menu(cx);
         }
     }
 }
-
 
 impl AppMain for LeuwiApp {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
@@ -608,108 +378,164 @@ impl AppMain for LeuwiApp {
 
         match event {
             Event::Startup => {
-                self.initialize_terminal(cx);
+                self.init_terminal(cx);
             }
-            Event::Timer(_te) => {
-                // Update pane 1
-                let text = self.render_grid_to_text();
-                self.ui.label(id!(terminal_output)).set_text(cx, &text);
+            Event::Timer(_) => {
+                if let Some(tabs) = &self.tabs {
+                    let tab = tabs.active_tab();
 
-                // Update pane 2 if split
-                if self.split_active {
-                    if let Some(session2) = &self.session2 {
-                        let text2 = Self::render_grid_to_text_session(session2);
+                    // Pane 1 text
+                    let text1 = tab.panes[0].render_text();
+                    self.ui.label(id!(terminal_output)).set_text(cx, &text1);
+
+                    // Pane 2 text (if split)
+                    if tab.is_split() && tab.panes.len() > 1 {
+                        let text2 = tab.panes[1].render_text();
                         self.ui.label(id!(terminal_output2)).set_text(cx, &text2);
+                    }
+
+                    self.update_tab_ui(cx);
+                }
+                self.ui.redraw(cx);
+            }
+            Event::WindowGeomChange(ev) => {
+                let size = ev.new_geom.inner_size;
+                self.handle_resize(cx, size.x, size.y);
+            }
+            Event::KeyDown(ke) => {
+                // Escape closes menu
+                if ke.key_code == KeyCode::Escape {
+                    if self.menu_open {
+                        self.toggle_menu(cx);
+                        return;
                     }
                 }
 
-                self.ui.redraw(cx);
-            }
-            Event::KeyDown(ke) => {
-                // Close menu on Escape
-                if ke.key_code == KeyCode::Escape && self.menu_open {
-                    self.toggle_menu(cx);
-                    return;
-                }
-
-                // Ctrl+Shift shortcuts (terminal special keys)
+                // Ctrl+Shift combos
                 if ke.modifiers.control && ke.modifiers.shift {
                     match ke.key_code {
-                        // Ctrl+Shift+C = copy selected text
-                        KeyCode::KeyC => {
-                            self.copy_selection();
-                            return;
-                        }
-                        // Ctrl+Shift+V = paste from clipboard
-                        KeyCode::KeyV => {
-                            self.paste_clipboard();
-                            return;
-                        }
-                        // Ctrl+Shift+D = split vertical (like iTerm2)
+                        KeyCode::KeyC => { self.copy_selection(); return; }
+                        KeyCode::KeyV => { self.paste_clipboard(); return; }
                         KeyCode::KeyD => {
-                            self.split_vertical(cx);
-                            return;
-                        }
-                        // Ctrl+Shift+E = split horizontal
-                        KeyCode::KeyE => {
-                            // TODO: horizontal split
-                            return;
-                        }
-                        // Ctrl+Shift+W = close active pane
-                        KeyCode::KeyW => {
-                            if self.split_active && self.active_pane == 1 {
-                                self.close_split(cx);
+                            if let Some(tabs) = &mut self.tabs {
+                                tabs.split_active(SplitDir::Vertical);
+                                self.update_split_ui(cx);
                             }
                             return;
                         }
-                        // Ctrl+Shift+T = new tab
+                        KeyCode::KeyE => {
+                            if let Some(tabs) = &mut self.tabs {
+                                tabs.split_active(SplitDir::Horizontal);
+                                self.update_split_ui(cx);
+                            }
+                            return;
+                        }
+                        KeyCode::KeyW => {
+                            if let Some(tabs) = &mut self.tabs {
+                                let tab = tabs.active_tab_mut();
+                                if tab.is_split() {
+                                    tab.close_split();
+                                    self.update_split_ui(cx);
+                                } else if tabs.tab_count() > 1 {
+                                    tabs.close_active_tab();
+                                    self.update_tab_ui(cx);
+                                    self.update_split_ui(cx);
+                                }
+                            }
+                            return;
+                        }
                         KeyCode::KeyT => {
-                            // TODO: new tab
+                            if let Some(tabs) = &mut self.tabs {
+                                tabs.new_tab();
+                                self.update_tab_ui(cx);
+                                self.update_split_ui(cx);
+                            }
                             return;
                         }
-                        // Ctrl+Shift+A = select all
                         KeyCode::KeyA => {
-                            self.select_all_text();
+                            if let Some(tabs) = &self.tabs {
+                                tabs.active_tab().active_pane().select_all();
+                            }
                             return;
                         }
                         _ => {}
                     }
                 }
 
-                // Alt+Arrow = switch between panes
+                // Ctrl+Tab / Ctrl+Shift+Tab = switch tabs
+                if ke.modifiers.control && ke.key_code == KeyCode::Tab {
+                    if let Some(tabs) = &mut self.tabs {
+                        if ke.modifiers.shift { tabs.prev_tab(); } else { tabs.next_tab(); }
+                        self.update_tab_ui(cx);
+                        self.update_split_ui(cx);
+                    }
+                    return;
+                }
+
+                // Alt+1-5 = go to tab N
                 if ke.modifiers.alt {
-                    match ke.key_code {
+                    let tab_num = match ke.key_code {
+                        KeyCode::Key1 => Some(0),
+                        KeyCode::Key2 => Some(1),
+                        KeyCode::Key3 => Some(2),
+                        KeyCode::Key4 => Some(3),
+                        KeyCode::Key5 => Some(4),
                         KeyCode::ArrowLeft | KeyCode::ArrowRight => {
-                            self.toggle_active_pane();
+                            if let Some(tabs) = &mut self.tabs {
+                                tabs.active_tab_mut().toggle_pane();
+                            }
+                            return;
+                        }
+                        _ => None,
+                    };
+                    if let Some(n) = tab_num {
+                        if let Some(tabs) = &mut self.tabs {
+                            tabs.switch_tab(n);
+                            self.update_tab_ui(cx);
+                            self.update_split_ui(cx);
+                        }
+                        return;
+                    }
+                }
+
+                // Shift+PageUp/Down = scroll
+                if ke.modifiers.shift {
+                    match ke.key_code {
+                        KeyCode::PageUp | KeyCode::PageDown => {
+                            // TODO: scrollback
                             return;
                         }
                         _ => {}
                     }
                 }
 
-                // Forward keyboard input to active PTY
+                // Forward to PTY
                 let bytes = key_event_to_bytes(ke);
                 if !bytes.is_empty() {
-                    if self.active_pane == 1 && self.split_active {
-                        if let Some(pty2) = &mut self.pty2 {
-                            let _ = pty2.write(&bytes);
-                        }
-                    } else if let Some(pty) = &mut self.pty {
-                        let _ = pty.write(&bytes);
+                    if let Some(tabs) = &mut self.tabs {
+                        tabs.write_active(&bytes);
                     }
                 }
             }
-            // Mouse selection for text block
             Event::MouseDown(me) => {
-                // Start selection on mouse down in terminal area
-                self.start_mouse_selection(me);
+                // Close menu on click outside
+                if self.menu_open {
+                    self.toggle_menu(cx);
+                    return;
+                }
+                // Start selection
+                let col = ((me.abs.x - 10.0) / 8.0).max(0.0) as usize;
+                let row = ((me.abs.y - 40.0) / 18.0).max(0.0) as usize;
+                if let Some(tabs) = &self.tabs {
+                    tabs.active_tab().active_pane().start_selection(row, col);
+                }
             }
             Event::MouseMove(me) => {
-                // Update selection while dragging (left button held)
-                self.update_mouse_selection(me);
-            }
-            Event::MouseUp(_me) => {
-                // Selection complete — text is now selectable via Ctrl+Shift+C
+                let col = ((me.abs.x - 10.0) / 8.0).max(0.0) as usize;
+                let row = ((me.abs.y - 40.0) / 18.0).max(0.0) as usize;
+                if let Some(tabs) = &self.tabs {
+                    tabs.active_tab().active_pane().update_selection(row, col);
+                }
             }
             _ => {}
         }
@@ -734,9 +560,9 @@ fn key_event_to_bytes(ke: &KeyEvent) -> Vec<u8> {
         _ => {
             if let Some(c) = keycode_to_char(&ke.key_code, ke.modifiers.shift) {
                 if ke.modifiers.control {
-                    let c = c.to_ascii_lowercase();
-                    if ('a'..='z').contains(&c) {
-                        return vec![(c as u8) - b'a' + 1];
+                    let cl = c.to_ascii_lowercase();
+                    if ('a'..='z').contains(&cl) {
+                        return vec![(cl as u8) - b'a' + 1];
                     }
                 }
                 let mut buf = [0u8; 4];
@@ -749,56 +575,44 @@ fn key_event_to_bytes(ke: &KeyEvent) -> Vec<u8> {
 }
 
 fn keycode_to_char(kc: &KeyCode, shift: bool) -> Option<char> {
-    match kc {
-        KeyCode::KeyA => Some(if shift { 'A' } else { 'a' }),
-        KeyCode::KeyB => Some(if shift { 'B' } else { 'b' }),
-        KeyCode::KeyC => Some(if shift { 'C' } else { 'c' }),
-        KeyCode::KeyD => Some(if shift { 'D' } else { 'd' }),
-        KeyCode::KeyE => Some(if shift { 'E' } else { 'e' }),
-        KeyCode::KeyF => Some(if shift { 'F' } else { 'f' }),
-        KeyCode::KeyG => Some(if shift { 'G' } else { 'g' }),
-        KeyCode::KeyH => Some(if shift { 'H' } else { 'h' }),
-        KeyCode::KeyI => Some(if shift { 'I' } else { 'i' }),
-        KeyCode::KeyJ => Some(if shift { 'J' } else { 'j' }),
-        KeyCode::KeyK => Some(if shift { 'K' } else { 'k' }),
-        KeyCode::KeyL => Some(if shift { 'L' } else { 'l' }),
-        KeyCode::KeyM => Some(if shift { 'M' } else { 'm' }),
-        KeyCode::KeyN => Some(if shift { 'N' } else { 'n' }),
-        KeyCode::KeyO => Some(if shift { 'O' } else { 'o' }),
-        KeyCode::KeyP => Some(if shift { 'P' } else { 'p' }),
-        KeyCode::KeyQ => Some(if shift { 'Q' } else { 'q' }),
-        KeyCode::KeyR => Some(if shift { 'R' } else { 'r' }),
-        KeyCode::KeyS => Some(if shift { 'S' } else { 's' }),
-        KeyCode::KeyT => Some(if shift { 'T' } else { 't' }),
-        KeyCode::KeyU => Some(if shift { 'U' } else { 'u' }),
-        KeyCode::KeyV => Some(if shift { 'V' } else { 'v' }),
-        KeyCode::KeyW => Some(if shift { 'W' } else { 'w' }),
-        KeyCode::KeyX => Some(if shift { 'X' } else { 'x' }),
-        KeyCode::KeyY => Some(if shift { 'Y' } else { 'y' }),
-        KeyCode::KeyZ => Some(if shift { 'Z' } else { 'z' }),
-        KeyCode::Key0 => Some(if shift { ')' } else { '0' }),
-        KeyCode::Key1 => Some(if shift { '!' } else { '1' }),
-        KeyCode::Key2 => Some(if shift { '@' } else { '2' }),
-        KeyCode::Key3 => Some(if shift { '#' } else { '3' }),
-        KeyCode::Key4 => Some(if shift { '$' } else { '4' }),
-        KeyCode::Key5 => Some(if shift { '%' } else { '5' }),
-        KeyCode::Key6 => Some(if shift { '^' } else { '6' }),
-        KeyCode::Key7 => Some(if shift { '&' } else { '7' }),
-        KeyCode::Key8 => Some(if shift { '*' } else { '8' }),
-        KeyCode::Key9 => Some(if shift { '(' } else { '9' }),
-        KeyCode::Space => Some(' '),
-        KeyCode::Minus => Some(if shift { '_' } else { '-' }),
-        KeyCode::Equals => Some(if shift { '+' } else { '=' }),
-        KeyCode::LBracket => Some(if shift { '{' } else { '[' }),
-        KeyCode::RBracket => Some(if shift { '}' } else { ']' }),
-        KeyCode::Backslash => Some(if shift { '|' } else { '\\' }),
-        KeyCode::Semicolon => Some(if shift { ':' } else { ';' }),
-        KeyCode::Quote => Some(if shift { '"' } else { '\'' }),
-        KeyCode::Comma => Some(if shift { '<' } else { ',' }),
-        KeyCode::Period => Some(if shift { '>' } else { '.' }),
-        KeyCode::Slash => Some(if shift { '?' } else { '/' }),
-        KeyCode::Backtick => Some(if shift { '~' } else { '`' }),
-        _ => None,
+    let c = match kc {
+        KeyCode::KeyA => 'a', KeyCode::KeyB => 'b', KeyCode::KeyC => 'c',
+        KeyCode::KeyD => 'd', KeyCode::KeyE => 'e', KeyCode::KeyF => 'f',
+        KeyCode::KeyG => 'g', KeyCode::KeyH => 'h', KeyCode::KeyI => 'i',
+        KeyCode::KeyJ => 'j', KeyCode::KeyK => 'k', KeyCode::KeyL => 'l',
+        KeyCode::KeyM => 'm', KeyCode::KeyN => 'n', KeyCode::KeyO => 'o',
+        KeyCode::KeyP => 'p', KeyCode::KeyQ => 'q', KeyCode::KeyR => 'r',
+        KeyCode::KeyS => 's', KeyCode::KeyT => 't', KeyCode::KeyU => 'u',
+        KeyCode::KeyV => 'v', KeyCode::KeyW => 'w', KeyCode::KeyX => 'x',
+        KeyCode::KeyY => 'y', KeyCode::KeyZ => 'z',
+        KeyCode::Key0 => '0', KeyCode::Key1 => '1', KeyCode::Key2 => '2',
+        KeyCode::Key3 => '3', KeyCode::Key4 => '4', KeyCode::Key5 => '5',
+        KeyCode::Key6 => '6', KeyCode::Key7 => '7', KeyCode::Key8 => '8',
+        KeyCode::Key9 => '9',
+        KeyCode::Space => return Some(' '),
+        KeyCode::Minus => return Some(if shift { '_' } else { '-' }),
+        KeyCode::Equals => return Some(if shift { '+' } else { '=' }),
+        KeyCode::LBracket => return Some(if shift { '{' } else { '[' }),
+        KeyCode::RBracket => return Some(if shift { '}' } else { ']' }),
+        KeyCode::Backslash => return Some(if shift { '|' } else { '\\' }),
+        KeyCode::Semicolon => return Some(if shift { ':' } else { ';' }),
+        KeyCode::Quote => return Some(if shift { '"' } else { '\'' }),
+        KeyCode::Comma => return Some(if shift { '<' } else { ',' }),
+        KeyCode::Period => return Some(if shift { '>' } else { '.' }),
+        KeyCode::Slash => return Some(if shift { '?' } else { '/' }),
+        KeyCode::Backtick => return Some(if shift { '~' } else { '`' }),
+        _ => return None,
+    };
+    if shift && c.is_alphabetic() {
+        Some(c.to_ascii_uppercase())
+    } else if shift {
+        Some(match c {
+            '0' => ')', '1' => '!', '2' => '@', '3' => '#', '4' => '$',
+            '5' => '%', '6' => '^', '7' => '&', '8' => '*', '9' => '(',
+            _ => c,
+        })
+    } else {
+        Some(c)
     }
 }
 
