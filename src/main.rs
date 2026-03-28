@@ -114,14 +114,22 @@ impl Default for Cell {
 // ── Terminal Grid ──────────────────────────────────────────
 struct TermGrid {
     cols: usize,
-    rows: usize,       // visible rows
+    rows: usize,
     cells: Vec<Vec<Cell>>,
-    scrollback: Vec<Vec<Cell>>,  // scrolled-off rows
+    scrollback: Vec<Vec<Cell>>,
     max_scrollback: usize,
     cur_r: usize,
     cur_c: usize,
     cur_fg: u8,
     cur_bold: bool,
+    // Alternate screen buffer (for vim, htop, less, etc.)
+    alt_cells: Option<Vec<Vec<Cell>>>,
+    alt_cur_r: usize,
+    alt_cur_c: usize,
+    in_alt_screen: bool,
+    // Saved cursor
+    saved_cur_r: usize,
+    saved_cur_c: usize,
 }
 
 impl Default for TermGrid {
@@ -136,7 +144,42 @@ impl TermGrid {
             scrollback: Vec::new(),
             max_scrollback: 5000,
             cur_r: 0, cur_c: 0, cur_fg: 255, cur_bold: false,
+            alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
+            saved_cur_r: 0, saved_cur_c: 0,
         }
+    }
+
+    fn enter_alt_screen(&mut self) {
+        if self.in_alt_screen { return; }
+        self.in_alt_screen = true;
+        self.alt_cur_r = self.cur_r;
+        self.alt_cur_c = self.cur_c;
+        // Save main screen, replace with blank
+        self.alt_cells = Some(self.cells.clone());
+        self.cells = vec![vec![Cell::default(); self.cols]; self.rows];
+        self.cur_r = 0;
+        self.cur_c = 0;
+    }
+
+    fn leave_alt_screen(&mut self) {
+        if !self.in_alt_screen { return; }
+        self.in_alt_screen = false;
+        // Restore main screen
+        if let Some(main) = self.alt_cells.take() {
+            self.cells = main;
+        }
+        self.cur_r = self.alt_cur_r;
+        self.cur_c = self.alt_cur_c;
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved_cur_r = self.cur_r;
+        self.saved_cur_c = self.cur_c;
+    }
+
+    fn restore_cursor(&mut self) {
+        self.cur_r = self.saved_cur_r.min(self.rows.saturating_sub(1));
+        self.cur_c = self.saved_cur_c.min(self.cols.saturating_sub(1));
     }
 
     fn put(&mut self, ch: char) {
@@ -248,9 +291,11 @@ impl TermGrid {
                             i += 1;
                             let mut params: Vec<usize> = Vec::new();
                             let mut num: i32 = -1;
+                            let mut private = false;
                             while i < data.len() {
                                 let c = data[i];
-                                if c == b'?' || c == b'>' || c == b'=' || c == b'!' { i += 1; continue; }
+                                if c == b'?' { private = true; i += 1; continue; }
+                                if c == b'>' || c == b'=' || c == b'!' { i += 1; continue; }
                                 if (b'0'..=b'9').contains(&c) {
                                     if num < 0 { num = 0; }
                                     num = num * 10 + (c - b'0') as i32;
@@ -303,6 +348,86 @@ impl TermGrid {
                                             }
                                         }
                                     }
+                                    b'h' => {
+                                        // DECSET — enable modes
+                                        if private {
+                                            for &p in &params {
+                                                match p {
+                                                    1049 => self.enter_alt_screen(), // alt screen
+                                                    1 => {} // app cursor keys
+                                                    25 => {} // show cursor
+                                                    2004 => {} // bracketed paste
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    b'l' => {
+                                        // DECRST — disable modes
+                                        if private {
+                                            for &p in &params {
+                                                match p {
+                                                    1049 => self.leave_alt_screen(), // leave alt screen
+                                                    1 => {} // normal cursor keys
+                                                    25 => {} // hide cursor
+                                                    2004 => {} // disable bracketed paste
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    b'L' => {
+                                        // IL — insert lines
+                                        let n = p0.max(1);
+                                        for _ in 0..n {
+                                            if self.cur_r < self.rows {
+                                                self.cells.insert(self.cur_r, vec![Cell::default(); self.cols]);
+                                                self.cells.truncate(self.rows);
+                                            }
+                                        }
+                                    }
+                                    b'M' => {
+                                        // DL — delete lines
+                                        let n = p0.max(1);
+                                        for _ in 0..n {
+                                            if self.cur_r < self.rows {
+                                                self.cells.remove(self.cur_r);
+                                                self.cells.push(vec![Cell::default(); self.cols]);
+                                            }
+                                        }
+                                    }
+                                    b'P' => {
+                                        // DCH — delete characters
+                                        let n = p0.max(1);
+                                        let row = &mut self.cells[self.cur_r];
+                                        for _ in 0..n {
+                                            if self.cur_c < self.cols {
+                                                row.remove(self.cur_c);
+                                                row.push(Cell::default());
+                                            }
+                                        }
+                                    }
+                                    b'@' => {
+                                        // ICH — insert characters
+                                        let n = p0.max(1);
+                                        let row = &mut self.cells[self.cur_r];
+                                        for _ in 0..n {
+                                            if self.cur_c < self.cols {
+                                                row.insert(self.cur_c, Cell::default());
+                                                row.truncate(self.cols);
+                                            }
+                                        }
+                                    }
+                                    b'X' => {
+                                        // ECH — erase characters
+                                        let n = p0.max(1);
+                                        for c in self.cur_c..(self.cur_c + n).min(self.cols) {
+                                            self.cells[self.cur_r][c] = Cell::default();
+                                        }
+                                    }
+                                    b'r' => {
+                                        // DECSTBM — set scroll region (ignored for now)
+                                    }
                                     _ => {} // silently ignore other CSI
                                 }
                                 i += 1; break;
@@ -311,6 +436,16 @@ impl TermGrid {
                         b']' => { i += 1; while i < data.len() { if data[i] == 0x07 { i += 1; break; } if data[i] == 0x1b { i += 2; break; } i += 1; } }
                         b'P' | b'_' | b'^' => { i += 1; while i < data.len() { if data[i] == 0x1b { i += 2; break; } if data[i] == 0x07 { i += 1; break; } i += 1; } }
                         b'(' | b')' | b'*' | b'+' => { i += 1; if i < data.len() { i += 1; } }
+                        b'7' => { self.save_cursor(); }     // DECSC
+                        b'8' => { self.restore_cursor(); }  // DECRC
+                        b'M' => {                           // RI — reverse index (scroll down)
+                            if self.cur_r == 0 {
+                                self.cells.insert(0, vec![Cell::default(); self.cols]);
+                                self.cells.truncate(self.rows);
+                            } else {
+                                self.cur_r -= 1;
+                            }
+                        }
                         _ => { i += 1; }
                     }
                 }
