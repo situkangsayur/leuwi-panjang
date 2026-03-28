@@ -666,9 +666,10 @@ impl AppMain for App {
                         KeyCode::KeyW => {
                             if self.split_tab.is_some() && self.split_active {
                                 self.close_split(cx);
-                            } else {
+                            } else if self.tabs.len() > 1 {
                                 self.close_active_tab(cx);
                             }
+                            // Never close the last tab — use Alt+F4 to close app
                             return;
                         }
                         KeyCode::KeyC => { self.copy_to_clipboard(); return; }
@@ -680,6 +681,11 @@ impl AppMain for App {
                 // Ctrl+Tab = next tab
                 if ke.modifiers.control && ke.key_code == KeyCode::Tab {
                     self.next_tab(cx);
+                    return;
+                }
+                // Alt+F4 = close window
+                if ke.modifiers.alt && ke.key_code == KeyCode::F4 {
+                    cx.quit();
                     return;
                 }
                 // Alt+Arrow = switch panes
