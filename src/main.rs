@@ -246,38 +246,49 @@ impl Widget for TermView {
     fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
-        let rect = cx.walk_turtle(walk);
-        self.draw_bg.draw_abs(cx, rect);
-
         let grid = match &self.grid_ref {
             Some(g) => g.lock().unwrap(),
-            None => return DrawStep::done(),
+            None => {
+                cx.walk_turtle(walk);
+                return DrawStep::done();
+            }
         };
 
-        let cw = 9.5_f64;   // wide enough to prevent any overlap
-        let ch = 20.0_f64;  // tall line height for clarity
-        let px = rect.pos.x + 12.0;
-        let py = rect.pos.y + 8.0;
+        let cw = 9.5_f64;
+        let ch = 20.0_f64;
+        let pad = 12.0;
 
-        // Render each character individually at exact grid position
+        // Calculate content height for scroll
         let last_row = grid.cur_r.max(
             grid.cells.iter().enumerate()
                 .filter(|(_, row)| row.iter().any(|c| c.ch != ' '))
                 .map(|(r, _)| r).max().unwrap_or(0)
         );
+        let content_h = ((last_row + 2) as f64) * ch + pad * 2.0;
+        let content_w = (grid.cols as f64) * cw + pad * 2.0;
+
+        // Set walk size to content size so ScrollXYView can scroll
+        let sized_walk = Walk {
+            width: Size::Fixed(content_w),
+            height: Size::Fixed(content_h),
+            ..walk
+        };
+
+        let rect = cx.walk_turtle(sized_walk);
+        self.draw_bg.draw_abs(cx, rect);
+
+        let px = rect.pos.x + pad;
+        let py = rect.pos.y + pad;
 
         let mut char_buf = [0u8; 4];
         for r in 0..=last_row {
             let y = py + (r as f64) * ch;
-            if y > rect.pos.y + rect.size.y { break; }
 
             for c in 0..grid.cols {
                 let cell = &grid.cells[r][c];
                 if cell.ch == ' ' { continue; }
 
                 let x = px + (c as f64) * cw;
-                if x > rect.pos.x + rect.size.x { break; }
-
                 self.draw_text.color = ansi_to_vec4(cell.fg);
                 let s = cell.ch.encode_utf8(&mut char_buf);
                 self.draw_text.draw_abs(cx, dvec2(x, y), s);
@@ -362,28 +373,14 @@ live_design! {
             }
             window_menu = <WindowMenu> { main = Main { items: [] } }
             body = <ScrollXYView> {
-                width: Fill, height: Fill, flow: Down
+                width: Fill, height: Fill
                 show_bg: true
                 draw_bg: { color: #x1E1E1E }
-                padding: { top: 6, left: 12, right: 12, bottom: 6 }
                 scroll_bars: <ScrollBars> {
                     show_scroll_x: false
                     show_scroll_y: true
                 }
-                output = <Label> {
-                    width: Fill
-                    text: ""
-                    draw_text: {
-                        color: #xC5C8C6
-                        text_style: {
-                            font_size: 12.0
-                            line_spacing: 1.3
-                            font_family: {
-                                latin = font("crate://makepad-widgets/resources/LiberationMono-Regular.ttf", 0.0, 0.0)
-                            }
-                        }
-                    }
-                }
+                terminal = <TermView> {}
             }
         }
     }
@@ -410,7 +407,7 @@ impl App {
         if self.started { return; }
         self.started = true;
 
-        // Grid renders to text for Label display
+        self.ui.term_view(id!(terminal)).set_grid(self.grid.clone());
 
         let pty_system = portable_pty::native_pty_system();
         let size = portable_pty::PtySize { rows: 33, cols: 110, pixel_width: 0, pixel_height: 0 };
@@ -420,9 +417,8 @@ impl App {
         cmd.args(["--no-globalrcs", "--no-rcs"]);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        // Simple prompt — both PS1 and PROMPT for bash/zsh compat
-        cmd.env("PROMPT", "$ ");
-        cmd.env("PS1", "$ ");
+        cmd.env("PROMPT", "%n@%m %1~ %# ");
+        cmd.env("PS1", "\\u@\\h \\W \\$ ");
         cmd.env("RPROMPT", "");
         cmd.env("LS_COLORS", "di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=33;40:cd=33;40:*.tar=1;31:*.gz=1;31:*.zip=1;31:*.jpg=1;35:*.png=1;35:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.toml=33:*.json=33:*.md=37:*.sh=32");
         cmd.env("CLICOLOR", "1");
@@ -468,8 +464,6 @@ impl AppMain for App {
         match event {
             Event::Startup => { self.start_pty(cx); }
             Event::Timer(_) => {
-                let text = self.grid.lock().unwrap().render();
-                self.ui.label(id!(output)).set_text(cx, &text);
                 self.ui.redraw(cx);
             }
             Event::KeyDown(ke) => {
