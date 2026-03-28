@@ -230,11 +230,109 @@ fn ansi_to_vec4(idx: u8) -> Vec4 {
     }
 }
 
+// ── TermView: colored terminal grid widget ─────────────────
+
+#[derive(Live, LiveHook, Widget)]
+pub struct TermView {
+    #[redraw] #[live] draw_text: DrawText,
+    #[live] draw_bg: DrawColor,
+    #[live] draw_cursor: DrawColor,
+    #[walk] walk: Walk,
+    #[layout] layout: Layout,
+    #[rust] grid_ref: Option<Arc<Mutex<TermGrid>>>,
+}
+
+impl Widget for TermView {
+    fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        let rect = cx.walk_turtle(walk);
+        self.draw_bg.draw_abs(cx, rect);
+
+        let grid = match &self.grid_ref {
+            Some(g) => g.lock().unwrap(),
+            None => return DrawStep::done(),
+        };
+
+        let cw = 6.65_f64;
+        let ch = 15.0_f64;
+        let px = rect.pos.x + 10.0;
+        let py = rect.pos.y + 4.0;
+
+        for r in 0..grid.rows {
+            let y = py + (r as f64) * ch;
+            if y > rect.pos.y + rect.size.y { break; }
+
+            // Build spans of same-color chars for efficient rendering
+            let mut c = 0;
+            while c < grid.cols {
+                let cell = &grid.cells[r][c];
+                if cell.ch == ' ' { c += 1; continue; }
+
+                // Collect consecutive chars with same color
+                let fg = cell.fg;
+                let mut text = String::new();
+                let start_c = c;
+                while c < grid.cols && grid.cells[r][c].fg == fg && grid.cells[r][c].ch != ' ' {
+                    text.push(grid.cells[r][c].ch);
+                    c += 1;
+                }
+                // Include spaces between same-color non-space chars
+                while c < grid.cols && grid.cells[r][c].ch == ' ' {
+                    // Look ahead — if next non-space has same color, include spaces
+                    let mut peek = c;
+                    while peek < grid.cols && grid.cells[r][peek].ch == ' ' { peek += 1; }
+                    if peek < grid.cols && grid.cells[r][peek].fg == fg {
+                        while c < peek { text.push(' '); c += 1; }
+                    } else {
+                        break;
+                    }
+                }
+
+                let x = px + (start_c as f64) * cw;
+                self.draw_text.color = ansi_to_vec4(fg);
+                self.draw_text.draw_abs(cx, dvec2(x, y), &text);
+            }
+        }
+
+        // Cursor
+        let cx_pos = px + (grid.cur_c as f64) * cw;
+        let cy_pos = py + (grid.cur_r as f64) * ch;
+        self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cx_pos, cy_pos), size: dvec2(2.0, ch) });
+
+        DrawStep::done()
+    }
+}
+
+impl TermViewRef {
+    fn set_grid(&self, grid: Arc<Mutex<TermGrid>>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.grid_ref = Some(grid);
+        }
+    }
+}
+
 // ── Makepad App ────────────────────────────────────────────
 
 live_design! {
     use link::theme::*;
     use link::widgets::*;
+
+    TermView = {{TermView}} {
+        width: Fill, height: Fill
+        draw_bg: { color: #x1E1E1E, fn pixel(self) -> vec4 { return self.color; } }
+        draw_cursor: { color: #x58A6FF, fn pixel(self) -> vec4 { return self.color; } }
+        draw_text: {
+            color: #xC5C8C6
+            text_style: {
+                font_size: 11.0
+                line_spacing: 1.35
+                font_family: {
+                    latin = font("crate://self/assets/fonts/JetBrainsMonoNerdFont-Regular.ttf", 0.0, 0.0)
+                }
+            }
+        }
+    }
 
     App = {{App}} {
         ui: <Window> {
@@ -274,29 +372,9 @@ live_design! {
                 }
             }
             window_menu = <WindowMenu> { main = Main { items: [] } }
-            body = <ScrollXYView> {
-                width: Fill, height: Fill, flow: Down
-                show_bg: true
-                draw_bg: { color: #x1E1E1E }
-                padding: { top: 4, left: 10, right: 10, bottom: 4 }
-                scroll_bars: <ScrollBars> {
-                    show_scroll_x: false
-                    show_scroll_y: true
-                }
-                output = <Label> {
-                    width: Fill
-                    text: ""
-                    draw_text: {
-                        color: #xC5C8C6
-                        text_style: {
-                            font_size: 11.0
-                            line_spacing: 1.35
-                            font_family: {
-                                latin = font("crate://makepad-widgets/resources/LiberationMono-Regular.ttf", 0.0, 0.0)
-                            }
-                        }
-                    }
-                }
+            body = <View> {
+                width: Fill, height: Fill
+                terminal = <TermView> {}
             }
         }
     }
@@ -323,7 +401,8 @@ impl App {
         if self.started { return; }
         self.started = true;
 
-        // Grid used for rendering to Label
+        // Pass grid to TermView for colored rendering
+        self.ui.term_view(id!(terminal)).set_grid(self.grid.clone());
 
         let pty_system = portable_pty::native_pty_system();
         let size = portable_pty::PtySize { rows: 45, cols: 140, pixel_width: 0, pixel_height: 0 };
@@ -333,7 +412,7 @@ impl App {
         cmd.args(["--no-globalrcs", "--no-rcs"]);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("PROMPT", "%n@%m %~ $ ");
+        cmd.env("PROMPT", "%n@%m %~ %# ");
         cmd.env("RPROMPT", "");
         cmd.env("LS_COLORS", "di=1;34:ln=36:so=35:pi=33:ex=1;32:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.md=37:*.toml=33:*.json=33:*.yaml=33:*.sh=32:*.txt=37");
         for v in &["HOME","USER","PATH","LANG","DISPLAY","WAYLAND_DISPLAY","XDG_RUNTIME_DIR","DBUS_SESSION_BUS_ADDRESS","SSH_AUTH_SOCK","EDITOR"] {
@@ -371,8 +450,6 @@ impl AppMain for App {
         match event {
             Event::Startup => { self.start_pty(cx); }
             Event::Timer(_) => {
-                let text = self.grid.lock().unwrap().render();
-                self.ui.label(id!(output)).set_text(cx, &text);
                 self.ui.redraw(cx);
             }
             Event::KeyDown(ke) => {
