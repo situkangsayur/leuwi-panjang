@@ -8,6 +8,8 @@ struct TermTab {
     grid: Arc<Mutex<TermGrid>>,
     writer: Option<Box<dyn Write + Send>>,
     title: String,
+    split: Option<Box<TermTab>>,  // per-tab split pane
+    split_focused: bool,
 }
 
 impl TermTab {
@@ -49,7 +51,7 @@ impl TermTab {
             }
         });
 
-        Self { grid, writer: Some(writer), title: format!("Terminal {}", id) }
+        Self { grid, writer: Some(writer), title: format!("Terminal {}", id), split: None, split_focused: false }
     }
 
     fn write(&mut self, data: &[u8]) {
