@@ -17,8 +17,10 @@ impl Default for Cell {
 // ── Terminal Grid ──────────────────────────────────────────
 struct TermGrid {
     cols: usize,
-    rows: usize,
+    rows: usize,       // visible rows
     cells: Vec<Vec<Cell>>,
+    scrollback: Vec<Vec<Cell>>,  // scrolled-off rows
+    max_scrollback: usize,
     cur_r: usize,
     cur_c: usize,
     cur_fg: u8,
@@ -34,6 +36,8 @@ impl TermGrid {
         Self {
             cols, rows,
             cells: vec![vec![Cell::default(); cols]; rows],
+            scrollback: Vec::new(),
+            max_scrollback: 5000,
             cur_r: 0, cur_c: 0, cur_fg: 255, cur_bold: false,
         }
     }
@@ -48,7 +52,12 @@ impl TermGrid {
 
     fn newline(&mut self) {
         if self.cur_r + 1 >= self.rows {
-            self.cells.remove(0);
+            // Save top row to scrollback
+            let top = self.cells.remove(0);
+            self.scrollback.push(top);
+            if self.scrollback.len() > self.max_scrollback {
+                self.scrollback.remove(0);
+            }
             self.cells.push(vec![Cell::default(); self.cols]);
         } else {
             self.cur_r += 1;
@@ -65,16 +74,22 @@ impl TermGrid {
     fn clear_below(&mut self) { self.clear_line_right(); for r in (self.cur_r+1)..self.rows { for c in 0..self.cols { self.cells[r][c] = Cell::default(); } } }
 
     fn render(&self) -> String {
+        // Render all visible rows, trim trailing empty rows
         let mut out = String::with_capacity((self.cols + 1) * self.rows);
-        let mut last_row = 0;
-        for (r, row) in self.cells.iter().enumerate() {
-            if row.iter().any(|c| c.ch != ' ') { last_row = r; }
-        }
+        // Find last row with content (at least up to cursor row)
+        let last_row = self.cur_r.max(
+            self.cells.iter().enumerate()
+                .filter(|(_, row)| row.iter().any(|c| c.ch != ' '))
+                .map(|(r, _)| r)
+                .max()
+                .unwrap_or(0)
+        );
         for r in 0..=last_row {
             let mut last_col = 0;
             for (c, cell) in self.cells[r].iter().enumerate() {
                 if cell.ch != ' ' { last_col = c + 1; }
             }
+            // Always output at least empty line for cursor row
             for c in 0..last_col { out.push(self.cells[r][c].ch); }
             if r < last_row { out.push('\n'); }
         }
