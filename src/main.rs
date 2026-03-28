@@ -50,9 +50,14 @@ fn build_ui(app: &Application) {
         .decorated(false)    // NO TITLE BAR
         .build();
 
+    // Set empty titlebar to kill GTK4 CSD header bar completely
+    let empty_titlebar = GtkBox::new(Orientation::Horizontal, 0);
+    empty_titlebar.set_size_request(-1, 0);
+    window.set_titlebar(Some(&empty_titlebar));
+
     let main_box = GtkBox::new(Orientation::Vertical, 0);
 
-    // Custom header (since no title bar)
+    // Our custom header (replaces CSD)
     let header = build_header(&window);
     main_box.append(&header);
 
