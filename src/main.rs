@@ -1186,3 +1186,400 @@ fn shift_char(c: char) -> char {
 
 app_main!(App);
 fn main() { app_main() }
+
+// ── Tests ──────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_grid(cols: usize, rows: usize) -> TermGrid {
+        TermGrid::new(cols, rows)
+    }
+
+    // ── Grid basics ──
+    #[test]
+    fn test_grid_new() {
+        let g = new_grid(80, 24);
+        assert_eq!(g.cols, 80);
+        assert_eq!(g.rows, 24);
+        assert_eq!(g.cur_r, 0);
+        assert_eq!(g.cur_c, 0);
+    }
+
+    #[test]
+    fn test_grid_put_char() {
+        let mut g = new_grid(80, 24);
+        g.put('A');
+        assert_eq!(g.cells[0][0].ch, 'A');
+        assert_eq!(g.cur_c, 1);
+        g.put('B');
+        assert_eq!(g.cells[0][1].ch, 'B');
+        assert_eq!(g.cur_c, 2);
+    }
+
+    #[test]
+    fn test_grid_newline() {
+        let mut g = new_grid(80, 24);
+        g.put('A');
+        g.newline();
+        assert_eq!(g.cur_r, 1);
+        // newline does NOT reset cur_c (only CR does)
+    }
+
+    #[test]
+    fn test_grid_scroll() {
+        let mut g = new_grid(80, 3);
+        g.cur_r = 2; // bottom row
+        g.newline();  // should scroll
+        assert_eq!(g.scrollback.len(), 1);
+        assert_eq!(g.cur_r, 2);
+    }
+
+    #[test]
+    fn test_grid_clear_screen() {
+        let mut g = new_grid(80, 24);
+        g.put('X');
+        g.clear_screen();
+        assert_eq!(g.cells[0][0].ch, ' ');
+        assert_eq!(g.cur_r, 0);
+        assert_eq!(g.cur_c, 0);
+    }
+
+    #[test]
+    fn test_grid_wrap() {
+        let mut g = new_grid(5, 3);
+        for c in "ABCDE".chars() { g.put(c); }
+        assert_eq!(g.cur_c, 5);
+        g.put('F'); // wraps
+        assert_eq!(g.cur_r, 1);
+        assert_eq!(g.cur_c, 1);
+        assert_eq!(g.cells[1][0].ch, 'F');
+    }
+
+    #[test]
+    fn test_grid_resize() {
+        let mut g = new_grid(80, 24);
+        g.put('A');
+        g.resize(40, 12);
+        assert_eq!(g.cols, 40);
+        assert_eq!(g.rows, 12);
+        assert_eq!(g.cells[0][0].ch, 'A');
+    }
+
+    // ── VT parser ──
+    #[test]
+    fn test_process_plain_text() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Hello");
+        assert_eq!(g.cells[0][0].ch, 'H');
+        assert_eq!(g.cells[0][4].ch, 'o');
+        assert_eq!(g.cur_c, 5);
+    }
+
+    #[test]
+    fn test_process_newline() {
+        let mut g = new_grid(80, 24);
+        g.process(b"A\r\nB"); // CR+LF to move to col 0 next line
+        assert_eq!(g.cells[0][0].ch, 'A');
+        assert_eq!(g.cells[1][0].ch, 'B');
+    }
+
+    #[test]
+    fn test_process_carriage_return() {
+        let mut g = new_grid(80, 24);
+        g.process(b"ABC\rX");
+        assert_eq!(g.cells[0][0].ch, 'X');
+        assert_eq!(g.cells[0][1].ch, 'B');
+    }
+
+    #[test]
+    fn test_process_backspace() {
+        let mut g = new_grid(80, 24);
+        g.process(b"AB\x08C");
+        assert_eq!(g.cells[0][0].ch, 'A');
+        assert_eq!(g.cells[0][1].ch, 'C');
+    }
+
+    #[test]
+    fn test_process_tab() {
+        let mut g = new_grid(80, 24);
+        g.process(b"A\tB");
+        assert_eq!(g.cells[0][0].ch, 'A');
+        assert_eq!(g.cur_c, 9); // tab to 8 + 'B' at 8, cur at 9
+        assert_eq!(g.cells[0][8].ch, 'B');
+    }
+
+    #[test]
+    fn test_csi_cursor_home() {
+        let mut g = new_grid(80, 24);
+        g.cur_r = 5; g.cur_c = 10;
+        g.process(b"\x1b[H"); // cursor home
+        assert_eq!(g.cur_r, 0);
+        assert_eq!(g.cur_c, 0);
+    }
+
+    #[test]
+    fn test_csi_cursor_position() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[5;10H"); // row 5, col 10 (1-based)
+        assert_eq!(g.cur_r, 4); // 0-based
+        assert_eq!(g.cur_c, 9);
+    }
+
+    #[test]
+    fn test_csi_cursor_up_down() {
+        let mut g = new_grid(80, 24);
+        g.cur_r = 10;
+        g.process(b"\x1b[3A"); // up 3
+        assert_eq!(g.cur_r, 7);
+        g.process(b"\x1b[5B"); // down 5
+        assert_eq!(g.cur_r, 12);
+    }
+
+    #[test]
+    fn test_csi_cursor_forward_back() {
+        let mut g = new_grid(80, 24);
+        g.cur_c = 10;
+        g.process(b"\x1b[3D"); // back 3
+        assert_eq!(g.cur_c, 7);
+        g.process(b"\x1b[5C"); // forward 5
+        assert_eq!(g.cur_c, 12);
+    }
+
+    #[test]
+    fn test_csi_erase_display() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Hello");
+        g.process(b"\x1b[2J"); // clear screen
+        assert_eq!(g.cells[0][0].ch, ' ');
+    }
+
+    #[test]
+    fn test_csi_erase_line() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Hello World");
+        g.cur_c = 5;
+        g.process(b"\x1b[K"); // erase from cursor to end
+        assert_eq!(g.cells[0][4].ch, 'o');
+        assert_eq!(g.cells[0][5].ch, ' ');
+    }
+
+    // ── SGR colors ──
+    #[test]
+    fn test_sgr_fg_color() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[31mR"); // red fg
+        assert_eq!(g.cells[0][0].fg, 1);
+        g.process(b"\x1b[32mG"); // green
+        assert_eq!(g.cells[0][1].fg, 2);
+    }
+
+    #[test]
+    fn test_sgr_bg_color() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[41mR"); // red bg
+        assert_eq!(g.cells[0][0].bg, 1);
+    }
+
+    #[test]
+    fn test_sgr_reset() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[31;42mX\x1b[0mY");
+        assert_eq!(g.cells[0][0].fg, 1);
+        assert_eq!(g.cells[0][0].bg, 2);
+        assert_eq!(g.cells[0][1].fg, 255); // reset
+        assert_eq!(g.cells[0][1].bg, 255);
+    }
+
+    #[test]
+    fn test_sgr_bright_colors() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[91mX"); // bright red
+        assert_eq!(g.cells[0][0].fg, 9);
+        g.process(b"\x1b[102mY"); // bright green bg
+        assert_eq!(g.cells[0][1].bg, 10);
+    }
+
+    #[test]
+    fn test_sgr_256_color() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[38;5;196mR"); // 256-color fg
+        assert_eq!(g.cells[0][0].fg, 196);
+    }
+
+    #[test]
+    fn test_sgr_bold() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[1mB");
+        assert!(g.cells[0][0].bold);
+        g.process(b"\x1b[0mN");
+        assert!(!g.cells[0][1].bold);
+    }
+
+    #[test]
+    fn test_sgr_reverse() {
+        let mut g = new_grid(80, 24);
+        g.cur_fg = 1; g.cur_bg = 2;
+        g.process(b"\x1b[7mX"); // reverse
+        // After reverse, fg and bg should be swapped
+        assert_eq!(g.cells[0][0].fg, 2);
+        assert_eq!(g.cells[0][0].bg, 1);
+    }
+
+    // ── Alt screen ──
+    #[test]
+    fn test_alt_screen() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Hello");
+        assert_eq!(g.cells[0][0].ch, 'H');
+
+        g.process(b"\x1b[?1049h"); // enter alt screen
+        assert!(g.in_alt_screen);
+        assert_eq!(g.cells[0][0].ch, ' '); // alt screen is blank
+
+        g.process(b"Alt");
+        assert_eq!(g.cells[0][0].ch, 'A');
+
+        g.process(b"\x1b[?1049l"); // leave alt screen
+        assert!(!g.in_alt_screen);
+        assert_eq!(g.cells[0][0].ch, 'H'); // main screen restored
+    }
+
+    // ── Scroll region ──
+    #[test]
+    fn test_scroll_region() {
+        let mut g = new_grid(80, 10);
+        g.process(b"\x1b[3;7r"); // scroll region rows 3-7 (1-based)
+        assert_eq!(g.scroll_top, 2);
+        assert_eq!(g.scroll_bottom, 6);
+    }
+
+    // ── Save/restore cursor ──
+    #[test]
+    fn test_save_restore_cursor() {
+        let mut g = new_grid(80, 24);
+        g.cur_r = 5; g.cur_c = 10;
+        g.save_cursor();
+        g.cur_r = 0; g.cur_c = 0;
+        g.restore_cursor();
+        assert_eq!(g.cur_r, 5);
+        assert_eq!(g.cur_c, 10);
+    }
+
+    // ── Search ──
+    #[test]
+    fn test_search() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Hello World\nFoo Bar\nHello Again");
+        let results = g.search("hello");
+        assert_eq!(results.len(), 2);
+    }
+
+    // ── Render ──
+    #[test]
+    fn test_render() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Hello\nWorld");
+        let text = g.render();
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+    }
+
+    // ── OSC / DCS skip ──
+    #[test]
+    fn test_osc_skip() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b]0;Title\x07Hello");
+        assert_eq!(g.cells[0][0].ch, 'H');
+    }
+
+    #[test]
+    fn test_dcs_skip() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1bPsomething\x1b\\Hello");
+        assert_eq!(g.cells[0][0].ch, 'H');
+    }
+
+    // ── UTF-8 ──
+    #[test]
+    fn test_utf8() {
+        let mut g = new_grid(80, 24);
+        g.process("日本語".as_bytes());
+        assert_eq!(g.cells[0][0].ch, '日');
+        assert_eq!(g.cells[0][1].ch, '本');
+        assert_eq!(g.cells[0][2].ch, '語');
+    }
+
+    // ── Insert/Delete lines ──
+    #[test]
+    fn test_insert_line() {
+        let mut g = new_grid(80, 5);
+        g.process(b"A\r\nB\r\nC");
+        g.cur_r = 1;
+        g.process(b"\x1b[L"); // insert line at row 1
+        assert_eq!(g.cells[1][0].ch, ' '); // inserted blank line
+    }
+
+    #[test]
+    fn test_delete_line() {
+        let mut g = new_grid(80, 5);
+        g.process(b"A\r\nB\r\nC");
+        g.cur_r = 1;
+        g.process(b"\x1b[M"); // delete line at row 1
+        assert_eq!(g.cells[1][0].ch, 'C'); // C moved up
+    }
+
+    // ── Scrollback ──
+    #[test]
+    fn test_scrollback_limit() {
+        let mut g = new_grid(10, 3);
+        g.max_scrollback = 5;
+        for i in 0..20 {
+            g.process(format!("{}\n", i).as_bytes());
+        }
+        assert!(g.scrollback.len() <= 5);
+    }
+
+    // ── Config ──
+    #[test]
+    fn test_config_default() {
+        let cfg = Config::default();
+        assert_eq!(cfg.font_size, 12.0);
+        assert_eq!(cfg.scrollback, 5000);
+        assert_eq!(cfg.opacity, 0.97);
+        assert!(!cfg.bg_color.is_empty());
+    }
+
+    // ── Color mapping ──
+    #[test]
+    fn test_ansi_to_vec4_all() {
+        for i in 0..=15 {
+            let v = ansi_to_vec4(i);
+            assert!(v.x >= 0.0 && v.x <= 1.0);
+            assert!(v.y >= 0.0 && v.y <= 1.0);
+        }
+        let def = ansi_to_vec4(255);
+        assert!(def.x > 0.5); // default fg is light
+    }
+
+    #[test]
+    fn test_rgb_to_ansi_basic() {
+        assert_eq!(rgb_to_ansi(0, 0, 0), 0);       // black
+        assert!(rgb_to_ansi(255, 0, 0) <= 9);       // red
+        assert!(rgb_to_ansi(0, 255, 0) <= 10);      // green
+        assert!(rgb_to_ansi(255, 255, 255) >= 7);   // white
+    }
+
+    // ── Key mapping ──
+    #[test]
+    fn test_shift_char() {
+        assert_eq!(shift_char('a'), 'A');
+        assert_eq!(shift_char('z'), 'Z');
+        assert_eq!(shift_char('1'), '!');
+        assert_eq!(shift_char(';'), ':');
+        assert_eq!(shift_char('-'), '_');
+        assert_eq!(shift_char('['), '{');
+        assert_eq!(shift_char('\\'), '|');
+        assert_eq!(shift_char('`'), '~');
+    }
+}

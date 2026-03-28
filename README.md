@@ -8,6 +8,22 @@ A lightweight, modern, GPU-accelerated terminal emulator built in Rust. Combines
 
 ![Screenshot](assets/screenshot.png)
 
+## Download
+
+**[Latest Release](https://github.com/situkangsayur/leuwi-panjang/releases/latest)**
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `leuwi-panjang-linux-x86_64` |
+| macOS ARM64 | `leuwi-panjang-macos-arm64` |
+| Windows x86_64 | `leuwi-panjang-windows-x86_64.exe` |
+
+```bash
+# Linux
+chmod +x leuwi-panjang-linux-x86_64
+./leuwi-panjang-linux-x86_64
+```
+
 ## Why Leuwi Panjang?
 
 Existing terminals make trade-offs:
