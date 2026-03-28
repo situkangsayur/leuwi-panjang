@@ -11,7 +11,7 @@ live_design! {
     // TerminalGrid will be added when custom Makepad draw pipeline is ready
 
     // Dark Green Theme
-    LEUWI_BG      = #x0A1410D9   // 85% opacity (D9 = 217/255 = 0.85)
+    LEUWI_BG      = #x0A1410FF   // opaque dark green (transparency via compositor)
     LEUWI_FG      = #xB8D4CCFF
     LEUWI_GREEN   = #x00FF88FF
     LEUWI_TAB_BG  = #x060F0BFF
@@ -19,11 +19,6 @@ live_design! {
     LEUWI_BORDER  = #x1A3A28FF
     LEUWI_DIM     = #x5C8A72FF
     LEUWI_HOVER   = #x0D1F17FF
-
-    TERM_STYLE = {
-        font_size: 13.0,
-        line_spacing: 1.5,
-    }
 
     LeuwiTab = <Button> {
         width: Fit, height: Fill,
@@ -136,7 +131,7 @@ live_design! {
                         terminal_output = <Label> {
                             width: Fill,
                             text: ""
-                            draw_text: { color: (LEUWI_FG), text_style: (TERM_STYLE) }
+                            draw_text: { color: (LEUWI_FG), text_style: { font_size: 13.0, line_spacing: 1.5 } }
                         }
                     }
 
@@ -156,7 +151,7 @@ live_design! {
                         terminal_output2 = <Label> {
                             width: Fill,
                             text: ""
-                            draw_text: { color: (LEUWI_FG), text_style: (TERM_STYLE) }
+                            draw_text: { color: (LEUWI_FG), text_style: { font_size: 13.0, line_spacing: 1.5 } }
                         }
                     }
                 }
@@ -233,14 +228,21 @@ impl LeuwiApp {
         if self.initialized { return; }
         self.initialized = true;
 
+        // Remove OS title bar after window appears (GNOME Wayland via XWayland)
         #[cfg(target_os = "linux")]
         {
             std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                let _ = std::process::Command::new("xprop")
-                    .args(["-name", "Leuwi Panjang", "-f", "_MOTIF_WM_HINTS", "32c",
-                           "-set", "_MOTIF_WM_HINTS", "0x2, 0x0, 0x0, 0x0, 0x0"])
-                    .output();
+                // Wait for window to fully initialize
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                // Try multiple times in case window isn't ready yet
+                for _ in 0..5 {
+                    let result = std::process::Command::new("xprop")
+                        .args(["-name", "Leuwi Panjang", "-f", "_MOTIF_WM_HINTS", "32c",
+                               "-set", "_MOTIF_WM_HINTS", "0x2, 0x0, 0x0, 0x0, 0x0"])
+                        .output();
+                    if result.is_ok() { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
             });
         }
 
