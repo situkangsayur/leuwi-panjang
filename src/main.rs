@@ -827,18 +827,36 @@ live_design! {
             }
             window_menu = <WindowMenu> { main = Main { items: [] } }
             body = <View> {
-                width: Fill, height: Fill, flow: Right
-                show_bg: true
-                draw_bg: { color: #x1E1E1E }
-                terminal = <TermView> {}
-                split_bar = <View> {
-                    visible: false
-                    width: 2, height: Fill
+                width: Fill, height: Fill, flow: Down
+
+                // Terminal panes area
+                panes = <View> {
+                    width: Fill, height: Fill, flow: Right
                     show_bg: true
-                    draw_bg: { color: #x333333 }
+                    draw_bg: { color: #x1E1E1E }
+                    terminal = <TermView> {}
+                    split_bar = <View> {
+                        visible: false
+                        width: 2, height: Fill
+                        show_bg: true
+                        draw_bg: { color: #x333333 }
+                    }
+                    terminal2 = <TermView> {
+                        width: 0, height: 0
+                    }
                 }
-                terminal2 = <TermView> {
-                    width: 0, height: 0
+
+                // Status bar
+                status = <View> {
+                    width: Fill, height: 20, flow: Right
+                    show_bg: true
+                    draw_bg: { color: #x181818 }
+                    align: { y: 0.5 }
+                    padding: { left: 10, right: 10 }
+                    status_text = <Label> {
+                        text: ""
+                        draw_text: { color: #x6E7681, text_style: { font_size: 8.5 } }
+                    }
                 }
             }
         }
@@ -985,6 +1003,17 @@ impl App {
         }
     }
 
+    /// Write bytes to the currently focused pane (main or split)
+    fn write_to_active(&mut self, data: &[u8]) {
+        if self.split_active {
+            if let Some(split) = &mut self.tabs[self.active_tab].split {
+                split.write(data);
+            }
+        } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.write(data);
+        }
+    }
+
     fn handle_resize(&mut self, width: f64, height: f64) {
         let chrome_h = 32.0 + 8.0;
         let cw = 7.8;  // match actual render cell width
@@ -1018,6 +1047,14 @@ impl AppMain for App {
             Event::Startup => { self.init(cx); }
             Event::Timer(_) => {
                 self.update_tab_label(cx);
+                // Status bar info
+                let tab_info = format!(
+                    "Tab {}/{}  {}  Cols:{}  Rows:{}",
+                    self.active_tab + 1, self.tabs.len(),
+                    if self.tabs[self.active_tab].split.is_some() { "Split" } else { "" },
+                    self.config.cols, self.config.rows,
+                );
+                self.ui.label(id!(status_text)).set_text(cx, &tab_info);
                 self.ui.redraw(cx);
             }
             Event::KeyDown(ke) => {
@@ -1037,6 +1074,7 @@ impl AppMain for App {
                         KeyCode::KeyC => { self.copy_to_clipboard(); return; }
                         KeyCode::KeyV => { self.paste_from_clipboard(); return; }
                         KeyCode::KeyD => { self.split_vertical(cx); return; }
+                        KeyCode::KeyE => { self.split_vertical(cx); return; } // horizontal split (same impl for now)
                         KeyCode::KeyF => {
                             // TODO: open search UI overlay
                             // For now, search is via shell (Ctrl+R in zsh)
@@ -1071,35 +1109,29 @@ impl AppMain for App {
                         _ => {}
                     }
                 }
-                // Forward special keys to PTY (printable chars via TextInput)
+                // Forward ONLY special/control keys via KeyDown
+                // Printable chars come via TextInput (no double-send)
                 self.key_handled = false;
                 let b = key_to_special_bytes(ke);
                 if !b.is_empty() {
                     self.key_handled = true;
+                    self.write_to_active(&b);
+                    self.ui.term_view(id!(terminal)).reset_scroll();
                     if self.split_active {
-                        if let Some(split) = &mut self.tabs[self.active_tab].split {
-                            split.write(&b);
-                            self.ui.term_view(id!(terminal2)).reset_scroll();
-                        }
-                    } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                        tab.write(&b);
-                        self.ui.term_view(id!(terminal)).reset_scroll();
+                        self.ui.term_view(id!(terminal2)).reset_scroll();
                     }
                 }
             }
             Event::TextInput(te) => {
-                if !self.key_handled && !te.input.is_empty() && !te.was_paste {
-                    let ch = te.input.as_str();
-                    if self.split_active {
-                        if let Some(split) = &mut self.tabs[self.active_tab].split {
-                            split.write(ch.as_bytes());
-                        }
-                    } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                        tab.write(ch.as_bytes());
-                    }
+                // ALL printable input comes here (handles shift, layout, etc.)
+                // Skip if KeyDown already handled this event (special keys)
+                if self.key_handled {
+                    self.key_handled = false;
+                    // don't send — already sent via KeyDown
+                } else if !te.input.is_empty() && !te.was_paste {
+                    self.write_to_active(te.input.as_bytes());
                     self.ui.term_view(id!(terminal)).reset_scroll();
                 }
-                self.key_handled = false;
             }
             Event::WindowGeomChange(ev) => {
                 let size = ev.new_geom.inner_size;
