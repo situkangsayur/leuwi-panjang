@@ -258,16 +258,17 @@ impl Widget for TermView {
         let ch = 20.0_f64;
         let pad = 12.0;
 
-        // Calculate content height for scroll
-        let last_row = grid.cur_r.max(
+        // Total rows = scrollback + visible grid
+        let sb_len = grid.scrollback.len();
+        let vis_last = grid.cur_r.max(
             grid.cells.iter().enumerate()
                 .filter(|(_, row)| row.iter().any(|c| c.ch != ' '))
                 .map(|(r, _)| r).max().unwrap_or(0)
         );
-        let content_h = ((last_row + 2) as f64) * ch + pad * 2.0;
+        let total_rows = sb_len + vis_last + 2;
+        let content_h = (total_rows as f64) * ch + pad * 2.0;
         let content_w = (grid.cols as f64) * cw + pad * 2.0;
 
-        // Set walk size to content size so ScrollXYView can scroll
         let sized_walk = Walk {
             width: Size::Fixed(content_w),
             height: Size::Fixed(content_h),
@@ -279,15 +280,26 @@ impl Widget for TermView {
 
         let px = rect.pos.x + pad;
         let py = rect.pos.y + pad;
-
         let mut char_buf = [0u8; 4];
-        for r in 0..=last_row {
-            let y = py + (r as f64) * ch;
 
+        // Draw scrollback rows
+        for (r, row) in grid.scrollback.iter().enumerate() {
+            let y = py + (r as f64) * ch;
+            for (c, cell) in row.iter().enumerate() {
+                if cell.ch == ' ' { continue; }
+                let x = px + (c as f64) * cw;
+                self.draw_text.color = ansi_to_vec4(cell.fg);
+                let s = cell.ch.encode_utf8(&mut char_buf);
+                self.draw_text.draw_abs(cx, dvec2(x, y), s);
+            }
+        }
+
+        // Draw visible grid rows
+        for r in 0..=vis_last {
+            let y = py + ((sb_len + r) as f64) * ch;
             for c in 0..grid.cols {
                 let cell = &grid.cells[r][c];
                 if cell.ch == ' ' { continue; }
-
                 let x = px + (c as f64) * cw;
                 self.draw_text.color = ansi_to_vec4(cell.fg);
                 let s = cell.ch.encode_utf8(&mut char_buf);
@@ -297,7 +309,7 @@ impl Widget for TermView {
 
         // Cursor
         let cx_pos = px + (grid.cur_c as f64) * cw;
-        let cy_pos = py + (grid.cur_r as f64) * ch;
+        let cy_pos = py + ((sb_len + grid.cur_r) as f64) * ch;
         self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cx_pos, cy_pos), size: dvec2(2.0, ch) });
 
         DrawStep::done()
