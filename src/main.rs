@@ -259,55 +259,28 @@ impl Widget for TermView {
         let px = rect.pos.x + 12.0;
         let py = rect.pos.y + 8.0;
 
-        // Find last row with content
-        let mut last_row = 0;
-        for (r, row) in grid.cells.iter().enumerate() {
-            if row.iter().any(|c| c.ch != ' ') { last_row = r; }
-        }
-        let last_row = last_row.max(grid.cur_r);
+        // Render each character individually at exact grid position
+        let last_row = grid.cur_r.max(
+            grid.cells.iter().enumerate()
+                .filter(|(_, row)| row.iter().any(|c| c.ch != ' '))
+                .map(|(r, _)| r).max().unwrap_or(0)
+        );
 
+        let mut char_buf = [0u8; 4];
         for r in 0..=last_row {
             let y = py + (r as f64) * ch;
             if y > rect.pos.y + rect.size.y { break; }
 
-            // Render row as color spans — group consecutive same-color chars
-            let mut c = 0;
-            while c < grid.cols {
-                // Skip trailing spaces
-                if grid.cells[r][c].ch == ' ' {
-                    c += 1;
-                    continue;
-                }
+            for c in 0..grid.cols {
+                let cell = &grid.cells[r][c];
+                if cell.ch == ' ' { continue; }
 
-                let fg = grid.cells[r][c].fg;
-                let start = c;
-                let mut span = String::new();
+                let x = px + (c as f64) * cw;
+                if x > rect.pos.x + rect.size.x { break; }
 
-                // Collect chars with same fg color (including spaces within)
-                while c < grid.cols {
-                    let cell = &grid.cells[r][c];
-                    if cell.ch == ' ' {
-                        // Check if there are more non-space chars with same color ahead
-                        let mut peek = c + 1;
-                        while peek < grid.cols && grid.cells[r][peek].ch == ' ' { peek += 1; }
-                        if peek < grid.cols && grid.cells[r][peek].fg == fg && grid.cells[r][peek].ch != ' ' {
-                            // Include the spaces
-                            while c < peek { span.push(' '); c += 1; }
-                            continue;
-                        } else {
-                            break; // End of this color span
-                        }
-                    }
-                    if cell.fg != fg { break; }
-                    span.push(cell.ch);
-                    c += 1;
-                }
-
-                if !span.is_empty() {
-                    let x = px + (start as f64) * cw;
-                    self.draw_text.color = ansi_to_vec4(fg);
-                    self.draw_text.draw_abs(cx, dvec2(x, y), &span);
-                }
+                self.draw_text.color = ansi_to_vec4(cell.fg);
+                let s = cell.ch.encode_utf8(&mut char_buf);
+                self.draw_text.draw_abs(cx, dvec2(x, y), s);
             }
         }
 
@@ -428,8 +401,8 @@ impl App {
         cmd.args(["--no-globalrcs", "--no-rcs"]);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        // Simple white prompt — no colors in prompt itself
-        cmd.env("PROMPT", "%n@%m %~ %# ");
+        // Simple prompt
+        cmd.env("PS1", "$ ");
         cmd.env("RPROMPT", "");
         cmd.env("LS_COLORS", "di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=33;40:cd=33;40:*.tar=1;31:*.gz=1;31:*.zip=1;31:*.jpg=1;35:*.png=1;35:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.toml=33:*.json=33:*.md=37:*.sh=32");
         cmd.env("CLICOLOR", "1");
