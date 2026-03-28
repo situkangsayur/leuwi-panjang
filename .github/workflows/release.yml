@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libpulse-dev
+      - name: Build release
+        run: cargo build --release
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/leuwi-panjang dist/leuwi-panjang-linux-x86_64
+          chmod +x dist/leuwi-panjang-linux-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: dist/
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/leuwi-panjang dist/leuwi-panjang-macos-arm64
+          chmod +x dist/leuwi-panjang-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-binary
+          path: dist/
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release
+      - name: Package
+        run: |
+          mkdir dist
+          copy target\release\leuwi-panjang.exe dist\leuwi-panjang-windows-x86_64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: dist/
+
+  release:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            linux-binary/leuwi-panjang-linux-x86_64
+            macos-binary/leuwi-panjang-macos-arm64
+            windows-binary/leuwi-panjang-windows-x86_64.exe
+          body: |
+            ## Leuwi Panjang Terminal ${{ github.ref_name }}
+
+            Lightweight, chromeless, GPU-accelerated terminal emulator built in Rust.
+
+            ### Downloads
+            - **Linux (x86_64)**: `leuwi-panjang-linux-x86_64`
+            - **macOS (ARM64)**: `leuwi-panjang-macos-arm64`
+            - **Windows (x86_64)**: `leuwi-panjang-windows-x86_64.exe`
+
+            ### Install
+            ```bash
+            chmod +x leuwi-panjang-linux-x86_64
+            ./leuwi-panjang-linux-x86_64
+            ```
