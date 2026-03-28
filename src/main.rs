@@ -274,11 +274,15 @@ live_design! {
                 }
             }
             window_menu = <WindowMenu> { main = Main { items: [] } }
-            body = <View> {
+            body = <ScrollXYView> {
                 width: Fill, height: Fill, flow: Down
                 show_bg: true
                 draw_bg: { color: #x1E1E1E }
-                padding: { top: 8, left: 12, right: 12, bottom: 6 }
+                padding: { top: 4, left: 10, right: 10, bottom: 4 }
+                scroll_bars: <ScrollBars> {
+                    show_scroll_x: false
+                    show_scroll_y: true
+                }
                 output = <Label> {
                     width: Fill
                     text: ""
