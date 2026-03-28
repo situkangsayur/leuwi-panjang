@@ -183,12 +183,13 @@ impl TermTab {
 #[derive(Clone, Copy)]
 struct Cell {
     ch: char,
-    fg: u8,  // ANSI color index 0-15, 255=default
+    fg: u8,   // ANSI color index 0-15, 255=default
+    bg: u8,   // ANSI bg color, 255=default (transparent)
     bold: bool,
 }
 
 impl Default for Cell {
-    fn default() -> Self { Self { ch: ' ', fg: 255, bold: false } }
+    fn default() -> Self { Self { ch: ' ', fg: 255, bg: 255, bold: false } }
 }
 
 // ── Terminal Grid ──────────────────────────────────────────
@@ -201,6 +202,7 @@ struct TermGrid {
     cur_r: usize,
     cur_c: usize,
     cur_fg: u8,
+    cur_bg: u8,
     cur_bold: bool,
     // Alternate screen buffer (for vim, htop, less, etc.)
     alt_cells: Option<Vec<Vec<Cell>>>,
@@ -226,7 +228,7 @@ impl TermGrid {
             cells: vec![vec![Cell::default(); cols]; rows],
             scrollback: Vec::new(),
             max_scrollback: 5000,
-            cur_r: 0, cur_c: 0, cur_fg: 255, cur_bold: false,
+            cur_r: 0, cur_c: 0, cur_fg: 255, cur_bg: 255, cur_bold: false,
             alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
             saved_cur_r: 0, saved_cur_c: 0,
             scroll_top: 0, scroll_bottom: rows.saturating_sub(1),
@@ -271,7 +273,7 @@ impl TermGrid {
     fn put(&mut self, ch: char) {
         if self.cur_c >= self.cols { self.cur_c = 0; self.newline(); }
         if self.cur_r < self.rows {
-            self.cells[self.cur_r][self.cur_c] = Cell { ch, fg: self.cur_fg, bold: self.cur_bold };
+            self.cells[self.cur_r][self.cur_c] = Cell { ch, fg: self.cur_fg, bg: self.cur_bg, bold: self.cur_bold };
             self.cur_c += 1;
         }
     }
@@ -407,30 +409,45 @@ impl TermGrid {
                                     b'F' => { self.cur_c = 0; self.cur_r = self.cur_r.saturating_sub(p0.max(1)); }
                                     b'm' => {
                                         // SGR — process colors
-                                        if params.is_empty() { self.cur_fg = 255; self.cur_bold = false; }
+                                        if params.is_empty() { self.cur_fg = 255; self.cur_bg = 255; self.cur_bold = false; }
                                         else {
                                             let mut j = 0;
                                             while j < params.len() {
                                                 match params[j] {
-                                                    0 => { self.cur_fg = 255; self.cur_bold = false; }
+                                                    0 => { self.cur_fg = 255; self.cur_bg = 255; self.cur_bold = false; }
                                                     1 => self.cur_bold = true,
-                                                    22 => self.cur_bold = false,
+                                                    2 | 22 => self.cur_bold = false,
+                                                    3 => {} // italic
+                                                    4 => {} // underline
+                                                    7 => { std::mem::swap(&mut self.cur_fg, &mut self.cur_bg); } // reverse
+                                                    27 => { std::mem::swap(&mut self.cur_fg, &mut self.cur_bg); } // reverse off
                                                     30..=37 => self.cur_fg = (params[j] - 30) as u8,
                                                     39 => self.cur_fg = 255,
+                                                    40..=47 => self.cur_bg = (params[j] - 40) as u8,
+                                                    49 => self.cur_bg = 255,
                                                     90..=97 => self.cur_fg = (params[j] - 90 + 8) as u8,
+                                                    100..=107 => self.cur_bg = (params[j] - 100 + 8) as u8,
                                                     38 => {
-                                                        // 256-color: 38;5;N
                                                         if j+2 < params.len() && params[j+1] == 5 {
                                                             self.cur_fg = params[j+2].min(255) as u8;
                                                             j += 2;
                                                         } else if j+4 < params.len() && params[j+1] == 2 {
-                                                            // RGB — map to nearest basic color
                                                             let r = params[j+2]; let g = params[j+3]; let b = params[j+4];
                                                             self.cur_fg = rgb_to_ansi(r as u8, g as u8, b as u8);
                                                             j += 4;
                                                         }
                                                     }
-                                                    _ => {} // ignore bg, underline, etc for now
+                                                    48 => {
+                                                        if j+2 < params.len() && params[j+1] == 5 {
+                                                            self.cur_bg = params[j+2].min(255) as u8;
+                                                            j += 2;
+                                                        } else if j+4 < params.len() && params[j+1] == 2 {
+                                                            let r = params[j+2]; let g = params[j+3]; let b = params[j+4];
+                                                            self.cur_bg = rgb_to_ansi(r as u8, g as u8, b as u8);
+                                                            j += 4;
+                                                        }
+                                                    }
+                                                    _ => {}
                                                 }
                                                 j += 1;
                                             }
@@ -692,9 +709,16 @@ impl Widget for TermView {
             };
 
             for (c, cell) in row_cells.iter().enumerate() {
-                if cell.ch == ' ' { continue; }
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
+
+                // Draw bg color if not default
+                if cell.bg != 255 {
+                    self.draw_cursor.color = ansi_to_vec4(cell.bg);
+                    self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
+                }
+
+                if cell.ch == ' ' { continue; }
                 self.draw_text.color = ansi_to_vec4(cell.fg);
                 let s = cell.ch.encode_utf8(&mut char_buf);
                 self.draw_text.draw_abs(cx, dvec2(x, y), s);
@@ -884,10 +908,11 @@ impl App {
     fn update_tab_label(&mut self, cx: &mut Cx) {
         let labels: Vec<String> = self.tabs.iter().enumerate().map(|(i, t)| {
             let name = t.dynamic_title();
+            let split_indicator = if t.split.is_some() { "⫽" } else { "" };
             if i == self.active_tab {
-                format!(" ● {} ", name)
+                format!(" ▌{} {} ×", name, split_indicator)
             } else {
-                format!("   {}  ", name)
+                format!("  {} {}  ", name, split_indicator)
             }
         }).collect();
         let text = labels.join("│");
