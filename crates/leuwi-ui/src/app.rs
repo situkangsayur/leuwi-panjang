@@ -208,6 +208,40 @@ live_design! {
                     }
                 }
 
+                // Menu panel (hidden by default, shown on ≡ click)
+                menu_overlay = <View> {
+                    visible: false,
+                    width: 300,
+                    height: Fill,
+                    show_bg: true,
+                    draw_bg: { color: (LEUWI_TAB_BG) }
+                    padding: { top: 8, bottom: 8, left: 0, right: 0 },
+                    flow: Down,
+
+                    menu_title = <Label> {
+                        width: Fill,
+                        padding: { left: 16, right: 16, bottom: 8 },
+                        text: "Leuwi Panjang"
+                        draw_text: {
+                            color: (LEUWI_GREEN),
+                            text_style: { font_size: 13.0 }
+                        }
+                    }
+
+                    menu_content = <Label> {
+                        width: Fill,
+                        padding: { left: 16, right: 16 },
+                        text: ""
+                        draw_text: {
+                            color: (LEUWI_FG),
+                            text_style: {
+                                font_size: 11.0,
+                                line_spacing: 1.6,
+                            }
+                        }
+                    }
+                }
+
                 // Status bar
                 status_bar = <View> {
                     width: Fill,
@@ -269,6 +303,8 @@ pub struct LeuwiApp {
     split_active: bool,
     #[rust]
     active_pane: u8, // 0 = pane1, 1 = pane2
+    #[rust]
+    menu_open: bool,
     #[rust]
     initialized: bool,
 }
@@ -533,6 +569,19 @@ impl LeuwiApp {
 
         output
     }
+
+    fn toggle_menu(&mut self, cx: &mut Cx) {
+        self.menu_open = !self.menu_open;
+        self.ui.view(id!(menu_overlay)).set_visible(cx, self.menu_open);
+
+        if self.menu_open {
+            let menu_items = crate::menu::build_main_menu();
+            let text = crate::menu::menu_to_text(&menu_items, 0);
+            self.ui.label(id!(menu_content)).set_text(cx, &text);
+        }
+
+        self.ui.redraw(cx);
+    }
 }
 
 impl MatchEvent for LeuwiApp {
@@ -541,10 +590,11 @@ impl MatchEvent for LeuwiApp {
             // TODO: new tab
         }
         if self.ui.button(id!(menu_btn)).clicked(actions) {
-            // TODO: hamburger menu popup
+            self.toggle_menu(cx);
         }
     }
 }
+
 
 impl AppMain for LeuwiApp {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
@@ -571,6 +621,12 @@ impl AppMain for LeuwiApp {
                 self.ui.redraw(cx);
             }
             Event::KeyDown(ke) => {
+                // Close menu on Escape
+                if ke.key_code == KeyCode::Escape && self.menu_open {
+                    self.toggle_menu(cx);
+                    return;
+                }
+
                 // Ctrl+Shift shortcuts (terminal special keys)
                 if ke.modifiers.control && ke.modifiers.shift {
                     match ke.key_code {
