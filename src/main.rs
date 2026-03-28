@@ -225,18 +225,18 @@ live_design! {
         ui: <Window> {
             window: { title: "Leuwi Panjang", inner_size: vec2(1100, 700) }
             show_bg: true
-            draw_bg: { color: #x161B22 }
+            draw_bg: { color: #x1E1E1E }
 
             caption_bar = <SolidView> {
                 visible: true, flow: Right, height: 32
-                draw_bg: { color: #x0D1117 }
+                draw_bg: { color: #x181818 }
                 caption_label = <View> { visible: false, width: 0, height: 0 }
                 tabs = <View> {
                     width: Fill, height: Fill, flow: Right, align: { y: 0.5 }, padding: { left: 8 }
                     tab1 = <Button> {
                         text: " Terminal 1 "
-                        draw_text: { color: #xC9D1D9, text_style: { font_size: 9.5 } }
-                        draw_bg: { color: #x161B22, fn pixel(self) -> vec4 { return self.color; } }
+                        draw_text: { color: #xC5C8C6, text_style: { font_size: 9.5 } }
+                        draw_bg: { color: #x1E1E1E, fn pixel(self) -> vec4 { return self.color; } }
                         padding: { left: 14, right: 14, top: 4, bottom: 4 }
                     }
                     <View> { width: Fill, height: Fill }
@@ -262,12 +262,17 @@ live_design! {
             body = <View> {
                 width: Fill, height: Fill, flow: Down
                 show_bg: true
-                draw_bg: { color: #x161B22 }
+                draw_bg: { color: #x1E1E1E }
                 padding: { top: 8, left: 12, right: 12, bottom: 6 }
                 output = <Label> {
                     width: Fill
                     text: ""
-                    draw_text: { color: #xC9D1D9, text_style: { font_size: 13.0 } }
+                    draw_text: {
+                        color: #xC5C8C6
+                        text_style: (THEME_FONT_CODE) {
+                            font_size: 11.0
+                        }
+                    }
                 }
             }
         }
