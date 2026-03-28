@@ -293,11 +293,18 @@ impl App {
         let size = portable_pty::PtySize { rows: 45, cols: 140, pixel_width: 0, pixel_height: 0 };
         let pair = pty_system.openpty(size).unwrap();
 
-        let shell = std::env::var("SHELL").unwrap_or("/bin/bash".into());
-        let mut cmd = portable_pty::CommandBuilder::new(&shell);
+        // Spawn zsh with clean config — no oh-my-zsh/p10k
+        let mut cmd = portable_pty::CommandBuilder::new("/bin/zsh");
+        cmd.args(["--no-globalrcs", "--no-rcs"]); // skip .zshrc
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        for v in &["HOME","USER","PATH","LANG","DISPLAY","WAYLAND_DISPLAY","XDG_RUNTIME_DIR","DBUS_SESSION_BUS_ADDRESS","SSH_AUTH_SOCK"] {
+        // Simple prompt: user@host dir (git branch) $
+        cmd.env("PROMPT", "%n@%m %~ $ ");
+        cmd.env("RPROMPT", "");
+        // Color ls
+        cmd.env("LS_COLORS", "di=34:ln=36:so=35:pi=33:ex=32:bd=33;40:cd=33;40:su=37;41:sg=30;43:tw=30;42:ow=34;42:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36");
+        cmd.env("CLICOLOR", "1");
+        for v in &["HOME","USER","PATH","LANG","DISPLAY","WAYLAND_DISPLAY","XDG_RUNTIME_DIR","DBUS_SESSION_BUS_ADDRESS","SSH_AUTH_SOCK","EDITOR"] {
             if let Ok(val) = std::env::var(v) { cmd.env(v, &val); }
         }
         pair.slave.spawn_command(cmd).unwrap();
