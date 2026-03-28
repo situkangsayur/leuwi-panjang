@@ -64,6 +64,12 @@ impl TermTab {
         grid.render()
     }
 
+    fn resize(&mut self, cols: usize, rows: usize) {
+        let mut grid = self.grid.lock().unwrap();
+        grid.resize(cols, rows);
+        // TODO: also resize the PTY (requires keeping master handle)
+    }
+
     /// Get dynamic title from current prompt line (last line with content)
     fn dynamic_title(&self) -> String {
         let grid = self.grid.lock().unwrap();
@@ -161,6 +167,50 @@ impl TermGrid {
     fn clear_line_full(&mut self) { for c in 0..self.cols { self.cells[self.cur_r][c] = Cell::default(); } }
     fn clear_screen(&mut self) { for r in &mut self.cells { for c in r.iter_mut() { *c = Cell::default(); } } self.cur_r = 0; self.cur_c = 0; }
     fn clear_below(&mut self) { self.clear_line_right(); for r in (self.cur_r+1)..self.rows { for c in 0..self.cols { self.cells[r][c] = Cell::default(); } } }
+
+    fn resize(&mut self, new_cols: usize, new_rows: usize) {
+        let mut new_cells = vec![vec![Cell::default(); new_cols]; new_rows];
+        let copy_r = self.rows.min(new_rows);
+        let copy_c = self.cols.min(new_cols);
+        for r in 0..copy_r {
+            for c in 0..copy_c {
+                new_cells[r][c] = self.cells[r][c];
+            }
+        }
+        self.cells = new_cells;
+        self.cols = new_cols;
+        self.rows = new_rows;
+        self.cur_r = self.cur_r.min(new_rows.saturating_sub(1));
+        self.cur_c = self.cur_c.min(new_cols.saturating_sub(1));
+    }
+
+    /// Search scrollback + visible for text, return list of (abs_row, col) matches
+    fn search(&self, query: &str) -> Vec<(usize, usize)> {
+        let mut results = Vec::new();
+        if query.is_empty() { return results; }
+        let q = query.to_lowercase();
+
+        // Search scrollback
+        for (r, row) in self.scrollback.iter().enumerate() {
+            let line: String = row.iter().map(|c| c.ch.to_lowercase().next().unwrap_or(' ')).collect();
+            let mut start = 0;
+            while let Some(pos) = line[start..].find(&q) {
+                results.push((r, start + pos));
+                start += pos + 1;
+            }
+        }
+        // Search visible
+        let sb = self.scrollback.len();
+        for r in 0..self.rows {
+            let line: String = self.cells[r].iter().map(|c| c.ch.to_lowercase().next().unwrap_or(' ')).collect();
+            let mut start = 0;
+            while let Some(pos) = line[start..].find(&q) {
+                results.push((sb + r, start + pos));
+                start += pos + 1;
+            }
+        }
+        results
+    }
 
     fn render(&self) -> String {
         // Render all visible rows, trim trailing empty rows
@@ -632,10 +682,31 @@ impl App {
             Err(_) => return,
         };
         if text.is_empty() { return; }
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.write(b"\x1b[200~"); // bracketed paste start
+        if self.split_active {
+            if let Some(tab) = &mut self.split_tab {
+                tab.write(b"\x1b[200~");
+                tab.write(text.as_bytes());
+                tab.write(b"\x1b[201~");
+            }
+        } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.write(b"\x1b[200~");
             tab.write(text.as_bytes());
-            tab.write(b"\x1b[201~"); // bracketed paste end
+            tab.write(b"\x1b[201~");
+        }
+    }
+
+    fn handle_resize(&mut self, width: f64, height: f64) {
+        let chrome_h = 32.0 + 20.0; // caption + padding
+        let cw = 9.5;
+        let ch = 20.0;
+        let cols = ((width - 24.0) / cw).max(20.0) as usize;
+        let rows = ((height - chrome_h) / ch).max(5.0) as usize;
+        // Resize all tabs
+        for tab in &mut self.tabs {
+            tab.resize(cols, rows);
+        }
+        if let Some(tab) = &mut self.split_tab {
+            tab.resize(cols / 2, rows);
         }
     }
 }
@@ -675,12 +746,23 @@ impl AppMain for App {
                         KeyCode::KeyC => { self.copy_to_clipboard(); return; }
                         KeyCode::KeyV => { self.paste_from_clipboard(); return; }
                         KeyCode::KeyD => { self.split_vertical(cx); return; }
+                        KeyCode::KeyF => {
+                            // TODO: open search UI overlay
+                            // For now, search is via shell (Ctrl+R in zsh)
+                            return;
+                        }
                         _ => {}
                     }
                 }
                 // Ctrl+Tab = next tab
                 if ke.modifiers.control && ke.key_code == KeyCode::Tab {
                     self.next_tab(cx);
+                    return;
+                }
+                // F11 = fullscreen
+                if ke.key_code == KeyCode::F11 {
+                    // Makepad doesn't have direct fullscreen toggle
+                    // but we can maximize
                     return;
                 }
                 // Alt+F4 = close window
@@ -713,6 +795,10 @@ impl AppMain for App {
                         }
                     }
                 }
+            }
+            Event::WindowGeomChange(ev) => {
+                let size = ev.new_geom.inner_size;
+                self.handle_resize(size.x, size.y);
             }
             _ => {}
         }
