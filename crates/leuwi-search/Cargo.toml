@@ -1,0 +1,11 @@
+[package]
+name = "leuwi-search"
+description = "Scrollback search and tab/pane fuzzy search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+regex = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

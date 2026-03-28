@@ -1,0 +1,113 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/leuwi-terminal",
+    "crates/leuwi-renderer",
+    "crates/leuwi-pty",
+    "crates/leuwi-ssh",
+    "crates/leuwi-ui",
+    "crates/leuwi-config",
+    "crates/leuwi-suggestions",
+    "crates/leuwi-plugin-host",
+    "crates/leuwi-plugin-sdk",
+    "crates/leuwi-crypto",
+    "crates/leuwi-search",
+    "crates/leuwi-shell-integration",
+    "crates/leuwi-wireguard",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["situkangsayur"]
+repository = "https://github.com/situkangsayur/leuwi-panjang"
+
+[workspace.dependencies]
+# Internal crates
+leuwi-terminal = { path = "crates/leuwi-terminal" }
+leuwi-renderer = { path = "crates/leuwi-renderer" }
+leuwi-pty = { path = "crates/leuwi-pty" }
+leuwi-ssh = { path = "crates/leuwi-ssh" }
+leuwi-ui = { path = "crates/leuwi-ui" }
+leuwi-config = { path = "crates/leuwi-config" }
+leuwi-suggestions = { path = "crates/leuwi-suggestions" }
+leuwi-plugin-host = { path = "crates/leuwi-plugin-host" }
+leuwi-plugin-sdk = { path = "crates/leuwi-plugin-sdk" }
+leuwi-crypto = { path = "crates/leuwi-crypto" }
+leuwi-search = { path = "crates/leuwi-search" }
+leuwi-shell-integration = { path = "crates/leuwi-shell-integration" }
+leuwi-wireguard = { path = "crates/leuwi-wireguard" }
+
+# Makepad
+makepad-widgets = { git = "https://github.com/makepad/makepad", branch = "main" }
+
+# Terminal
+vte = "0.15"
+portable-pty = "0.8"
+
+# SSH
+russh = "0.58"
+
+# Text shaping
+rustybuzz = "0.20"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+notify = "8"
+
+# Crypto
+aes-gcm = "0.10"
+argon2 = "0.5"
+secrecy = "0.10"
+
+# WireGuard
+boringtun = "0.7"
+
+# Plugin
+wasmtime = "29"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utils
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+regex = "1"
+arboard = "3"
+
+[package]
+name = "leuwi-panjang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "leuwi-panjang"
+path = "src/main.rs"
+
+[dependencies]
+leuwi-terminal = { workspace = true }
+leuwi-renderer = { workspace = true }
+leuwi-pty = { workspace = true }
+leuwi-ui = { workspace = true }
+leuwi-config = { workspace = true }
+makepad-widgets = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

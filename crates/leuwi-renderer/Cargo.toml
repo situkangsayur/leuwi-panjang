@@ -1,0 +1,12 @@
+[package]
+name = "leuwi-renderer"
+description = "Terminal grid renderer using Makepad shaders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+leuwi-terminal = { workspace = true }
+makepad-widgets = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

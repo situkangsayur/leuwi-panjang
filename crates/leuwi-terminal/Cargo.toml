@@ -1,0 +1,12 @@
+[package]
+name = "leuwi-terminal"
+description = "VT terminal parser and screen buffer for Leuwi Panjang"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vte = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }

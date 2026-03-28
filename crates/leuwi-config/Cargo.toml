@@ -1,0 +1,16 @@
+[package]
+name = "leuwi-config"
+description = "Configuration, profiles, and theme management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+notify = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
