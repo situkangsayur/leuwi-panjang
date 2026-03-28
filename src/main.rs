@@ -2,6 +2,75 @@ use makepad_widgets::*;
 use std::sync::{Arc, Mutex};
 use std::io::{Read, Write};
 use arboard::Clipboard;
+use serde::{Deserialize, Serialize};
+
+// ── Config ─────────────────────────────────────────────────
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Config {
+    #[serde(default = "default_shell")]
+    shell: String,
+    #[serde(default = "default_font_size")]
+    font_size: f64,
+    #[serde(default = "default_cols")]
+    cols: usize,
+    #[serde(default = "default_rows")]
+    rows: usize,
+    #[serde(default = "default_scrollback")]
+    scrollback: usize,
+    #[serde(default = "default_bg")]
+    bg_color: String,
+    #[serde(default = "default_fg")]
+    fg_color: String,
+    #[serde(default = "default_prompt")]
+    prompt: String,
+    #[serde(default = "default_opacity")]
+    opacity: f64,
+}
+
+fn default_shell() -> String { std::env::var("SHELL").unwrap_or("/bin/zsh".into()) }
+fn default_font_size() -> f64 { 12.0 }
+fn default_cols() -> usize { 110 }
+fn default_rows() -> usize { 33 }
+fn default_scrollback() -> usize { 5000 }
+fn default_bg() -> String { "#1E1E1E".into() }
+fn default_fg() -> String { "#C5C8C6".into() }
+fn default_prompt() -> String { "%n@%m %~ %# ".into() }
+fn default_opacity() -> f64 { 0.97 }
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            shell: default_shell(), font_size: default_font_size(),
+            cols: default_cols(), rows: default_rows(),
+            scrollback: default_scrollback(),
+            bg_color: default_bg(), fg_color: default_fg(),
+            prompt: default_prompt(), opacity: default_opacity(),
+        }
+    }
+}
+
+impl Config {
+    fn load() -> Self {
+        let path = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("leuwi-panjang/config.toml");
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(cfg) = toml::from_str(&content) {
+                    return cfg;
+                }
+            }
+        }
+        // Write default config if not exists
+        let cfg = Config::default();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap_or_default());
+        cfg
+    }
+}
 
 // ── Terminal Tab ───────────────────────────────────────────
 struct TermTab {
@@ -13,17 +82,18 @@ struct TermTab {
 }
 
 impl TermTab {
-    fn spawn(id: usize) -> Self {
-        let grid = Arc::new(Mutex::new(TermGrid::new(110, 33)));
+    fn spawn(id: usize, cfg: &Config) -> Self {
+        let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
         let pty_system = portable_pty::native_pty_system();
-        let size = portable_pty::PtySize { rows: 33, cols: 110, pixel_width: 0, pixel_height: 0 };
+        let size = portable_pty::PtySize { rows: cfg.rows as u16, cols: cfg.cols as u16, pixel_width: 0, pixel_height: 0 };
         let pair = pty_system.openpty(size).unwrap();
 
-        let mut cmd = portable_pty::CommandBuilder::new("/bin/zsh");
-        cmd.args(["--no-globalrcs", "--no-rcs"]);
+        let shell = &cfg.shell;
+        let mut cmd = portable_pty::CommandBuilder::new(shell);
+        if shell.contains("zsh") { cmd.args(["--no-globalrcs", "--no-rcs"]); }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("PROMPT", "%n@%m %~ %# ");
+        cmd.env("PROMPT", &cfg.prompt);
         cmd.env("RPROMPT", "");
         cmd.env("LS_COLORS", "di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=33;40:cd=33;40:*.tar=1;31:*.gz=1;31:*.zip=1;31:*.jpg=1;35:*.png=1;35:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.toml=33:*.json=33:*.md=37:*.sh=32");
         cmd.env("CLICOLOR", "1");
@@ -720,8 +790,9 @@ pub struct App {
     #[rust] active_tab: usize,
     #[rust] started: bool,
     #[rust] tab_counter: usize,
-    #[rust] split_tab: Option<TermTab>,  // second pane (split)
-    #[rust] split_active: bool,          // is right pane focused
+    #[rust] split_tab: Option<TermTab>,
+    #[rust] split_active: bool,
+    #[rust] config: Config,
 }
 
 impl LiveRegister for App {
@@ -734,8 +805,9 @@ impl App {
     fn init(&mut self, cx: &mut Cx) {
         if self.started { return; }
         self.started = true;
+        self.config = Config::load();
         self.tab_counter = 1;
-        self.tabs.push(TermTab::spawn(1));
+        self.tabs.push(TermTab::spawn(1, &self.config));
         self.active_tab = 0;
         self.ui.term_view(id!(terminal)).set_grid(self.tabs[0].grid.clone());
         self.update_tab_label(cx);
@@ -745,7 +817,7 @@ impl App {
     fn new_tab(&mut self, cx: &mut Cx) {
         if self.tabs.len() >= 5 { return; }
         self.tab_counter += 1;
-        self.tabs.push(TermTab::spawn(self.tab_counter));
+        self.tabs.push(TermTab::spawn(self.tab_counter, &self.config));
         self.active_tab = self.tabs.len() - 1;
         self.switch_to_active(cx);
     }
@@ -783,7 +855,7 @@ impl App {
     fn split_vertical(&mut self, cx: &mut Cx) {
         if self.split_tab.is_some() { return; }
         self.tab_counter += 1;
-        let tab = TermTab::spawn(self.tab_counter);
+        let tab = TermTab::spawn(self.tab_counter, &self.config);
         self.ui.term_view(id!(terminal2)).set_grid(tab.grid.clone());
         self.split_tab = Some(tab);
         self.split_active = true;
@@ -917,20 +989,35 @@ impl AppMain for App {
                         _ => {}
                     }
                 }
-                // Forward to active pane PTY
-                let b = key_to_bytes(ke);
+                // Forward ONLY special keys to PTY (printable chars via TextInput)
+                let b = key_to_special_bytes(ke);
                 if !b.is_empty() {
                     if self.split_active {
                         if let Some(tab) = &mut self.split_tab {
                             tab.write(&b);
                             self.ui.term_view(id!(terminal2)).reset_scroll();
                         }
-                    } else {
-                        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                            tab.write(&b);
-                            self.ui.term_view(id!(terminal)).reset_scroll();
-                        }
+                    } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        tab.write(&b);
+                        self.ui.term_view(id!(terminal)).reset_scroll();
                     }
+                }
+            }
+            Event::TextInput(te) => {
+                // TextInput gives us the actual typed character (handles shift, etc.)
+                // Only use if not a control key combo
+                if !te.input.is_empty() && !te.was_paste {
+                    let ch = te.input.as_str();
+                    // Don't double-send if we already handled it in KeyDown
+                    // TextInput handles: :, ", {, }, <, >, ?, etc.
+                    if self.split_active {
+                        if let Some(tab) = &mut self.split_tab {
+                            tab.write(ch.as_bytes());
+                        }
+                    } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        tab.write(ch.as_bytes());
+                    }
+                    self.ui.term_view(id!(terminal)).reset_scroll();
                 }
             }
             Event::WindowGeomChange(ev) => {
@@ -942,7 +1029,9 @@ impl AppMain for App {
     }
 }
 
-fn key_to_bytes(ke: &KeyEvent) -> Vec<u8> {
+/// Only handle special/control keys — printable chars come via TextInput
+fn key_to_special_bytes(ke: &KeyEvent) -> Vec<u8> {
+    // Ctrl+key combos
     if ke.modifiers.control {
         if let Some(c) = kc_char(&ke.key_code) {
             let c = c.to_ascii_lowercase();
@@ -950,22 +1039,33 @@ fn key_to_bytes(ke: &KeyEvent) -> Vec<u8> {
         }
     }
     match ke.key_code {
-        KeyCode::ReturnKey => vec![13], KeyCode::Backspace => vec![127],
-        KeyCode::Tab => vec![9], KeyCode::Escape => vec![27],
-        KeyCode::ArrowUp => vec![27,b'[',b'A'], KeyCode::ArrowDown => vec![27,b'[',b'B'],
-        KeyCode::ArrowRight => vec![27,b'[',b'C'], KeyCode::ArrowLeft => vec![27,b'[',b'D'],
-        KeyCode::Home => vec![27,b'[',b'H'], KeyCode::End => vec![27,b'[',b'F'],
-        KeyCode::PageUp => vec![27,b'[',b'5',b'~'], KeyCode::PageDown => vec![27,b'[',b'6',b'~'],
-        KeyCode::Delete => vec![27,b'[',b'3',b'~'],
-        _ => {
-            if let Some(c) = kc_char(&ke.key_code) {
-                let c = if ke.modifiers.shift { shift_char(c) } else { c };
-                let mut b = [0u8;4]; c.encode_utf8(&mut b);
-                return b[..c.len_utf8()].to_vec();
-            }
-            if ke.key_code == KeyCode::Space { return vec![32]; }
-            vec![]
-        }
+        KeyCode::ReturnKey => vec![13],
+        KeyCode::Backspace => vec![127],
+        KeyCode::Tab => vec![9],
+        KeyCode::Escape => vec![27],
+        KeyCode::ArrowUp => vec![27, b'[', b'A'],
+        KeyCode::ArrowDown => vec![27, b'[', b'B'],
+        KeyCode::ArrowRight => vec![27, b'[', b'C'],
+        KeyCode::ArrowLeft => vec![27, b'[', b'D'],
+        KeyCode::Home => vec![27, b'[', b'H'],
+        KeyCode::End => vec![27, b'[', b'F'],
+        KeyCode::PageUp => vec![27, b'[', b'5', b'~'],
+        KeyCode::PageDown => vec![27, b'[', b'6', b'~'],
+        KeyCode::Delete => vec![27, b'[', b'3', b'~'],
+        KeyCode::F1 => vec![27, b'O', b'P'],
+        KeyCode::F2 => vec![27, b'O', b'Q'],
+        KeyCode::F3 => vec![27, b'O', b'R'],
+        KeyCode::F4 => vec![27, b'O', b'S'],
+        KeyCode::F5 => vec![27, b'[', b'1', b'5', b'~'],
+        KeyCode::F6 => vec![27, b'[', b'1', b'7', b'~'],
+        KeyCode::F7 => vec![27, b'[', b'1', b'8', b'~'],
+        KeyCode::F8 => vec![27, b'[', b'1', b'9', b'~'],
+        KeyCode::F9 => vec![27, b'[', b'2', b'0', b'~'],
+        KeyCode::F10 => vec![27, b'[', b'2', b'1', b'~'],
+        KeyCode::F11 => vec![27, b'[', b'2', b'3', b'~'],
+        KeyCode::F12 => vec![27, b'[', b'2', b'4', b'~'],
+        // Don't handle printable chars — they come via TextInput
+        _ => vec![],
     }
 }
 
