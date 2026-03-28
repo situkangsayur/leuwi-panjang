@@ -2,13 +2,27 @@ use makepad_widgets::*;
 use std::sync::{Arc, Mutex};
 use std::io::{Read, Write};
 
+// ── Cell with color ────────────────────────────────────────
+#[derive(Clone, Copy)]
+struct Cell {
+    ch: char,
+    fg: u8,  // ANSI color index 0-15, 255=default
+    bold: bool,
+}
+
+impl Default for Cell {
+    fn default() -> Self { Self { ch: ' ', fg: 255, bold: false } }
+}
+
 // ── Terminal Grid ──────────────────────────────────────────
 struct TermGrid {
     cols: usize,
     rows: usize,
-    cells: Vec<Vec<char>>,
-    cursor_row: usize,
-    cursor_col: usize,
+    cells: Vec<Vec<Cell>>,
+    cur_r: usize,
+    cur_c: usize,
+    cur_fg: u8,
+    cur_bold: bool,
 }
 
 impl Default for TermGrid {
@@ -19,177 +33,126 @@ impl TermGrid {
     fn new(cols: usize, rows: usize) -> Self {
         Self {
             cols, rows,
-            cells: vec![vec![' '; cols]; rows],
-            cursor_row: 0, cursor_col: 0,
+            cells: vec![vec![Cell::default(); cols]; rows],
+            cur_r: 0, cur_c: 0, cur_fg: 255, cur_bold: false,
         }
     }
 
-    fn put_char(&mut self, c: char) {
-        if self.cursor_col >= self.cols {
-            self.cursor_col = 0;
-            self.newline();
-        }
-        if self.cursor_row < self.rows {
-            self.cells[self.cursor_row][self.cursor_col] = c;
-            self.cursor_col += 1;
+    fn put(&mut self, ch: char) {
+        if self.cur_c >= self.cols { self.cur_c = 0; self.newline(); }
+        if self.cur_r < self.rows {
+            self.cells[self.cur_r][self.cur_c] = Cell { ch, fg: self.cur_fg, bold: self.cur_bold };
+            self.cur_c += 1;
         }
     }
 
     fn newline(&mut self) {
-        if self.cursor_row + 1 >= self.rows {
-            // Scroll up
+        if self.cur_r + 1 >= self.rows {
             self.cells.remove(0);
-            self.cells.push(vec![' '; self.cols]);
+            self.cells.push(vec![Cell::default(); self.cols]);
         } else {
-            self.cursor_row += 1;
+            self.cur_r += 1;
         }
     }
 
-    fn carriage_return(&mut self) { self.cursor_col = 0; }
-    fn backspace(&mut self) { if self.cursor_col > 0 { self.cursor_col -= 1; } }
-    fn tab(&mut self) { self.cursor_col = ((self.cursor_col / 8) + 1) * 8; if self.cursor_col >= self.cols { self.cursor_col = self.cols - 1; } }
+    fn cr(&mut self) { self.cur_c = 0; }
+    fn bs(&mut self) { if self.cur_c > 0 { self.cur_c -= 1; } }
+    fn tab(&mut self) { self.cur_c = ((self.cur_c / 8) + 1) * 8; if self.cur_c >= self.cols { self.cur_c = self.cols - 1; } }
 
-    fn clear_line_from_cursor(&mut self) {
-        for c in self.cursor_col..self.cols { self.cells[self.cursor_row][c] = ' '; }
-    }
-    fn clear_screen(&mut self) {
-        for row in &mut self.cells { for c in row.iter_mut() { *c = ' '; } }
-        self.cursor_row = 0; self.cursor_col = 0;
-    }
-    fn clear_screen_from_cursor(&mut self) {
-        self.clear_line_from_cursor();
-        for r in (self.cursor_row + 1)..self.rows {
-            for c in 0..self.cols { self.cells[r][c] = ' '; }
-        }
-    }
+    fn clear_line_right(&mut self) { for c in self.cur_c..self.cols { self.cells[self.cur_r][c] = Cell::default(); } }
+    fn clear_line_full(&mut self) { for c in 0..self.cols { self.cells[self.cur_r][c] = Cell::default(); } }
+    fn clear_screen(&mut self) { for r in &mut self.cells { for c in r.iter_mut() { *c = Cell::default(); } } self.cur_r = 0; self.cur_c = 0; }
+    fn clear_below(&mut self) { self.clear_line_right(); for r in (self.cur_r+1)..self.rows { for c in 0..self.cols { self.cells[r][c] = Cell::default(); } } }
 
-    fn cursor_up(&mut self, n: usize) { self.cursor_row = self.cursor_row.saturating_sub(n); }
-    fn cursor_down(&mut self, n: usize) { self.cursor_row = (self.cursor_row + n).min(self.rows - 1); }
-    fn cursor_forward(&mut self, n: usize) { self.cursor_col = (self.cursor_col + n).min(self.cols - 1); }
-    fn cursor_back(&mut self, n: usize) { self.cursor_col = self.cursor_col.saturating_sub(n); }
-    fn cursor_to(&mut self, row: usize, col: usize) {
-        self.cursor_row = row.min(self.rows - 1);
-        self.cursor_col = col.min(self.cols - 1);
-    }
-    fn cursor_to_col(&mut self, col: usize) { self.cursor_col = col.min(self.cols - 1); }
-
-    fn render(&self) -> String {
-        let mut out = String::with_capacity((self.cols + 1) * self.rows);
-        let mut last_content_row = 0;
-        for (r, row) in self.cells.iter().enumerate() {
-            if row.iter().any(|&c| c != ' ') { last_content_row = r; }
-        }
-        for r in 0..=last_content_row {
-            let mut last_non_space = 0;
-            for (c, &ch) in self.cells[r].iter().enumerate() {
-                if ch != ' ' { last_non_space = c + 1; }
-            }
-            for c in 0..last_non_space {
-                out.push(self.cells[r][c]);
-            }
-            if r < last_content_row { out.push('\n'); }
-        }
-        out
-    }
-
-    /// Process raw PTY bytes through a simple VT parser
     fn process(&mut self, data: &[u8]) {
         let mut i = 0;
         while i < data.len() {
-            let b = data[i];
-            match b {
+            match data[i] {
                 0x1b => {
-                    i += 1;
-                    if i >= data.len() { break; }
+                    i += 1; if i >= data.len() { break; }
                     match data[i] {
                         b'[' => {
-                            // CSI sequence
                             i += 1;
-                            let mut params = Vec::new();
+                            let mut params: Vec<usize> = Vec::new();
                             let mut num: i32 = -1;
-                            let mut private = false;
-
                             while i < data.len() {
                                 let c = data[i];
-                                if c == b'?' { private = true; i += 1; continue; }
-                                if c == b'>' || c == b'=' || c == b'!' { i += 1; continue; }
-                                if c >= b'0' && c <= b'9' {
+                                if c == b'?' || c == b'>' || c == b'=' || c == b'!' { i += 1; continue; }
+                                if (b'0'..=b'9').contains(&c) {
                                     if num < 0 { num = 0; }
                                     num = num * 10 + (c - b'0') as i32;
                                     i += 1; continue;
                                 }
-                                if c == b';' {
-                                    params.push(if num < 0 { 0 } else { num as usize });
-                                    num = -1; i += 1; continue;
-                                }
-                                // Final byte
+                                if c == b';' { params.push(if num < 0 { 0 } else { num as usize }); num = -1; i += 1; continue; }
                                 if num >= 0 { params.push(num as usize); }
-                                let p0 = params.first().copied().unwrap_or(1);
-                                let p1 = params.get(1).copied().unwrap_or(1);
+                                let p0 = params.first().copied().unwrap_or(0);
+                                let p1 = params.get(1).copied().unwrap_or(0);
                                 match c {
-                                    b'A' => self.cursor_up(p0.max(1)),
-                                    b'B' => self.cursor_down(p0.max(1)),
-                                    b'C' => self.cursor_forward(p0.max(1)),
-                                    b'D' => self.cursor_back(p0.max(1)),
-                                    b'H' | b'f' => self.cursor_to(p0.saturating_sub(1), p1.saturating_sub(1)),
-                                    b'G' => self.cursor_to_col(p0.saturating_sub(1)),
-                                    b'd' => { self.cursor_row = p0.saturating_sub(1).min(self.rows - 1); }
-                                    b'J' => {
-                                        match p0 { 0 => self.clear_screen_from_cursor(), 2 | 3 => self.clear_screen(), _ => {} }
-                                    }
-                                    b'K' => {
-                                        match params.first().copied().unwrap_or(0) {
-                                            0 => self.clear_line_from_cursor(),
-                                            2 => { for c in 0..self.cols { self.cells[self.cursor_row][c] = ' '; } }
-                                            _ => {}
+                                    b'A' => self.cur_r = self.cur_r.saturating_sub(p0.max(1)),
+                                    b'B' => self.cur_r = (self.cur_r + p0.max(1)).min(self.rows - 1),
+                                    b'C' => self.cur_c = (self.cur_c + p0.max(1)).min(self.cols - 1),
+                                    b'D' => self.cur_c = self.cur_c.saturating_sub(p0.max(1)),
+                                    b'H' | b'f' => { self.cur_r = p0.max(1).saturating_sub(1).min(self.rows-1); self.cur_c = p1.max(1).saturating_sub(1).min(self.cols-1); }
+                                    b'G' => self.cur_c = p0.max(1).saturating_sub(1).min(self.cols-1),
+                                    b'd' => self.cur_r = p0.max(1).saturating_sub(1).min(self.rows-1),
+                                    b'J' => match p0 { 0 => self.clear_below(), 2|3 => self.clear_screen(), _ => {} },
+                                    b'K' => match p0 { 0 => self.clear_line_right(), 2 => self.clear_line_full(), _ => {} },
+                                    b'E' => { self.cur_c = 0; self.cur_r = (self.cur_r + p0.max(1)).min(self.rows-1); }
+                                    b'F' => { self.cur_c = 0; self.cur_r = self.cur_r.saturating_sub(p0.max(1)); }
+                                    b'm' => {
+                                        // SGR — process colors
+                                        if params.is_empty() { self.cur_fg = 255; self.cur_bold = false; }
+                                        else {
+                                            let mut j = 0;
+                                            while j < params.len() {
+                                                match params[j] {
+                                                    0 => { self.cur_fg = 255; self.cur_bold = false; }
+                                                    1 => self.cur_bold = true,
+                                                    22 => self.cur_bold = false,
+                                                    30..=37 => self.cur_fg = (params[j] - 30) as u8,
+                                                    39 => self.cur_fg = 255,
+                                                    90..=97 => self.cur_fg = (params[j] - 90 + 8) as u8,
+                                                    38 => {
+                                                        // 256-color: 38;5;N
+                                                        if j+2 < params.len() && params[j+1] == 5 {
+                                                            self.cur_fg = params[j+2].min(255) as u8;
+                                                            j += 2;
+                                                        } else if j+4 < params.len() && params[j+1] == 2 {
+                                                            // RGB — map to nearest basic color
+                                                            let r = params[j+2]; let g = params[j+3]; let b = params[j+4];
+                                                            self.cur_fg = rgb_to_ansi(r as u8, g as u8, b as u8);
+                                                            j += 4;
+                                                        }
+                                                    }
+                                                    _ => {} // ignore bg, underline, etc for now
+                                                }
+                                                j += 1;
+                                            }
                                         }
                                     }
-                                    b'E' => { self.cursor_col = 0; self.cursor_down(p0.max(1)); }
-                                    b'F' => { self.cursor_col = 0; self.cursor_up(p0.max(1)); }
-                                    // m (SGR), h, l, r, etc — silently ignore
-                                    _ => {}
+                                    _ => {} // silently ignore other CSI
                                 }
                                 i += 1; break;
                             }
                         }
-                        b']' => {
-                            // OSC — skip until BEL or ST
-                            i += 1;
-                            while i < data.len() {
-                                if data[i] == 0x07 { i += 1; break; }
-                                if data[i] == 0x1b && i + 1 < data.len() && data[i+1] == b'\\' { i += 2; break; }
-                                i += 1;
-                            }
-                        }
-                        b'P' | b'_' | b'^' => {
-                            // DCS, APC, PM — skip until ST
-                            i += 1;
-                            while i < data.len() {
-                                if data[i] == 0x1b && i + 1 < data.len() && data[i+1] == b'\\' { i += 2; break; }
-                                if data[i] == 0x07 { i += 1; break; }
-                                i += 1;
-                            }
-                        }
-                        b'(' | b')' | b'*' | b'+' => { i += 1; } // charset — skip next byte
-                        b'7' | b'8' | b'c' | b'D' | b'E' | b'M' => {} // save/restore/reset — ignore
-                        _ => {}
+                        b']' => { i += 1; while i < data.len() { if data[i] == 0x07 { i += 1; break; } if data[i] == 0x1b { i += 2; break; } i += 1; } }
+                        b'P' | b'_' | b'^' => { i += 1; while i < data.len() { if data[i] == 0x1b { i += 2; break; } if data[i] == 0x07 { i += 1; break; } i += 1; } }
+                        b'(' | b')' | b'*' | b'+' => { i += 1; if i < data.len() { i += 1; } }
+                        _ => { i += 1; }
                     }
                 }
                 b'\n' => { self.newline(); i += 1; }
-                b'\r' => { self.carriage_return(); i += 1; }
-                b'\x08' => { self.backspace(); i += 1; }
+                b'\r' => { self.cr(); i += 1; }
+                b'\x08' => { self.bs(); i += 1; }
                 b'\t' => { self.tab(); i += 1; }
-                0x07 => { i += 1; } // BEL
-                0x00..=0x06 | 0x0e..=0x1a | 0x1c..=0x1f => { i += 1; } // skip control chars
+                0x00..=0x06 | 0x07 | 0x0e..=0x1a | 0x1c..=0x1f => { i += 1; }
                 _ => {
-                    // UTF-8 character
-                    let start = i;
-                    if b < 0x80 { self.put_char(b as char); i += 1; }
+                    if data[i] < 0x80 { self.put(data[i] as char); i += 1; }
                     else {
-                        let len = if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 };
-                        let end = (start + len).min(data.len());
-                        if let Ok(s) = std::str::from_utf8(&data[start..end]) {
-                            for ch in s.chars() { self.put_char(ch); }
+                        let len = if data[i] < 0xE0 { 2 } else if data[i] < 0xF0 { 3 } else { 4 };
+                        let end = (i + len).min(data.len());
+                        if let Ok(s) = std::str::from_utf8(&data[i..end]) {
+                            for ch in s.chars() { self.put(ch); }
                             i = end;
                         } else { i += 1; }
                     }
@@ -199,11 +162,54 @@ impl TermGrid {
     }
 }
 
-// ── Makepad App ────────────────────────────────────────────
+fn rgb_to_ansi(r: u8, g: u8, b: u8) -> u8 {
+    // Simple mapping to 16 basic colors
+    let brightness = (r as u16 + g as u16 + b as u16) / 3;
+    if brightness < 40 { return 0; }
+    if r > 150 && g < 100 && b < 100 { return if brightness > 180 { 9 } else { 1 }; }
+    if g > 150 && r < 100 && b < 100 { return if brightness > 180 { 10 } else { 2 }; }
+    if r > 150 && g > 150 && b < 100 { return if brightness > 180 { 11 } else { 3 }; }
+    if b > 150 && r < 100 && g < 100 { return if brightness > 180 { 12 } else { 4 }; }
+    if r > 150 && b > 150 && g < 100 { return if brightness > 180 { 13 } else { 5 }; }
+    if g > 150 && b > 150 && r < 100 { return if brightness > 180 { 14 } else { 6 }; }
+    if brightness > 200 { 15 } else if brightness > 120 { 7 } else { 8 }
+}
+
+// ANSI color to Makepad vec4
+fn ansi_to_vec4(idx: u8) -> Vec4 {
+    match idx {
+        0  => vec4(0.20, 0.24, 0.28, 1.0),  // black
+        1  => vec4(1.00, 0.33, 0.33, 1.0),  // red
+        2  => vec4(0.25, 0.73, 0.31, 1.0),  // green
+        3  => vec4(0.83, 0.69, 0.22, 1.0),  // yellow
+        4  => vec4(0.35, 0.61, 0.98, 1.0),  // blue
+        5  => vec4(0.74, 0.50, 0.98, 1.0),  // magenta
+        6  => vec4(0.32, 0.83, 0.89, 1.0),  // cyan
+        7  => vec4(0.79, 0.82, 0.89, 1.0),  // white
+        8  => vec4(0.41, 0.46, 0.52, 1.0),  // bright black
+        9  => vec4(1.00, 0.47, 0.47, 1.0),  // bright red
+        10 => vec4(0.35, 0.83, 0.42, 1.0),  // bright green
+        11 => vec4(0.93, 0.83, 0.32, 1.0),  // bright yellow
+        12 => vec4(0.50, 0.74, 1.00, 1.0),  // bright blue
+        13 => vec4(0.84, 0.64, 1.00, 1.0),  // bright magenta
+        14 => vec4(0.44, 0.91, 0.97, 1.0),  // bright cyan
+        15 => vec4(0.91, 0.93, 0.98, 1.0),  // bright white
+        _  => vec4(0.90, 0.93, 0.96, 1.0),  // default fg
+    }
+}
+
+// ── Custom Terminal Widget ─────────────────────────────────
 
 live_design! {
     use link::theme::*;
     use link::widgets::*;
+
+    TermView = {{TermView}} {
+        width: Fill, height: Fill
+        draw_bg: { color: #x161B22 }
+        draw_text: { text_style: { font_size: 13.0 } }
+        draw_cursor: { color: #x58A6FF }
+    }
 
     App = {{App}} {
         ui: <Window> {
@@ -212,17 +218,11 @@ live_design! {
             draw_bg: { color: #x161B22 }
 
             caption_bar = <SolidView> {
-                visible: true
-                flow: Right
-                height: 32
+                visible: true, flow: Right, height: 32
                 draw_bg: { color: #x0D1117 }
                 caption_label = <View> { visible: false, width: 0, height: 0 }
-
                 tabs = <View> {
-                    width: Fill, height: Fill, flow: Right
-                    align: { y: 0.5 }
-                    padding: { left: 8 }
-
+                    width: Fill, height: Fill, flow: Right, align: { y: 0.5 }, padding: { left: 8 }
                     tab1 = <Button> {
                         text: " Terminal 1 "
                         draw_text: { color: #xC9D1D9, text_style: { font_size: 9.5 } }
@@ -231,16 +231,14 @@ live_design! {
                     }
                     <View> { width: Fill, height: Fill }
                     plus_btn = <Button> {
-                        text: "+"
+                        text: "+", width: 28
                         draw_text: { color: #x6E7681, text_style: { font_size: 13.0 } }
                         draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #x30363D60, self.hover); } }
-                        width: 28
                     }
                     menu_btn = <Button> {
-                        text: "≡"
+                        text: "≡", width: 32
                         draw_text: { color: #x6E7681, text_style: { font_size: 14.0 } }
                         draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #x30363D60, self.hover); } }
-                        width: 32
                     }
                 }
                 windows_buttons = <View> {
@@ -250,27 +248,80 @@ live_design! {
                     close = <DesktopButton> { draw_bg: { button_type: WindowsClose } }
                 }
             }
-
             window_menu = <WindowMenu> { main = Main { items: [] } }
-
             body = <View> {
-                width: Fill, height: Fill, flow: Down
-                show_bg: true
-                draw_bg: { color: #x161B22 }
-                padding: { top: 8, left: 12, right: 12, bottom: 6 }
-
-                output = <Label> {
-                    width: Fill
-                    text: ""
-                    draw_text: {
-                        color: #xE6EDF3
-                        text_style: { font_size: 13.0 }
-                    }
-                }
+                width: Fill, height: Fill
+                terminal = <TermView> {}
             }
         }
     }
 }
+
+// ── TermView Widget ────────────────────────────────────────
+
+#[derive(Live, LiveHook, Widget)]
+pub struct TermView {
+    #[redraw] #[live] draw_bg: DrawColor,
+    #[live] draw_text: DrawText,
+    #[live] draw_cursor: DrawColor,
+    #[walk] walk: Walk,
+    #[layout] layout: Layout,
+    #[rust] grid: Option<Arc<Mutex<TermGrid>>>,
+}
+
+impl Widget for TermView {
+    fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        let rect = cx.walk_turtle(walk);
+        self.draw_bg.draw_abs(cx, rect);
+
+        let grid = match &self.grid {
+            Some(g) => g.lock().unwrap(),
+            None => return DrawStep::done(),
+        };
+
+        let cw = 7.8_f64;   // cell width (monospace char width at font_size 13)
+        let ch = 18.0_f64;  // cell height (line height)
+        let pad_x = 10.0;
+        let pad_y = 6.0;
+
+        for r in 0..grid.rows {
+            let y = rect.pos.y + pad_y + (r as f64) * ch;
+            if y > rect.pos.y + rect.size.y { break; }
+
+            for c in 0..grid.cols {
+                let cell = &grid.cells[r][c];
+                if cell.ch == ' ' || cell.ch == '\0' { continue; }
+
+                let x = rect.pos.x + pad_x + (c as f64) * cw;
+                if x > rect.pos.x + rect.size.x { break; }
+
+                self.draw_text.color = ansi_to_vec4(cell.fg);
+                let s = cell.ch.to_string();
+                self.draw_text.draw_abs(cx, dvec2(x, y), &s);
+            }
+        }
+
+        // Draw cursor
+        let cx_pos = rect.pos.x + pad_x + (grid.cur_c as f64) * cw;
+        let cy_pos = rect.pos.y + pad_y + (grid.cur_r as f64) * ch;
+        self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cx_pos, cy_pos), size: dvec2(2.0, ch) });
+
+        DrawStep::done()
+    }
+}
+
+impl TermView {
+    fn set_grid(&mut self, grid: Arc<Mutex<TermGrid>>) { self.grid = Some(grid); }
+}
+impl TermViewRef {
+    fn set_grid(&self, grid: Arc<Mutex<TermGrid>>) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_grid(grid); }
+    }
+}
+
+// ── App ────────────────────────────────────────────────────
 
 #[derive(Live, LiveHook)]
 pub struct App {
@@ -281,7 +332,9 @@ pub struct App {
 }
 
 impl LiveRegister for App {
-    fn live_register(cx: &mut Cx) { makepad_widgets::live_design(cx); }
+    fn live_register(cx: &mut Cx) {
+        makepad_widgets::live_design(cx);
+    }
 }
 
 impl App {
@@ -289,21 +342,20 @@ impl App {
         if self.started { return; }
         self.started = true;
 
+        // Pass grid to TermView widget
+        self.ui.term_view(id!(terminal)).set_grid(self.grid.clone());
+
         let pty_system = portable_pty::native_pty_system();
         let size = portable_pty::PtySize { rows: 45, cols: 140, pixel_width: 0, pixel_height: 0 };
         let pair = pty_system.openpty(size).unwrap();
 
-        // Spawn zsh with clean config — no oh-my-zsh/p10k
         let mut cmd = portable_pty::CommandBuilder::new("/bin/zsh");
-        cmd.args(["--no-globalrcs", "--no-rcs"]); // skip .zshrc
+        cmd.args(["--no-globalrcs", "--no-rcs"]);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        // Simple prompt: user@host dir (git branch) $
         cmd.env("PROMPT", "%n@%m %~ $ ");
         cmd.env("RPROMPT", "");
-        // Color ls
-        cmd.env("LS_COLORS", "di=34:ln=36:so=35:pi=33:ex=32:bd=33;40:cd=33;40:su=37;41:sg=30;43:tw=30;42:ow=34;42:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36");
-        cmd.env("CLICOLOR", "1");
+        cmd.env("LS_COLORS", "di=1;34:ln=36:so=35:pi=33:ex=1;32:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.md=37:*.toml=33:*.json=33:*.yaml=33:*.sh=32:*.txt=37");
         for v in &["HOME","USER","PATH","LANG","DISPLAY","WAYLAND_DISPLAY","XDG_RUNTIME_DIR","DBUS_SESSION_BUS_ADDRESS","SSH_AUTH_SOCK","EDITOR"] {
             if let Ok(val) = std::env::var(v) { cmd.env(v, &val); }
         }
@@ -324,7 +376,6 @@ impl App {
                 }
             }
         });
-
         cx.start_interval(0.033);
     }
 }
@@ -337,14 +388,9 @@ impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
-
         match event {
             Event::Startup => { self.start_pty(cx); }
-            Event::Timer(_) => {
-                let text = self.grid.lock().unwrap().render();
-                self.ui.label(id!(output)).set_text(cx, &text);
-                self.ui.redraw(cx);
-            }
+            Event::Timer(_) => { self.ui.redraw(cx); }
             Event::KeyDown(ke) => {
                 if let Some(w) = &mut self.pty_writer {
                     let b = key_to_bytes(ke);
@@ -364,24 +410,17 @@ fn key_to_bytes(ke: &KeyEvent) -> Vec<u8> {
         }
     }
     match ke.key_code {
-        KeyCode::ReturnKey => vec![13],
-        KeyCode::Backspace => vec![127],
-        KeyCode::Tab => vec![9],
-        KeyCode::Escape => vec![27],
-        KeyCode::ArrowUp => vec![27, b'[', b'A'],
-        KeyCode::ArrowDown => vec![27, b'[', b'B'],
-        KeyCode::ArrowRight => vec![27, b'[', b'C'],
-        KeyCode::ArrowLeft => vec![27, b'[', b'D'],
-        KeyCode::Home => vec![27, b'[', b'H'],
-        KeyCode::End => vec![27, b'[', b'F'],
-        KeyCode::PageUp => vec![27, b'[', b'5', b'~'],
-        KeyCode::PageDown => vec![27, b'[', b'6', b'~'],
-        KeyCode::Delete => vec![27, b'[', b'3', b'~'],
+        KeyCode::ReturnKey => vec![13], KeyCode::Backspace => vec![127],
+        KeyCode::Tab => vec![9], KeyCode::Escape => vec![27],
+        KeyCode::ArrowUp => vec![27,b'[',b'A'], KeyCode::ArrowDown => vec![27,b'[',b'B'],
+        KeyCode::ArrowRight => vec![27,b'[',b'C'], KeyCode::ArrowLeft => vec![27,b'[',b'D'],
+        KeyCode::Home => vec![27,b'[',b'H'], KeyCode::End => vec![27,b'[',b'F'],
+        KeyCode::PageUp => vec![27,b'[',b'5',b'~'], KeyCode::PageDown => vec![27,b'[',b'6',b'~'],
+        KeyCode::Delete => vec![27,b'[',b'3',b'~'],
         _ => {
             if let Some(c) = kc_char(&ke.key_code) {
                 let c = if ke.modifiers.shift { shift_char(c) } else { c };
-                let mut b = [0u8; 4];
-                c.encode_utf8(&mut b);
+                let mut b = [0u8;4]; c.encode_utf8(&mut b);
                 return b[..c.len_utf8()].to_vec();
             }
             if ke.key_code == KeyCode::Space { return vec![32]; }
@@ -410,19 +449,17 @@ fn kc_char(kc: &KeyCode) -> Option<char> {
         KeyCode::Backslash => Some('\\'), KeyCode::Semicolon => Some(';'),
         KeyCode::Quote => Some('\''), KeyCode::Comma => Some(','),
         KeyCode::Period => Some('.'), KeyCode::Slash => Some('/'),
-        KeyCode::Backtick => Some('`'),
-        _ => None,
+        KeyCode::Backtick => Some('`'), _ => None,
     }
 }
 
 fn shift_char(c: char) -> char {
     match c {
         'a'..='z' => c.to_ascii_uppercase(),
-        '0' => ')', '1' => '!', '2' => '@', '3' => '#', '4' => '$',
-        '5' => '%', '6' => '^', '7' => '&', '8' => '*', '9' => '(',
-        '-' => '_', '=' => '+', '[' => '{', ']' => '}', '\\' => '|',
-        ';' => ':', '\'' => '"', ',' => '<', '.' => '>', '/' => '?',
-        '`' => '~', c => c,
+        '0'=>')', '1'=>'!', '2'=>'@', '3'=>'#', '4'=>'$',
+        '5'=>'%', '6'=>'^', '7'=>'&', '8'=>'*', '9'=>'(',
+        '-'=>'_', '='=>'+', '['=>'{', ']'=>'}', '\\'=>'|',
+        ';'=>':', '\''=>'"', ','=>'<', '.'=>'>', '/'=>'?', '`'=>'~', c=>c,
     }
 }
 
