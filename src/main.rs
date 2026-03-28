@@ -1,6 +1,70 @@
 use makepad_widgets::*;
 use std::sync::{Arc, Mutex};
 use std::io::{Read, Write};
+use arboard::Clipboard;
+
+// ── Terminal Tab ───────────────────────────────────────────
+struct TermTab {
+    grid: Arc<Mutex<TermGrid>>,
+    writer: Option<Box<dyn Write + Send>>,
+    title: String,
+}
+
+impl TermTab {
+    fn spawn(id: usize) -> Self {
+        let grid = Arc::new(Mutex::new(TermGrid::new(110, 33)));
+        let pty_system = portable_pty::native_pty_system();
+        let size = portable_pty::PtySize { rows: 33, cols: 110, pixel_width: 0, pixel_height: 0 };
+        let pair = pty_system.openpty(size).unwrap();
+
+        let mut cmd = portable_pty::CommandBuilder::new("/bin/zsh");
+        cmd.args(["--no-globalrcs", "--no-rcs"]);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("PROMPT", "%n@%m %~ %# ");
+        cmd.env("RPROMPT", "");
+        cmd.env("LS_COLORS", "di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=33;40:cd=33;40:*.tar=1;31:*.gz=1;31:*.zip=1;31:*.jpg=1;35:*.png=1;35:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.toml=33:*.json=33:*.md=37:*.sh=32");
+        cmd.env("CLICOLOR", "1");
+        for v in &["HOME","USER","PATH","LANG","DISPLAY","WAYLAND_DISPLAY","XDG_RUNTIME_DIR","DBUS_SESSION_BUS_ADDRESS","SSH_AUTH_SOCK","EDITOR"] {
+            if let Ok(val) = std::env::var(v) { cmd.env(v, &val); }
+        }
+        pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+
+        let reader = pair.master.try_clone_reader().unwrap();
+        let mut writer = pair.master.take_writer().unwrap();
+
+        let _ = writer.write_all(b"alias ls='ls --color=auto'\nalias ll='ls -lah --color=auto'\nalias grep='grep --color=auto'\nclear\n");
+        let _ = writer.flush();
+
+        let g = grid.clone();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => { g.lock().unwrap().process(&buf[..n]); }
+                }
+            }
+        });
+
+        Self { grid, writer: Some(writer), title: format!("Terminal {}", id) }
+    }
+
+    fn write(&mut self, data: &[u8]) {
+        if let Some(w) = &mut self.writer {
+            let _ = w.write_all(data);
+            let _ = w.flush();
+        }
+    }
+
+    fn get_selected_text(&self) -> String {
+        let grid = self.grid.lock().unwrap();
+        // Return all visible text for now
+        grid.render()
+    }
+}
 
 // ── Cell with color ────────────────────────────────────────
 #[derive(Clone, Copy)]
@@ -240,7 +304,9 @@ pub struct TermView {
     #[walk] walk: Walk,
     #[layout] layout: Layout,
     #[rust] grid_ref: Option<Arc<Mutex<TermGrid>>>,
-    #[rust] scroll_offset: i64,  // lines scrolled up from bottom (0 = at bottom)
+    #[rust] scroll_offset: i64,
+    #[rust] blink_on: bool,
+    #[rust] blink_counter: u32,
 }
 
 impl Widget for TermView {
@@ -289,7 +355,7 @@ impl Widget for TermView {
         let px = rect.pos.x + pad_x;
         let py = rect.pos.y + pad_y;
         let mut char_buf = [0u8; 4];
-        let mut screen_row = 0;
+        let mut screen_row: usize = 0;
 
         for abs_row in start_row..end_row {
             let y = py + (screen_row as f64) * ch;
@@ -314,13 +380,16 @@ impl Widget for TermView {
             screen_row += 1;
         }
 
-        // Cursor (only if visible — scroll_offset == 0 means at bottom)
-        if self.scroll_offset == 0 {
-            let cursor_screen_row = view_rows.min(vis_last + 1) - 1;
-            // Actually cursor is at the last visible row position
-            let cursor_y = py + ((end_row - start_row).saturating_sub(1).min(vis_last) as f64) * ch;
+        // Blinking cursor
+        self.blink_counter += 1;
+        if self.blink_counter % 15 == 0 { self.blink_on = !self.blink_on; }
+
+        if self.scroll_offset == 0 && self.blink_on {
+            let cursor_y = py + (screen_row.saturating_sub(1usize) as f64) * ch;
             let cursor_x = px + (grid.cur_c as f64) * cw;
-            self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(2.0, ch) });
+            // Block cursor with highlight color
+            self.draw_cursor.color = vec4(0.345, 0.608, 0.976, 0.8); // #58A6FF
+            self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(9.5, ch) });
         }
 
         DrawStep::done()
@@ -331,6 +400,12 @@ impl TermViewRef {
     fn set_grid(&self, grid: Arc<Mutex<TermGrid>>) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.grid_ref = Some(grid);
+            inner.scroll_offset = 0;
+        }
+    }
+    fn reset_scroll(&self) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.scroll_offset = 0;
         }
     }
 }
@@ -410,9 +485,10 @@ live_design! {
 #[derive(Live, LiveHook)]
 pub struct App {
     #[live] ui: WidgetRef,
-    #[rust] pty_writer: Option<Box<dyn Write + Send>>,
-    #[rust] grid: Arc<Mutex<TermGrid>>,
+    #[rust] tabs: Vec<TermTab>,
+    #[rust] active_tab: usize,
     #[rust] started: bool,
+    #[rust] tab_counter: usize,
 }
 
 impl LiveRegister for App {
@@ -422,57 +498,79 @@ impl LiveRegister for App {
 }
 
 impl App {
-    fn start_pty(&mut self, cx: &mut Cx) {
+    fn init(&mut self, cx: &mut Cx) {
         if self.started { return; }
         self.started = true;
-
-        self.ui.term_view(id!(terminal)).set_grid(self.grid.clone());
-
-        let pty_system = portable_pty::native_pty_system();
-        let size = portable_pty::PtySize { rows: 33, cols: 110, pixel_width: 0, pixel_height: 0 };
-        let pair = pty_system.openpty(size).unwrap();
-
-        let mut cmd = portable_pty::CommandBuilder::new("/bin/zsh");
-        cmd.args(["--no-globalrcs", "--no-rcs"]);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("PROMPT", "%n@%m %~ %# ");
-        cmd.env("RPROMPT", "");
-        cmd.env("LS_COLORS", "di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=33;40:cd=33;40:*.tar=1;31:*.gz=1;31:*.zip=1;31:*.jpg=1;35:*.png=1;35:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.toml=33:*.json=33:*.md=37:*.sh=32");
-        cmd.env("CLICOLOR", "1");
-        for v in &["HOME","USER","PATH","LANG","DISPLAY","WAYLAND_DISPLAY","XDG_RUNTIME_DIR","DBUS_SESSION_BUS_ADDRESS","SSH_AUTH_SOCK","EDITOR"] {
-            if let Ok(val) = std::env::var(v) { cmd.env(v, &val); }
-        }
-        pair.slave.spawn_command(cmd).unwrap();
-        drop(pair.slave);
-
-        let reader = pair.master.try_clone_reader().unwrap();
-        self.pty_writer = Some(pair.master.take_writer().unwrap());
-
-        // Send aliases for colored output
-        {
-            let w = self.pty_writer.as_mut().unwrap();
-            let _ = w.write_all(b"alias ls='ls --color=auto'\nalias ll='ls -lah --color=auto'\nalias grep='grep --color=auto'\nclear\n");
-            let _ = w.flush();
-        }
-
-        let grid = self.grid.clone();
-        std::thread::spawn(move || {
-            let mut reader = reader;
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => { grid.lock().unwrap().process(&buf[..n]); }
-                }
-            }
-        });
+        self.tab_counter = 1;
+        self.tabs.push(TermTab::spawn(1));
+        self.active_tab = 0;
+        self.ui.term_view(id!(terminal)).set_grid(self.tabs[0].grid.clone());
+        self.update_tab_label(cx);
         cx.start_interval(0.033);
+    }
+
+    fn new_tab(&mut self, cx: &mut Cx) {
+        if self.tabs.len() >= 5 { return; }
+        self.tab_counter += 1;
+        self.tabs.push(TermTab::spawn(self.tab_counter));
+        self.active_tab = self.tabs.len() - 1;
+        self.switch_to_active(cx);
+    }
+
+    fn close_active_tab(&mut self, cx: &mut Cx) {
+        if self.tabs.len() <= 1 { return; }
+        self.tabs.remove(self.active_tab);
+        if self.active_tab >= self.tabs.len() { self.active_tab = self.tabs.len() - 1; }
+        self.switch_to_active(cx);
+    }
+
+    fn next_tab(&mut self, cx: &mut Cx) {
+        self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        self.switch_to_active(cx);
+    }
+
+    fn switch_to_active(&mut self, cx: &mut Cx) {
+        self.ui.term_view(id!(terminal)).set_grid(self.tabs[self.active_tab].grid.clone());
+        self.update_tab_label(cx);
+    }
+
+    fn update_tab_label(&mut self, cx: &mut Cx) {
+        let labels: Vec<String> = self.tabs.iter().enumerate().map(|(i, t)| {
+            if i == self.active_tab { format!(" ● {} ", t.title) } else { format!("   {}  ", t.title) }
+        }).collect();
+        let text = labels.join("│");
+        self.ui.button(id!(tab1)).set_text(cx, &text);
+    }
+
+    fn copy_to_clipboard(&self) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let text = tab.get_selected_text();
+            if !text.is_empty() {
+                if let Ok(mut cb) = Clipboard::new() { let _ = cb.set_text(&text); }
+            }
+        }
+    }
+
+    fn paste_from_clipboard(&mut self) {
+        let text = match Clipboard::new() {
+            Ok(mut cb) => cb.get_text().unwrap_or_default(),
+            Err(_) => return,
+        };
+        if text.is_empty() { return; }
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.write(b"\x1b[200~"); // bracketed paste start
+            tab.write(text.as_bytes());
+            tab.write(b"\x1b[201~"); // bracketed paste end
+        }
     }
 }
 
 impl MatchEvent for App {
-    fn handle_actions(&mut self, _cx: &mut Cx, _actions: &Actions) {}
+    fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        if self.ui.button(id!(plus_btn)).clicked(actions) {
+            self.new_tab(cx);
+        }
+    }
 }
 
 impl AppMain for App {
@@ -480,14 +578,30 @@ impl AppMain for App {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
         match event {
-            Event::Startup => { self.start_pty(cx); }
-            Event::Timer(_) => {
-                self.ui.redraw(cx);
-            }
+            Event::Startup => { self.init(cx); }
+            Event::Timer(_) => { self.ui.redraw(cx); }
             Event::KeyDown(ke) => {
-                if let Some(w) = &mut self.pty_writer {
+                // Ctrl+Shift shortcuts
+                if ke.modifiers.control && ke.modifiers.shift {
+                    match ke.key_code {
+                        KeyCode::KeyT => { self.new_tab(cx); return; }
+                        KeyCode::KeyW => { self.close_active_tab(cx); return; }
+                        KeyCode::KeyC => { self.copy_to_clipboard(); return; }
+                        KeyCode::KeyV => { self.paste_from_clipboard(); return; }
+                        _ => {}
+                    }
+                }
+                // Ctrl+Tab = next tab
+                if ke.modifiers.control && ke.key_code == KeyCode::Tab {
+                    self.next_tab(cx);
+                    return;
+                }
+                // Forward to active tab PTY
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                     let b = key_to_bytes(ke);
-                    if !b.is_empty() { let _ = w.write_all(&b); let _ = w.flush(); }
+                    if !b.is_empty() { tab.write(&b); }
+                    // Reset scroll to bottom on keypress
+                    self.ui.term_view(id!(terminal)).reset_scroll();
                 }
             }
             _ => {}

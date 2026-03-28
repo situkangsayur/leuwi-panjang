@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 makepad-widgets = { git = "https://github.com/makepad/makepad", branch = "main" }
 portable-pty = "0.8"
+arboard = "3"
 
 [profile.release]
 opt-level = 3
