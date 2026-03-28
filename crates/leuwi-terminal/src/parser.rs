@@ -512,7 +512,7 @@ impl Parser {
                 40..=47 => {
                     self.current_attrs.bg = ansi_color(self.params[i] - 40);
                 }
-                49 => self.current_attrs.bg = Color::rgb(26, 26, 46),
+                49 => self.current_attrs.bg = Color::rgb(10, 20, 16), // default bg
                 // 256-color and truecolor
                 38 => {
                     if i + 1 < self.params.len() {
@@ -573,30 +573,31 @@ impl Default for Parser {
     }
 }
 
+/// ANSI colors — high contrast for dark green background (#0A1410)
 fn ansi_color(idx: u16) -> Color {
     match idx {
-        0 => Color::rgb(26, 26, 46),    // black
-        1 => Color::rgb(233, 69, 96),   // red
-        2 => Color::rgb(12, 206, 107),  // green
-        3 => Color::rgb(255, 200, 87),  // yellow
-        4 => Color::rgb(15, 52, 96),    // blue
-        5 => Color::rgb(199, 125, 255), // magenta
-        6 => Color::rgb(0, 180, 216),   // cyan
-        7 => Color::rgb(224, 224, 224), // white
+        0 => Color::rgb(40, 50, 45),     // black (visible on dark bg)
+        1 => Color::rgb(255, 85, 85),    // red — bright, alert
+        2 => Color::rgb(0, 255, 136),    // green — neon, success
+        3 => Color::rgb(255, 214, 102),  // yellow — warm, warning
+        4 => Color::rgb(100, 160, 255),  // blue — visible on dark
+        5 => Color::rgb(210, 140, 255),  // magenta — soft purple
+        6 => Color::rgb(80, 220, 240),   // cyan — bright info
+        7 => Color::rgb(200, 215, 205),  // white — slightly green tint
         _ => Color::default(),
     }
 }
 
 fn ansi_bright_color(idx: u16) -> Color {
     match idx {
-        0 => Color::rgb(74, 74, 106),   // bright black
-        1 => Color::rgb(255, 107, 138), // bright red
-        2 => Color::rgb(61, 255, 149),  // bright green
-        3 => Color::rgb(255, 224, 135), // bright yellow
-        4 => Color::rgb(63, 100, 144),  // bright blue
-        5 => Color::rgb(231, 173, 255), // bright magenta
-        6 => Color::rgb(48, 212, 248),  // bright cyan
-        7 => Color::rgb(255, 255, 255), // bright white
+        0 => Color::rgb(90, 110, 100),   // bright black (comment color)
+        1 => Color::rgb(255, 120, 120),  // bright red
+        2 => Color::rgb(100, 255, 170),  // bright green
+        3 => Color::rgb(255, 230, 150),  // bright yellow
+        4 => Color::rgb(140, 190, 255),  // bright blue
+        5 => Color::rgb(230, 180, 255),  // bright magenta
+        6 => Color::rgb(130, 240, 255),  // bright cyan
+        7 => Color::rgb(240, 245, 240),  // bright white
         _ => Color::default(),
     }
 }

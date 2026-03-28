@@ -66,15 +66,15 @@ impl Color {
 
 impl Default for Color {
     fn default() -> Self {
-        Self::rgb(224, 224, 224) // #e0e0e0
+        Self::rgb(184, 212, 204) // #B8D4CC — Leuwi Panjang default FG
     }
 }
 
 impl Default for CellAttributes {
     fn default() -> Self {
         Self {
-            fg: Color::rgb(224, 224, 224),
-            bg: Color::rgb(26, 26, 46), // #1a1a2e
+            fg: Color::rgb(184, 212, 204), // #B8D4CC
+            bg: Color::rgb(10, 20, 16),   // #0A1410 — dark green bg
             bold: false,
             italic: false,
             underline: UnderlineStyle::None,
