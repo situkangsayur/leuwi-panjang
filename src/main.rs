@@ -417,8 +417,7 @@ impl App {
         cmd.args(["--no-globalrcs", "--no-rcs"]);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("PROMPT", "%n@%m %1~ %# ");
-        cmd.env("PS1", "\\u@\\h \\W \\$ ");
+        cmd.env("PROMPT", "%n@%m %~ %# ");
         cmd.env("RPROMPT", "");
         cmd.env("LS_COLORS", "di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=33;40:cd=33;40:*.tar=1;31:*.gz=1;31:*.zip=1;31:*.jpg=1;35:*.png=1;35:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.toml=33:*.json=33:*.md=37:*.sh=32");
         cmd.env("CLICOLOR", "1");
