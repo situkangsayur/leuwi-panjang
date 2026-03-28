@@ -17,6 +17,14 @@ live_design! {
     LEUWI_DIM     = #x5C8A72FF   // dim green-gray text
     LEUWI_HOVER   = #x0D1F17FF   // hover state (slightly lighter green-dark)
 
+    // Terminal monospace text style
+    TERMINAL_TEXT_STYLE = {
+        font_size: 13.0,
+        line_spacing: 1.5,
+        // Uses system monospace font (JetBrainsMono Nerd Font if available)
+        font: { path: dep("crate://makepad-widgets/resources/LiberationMono-Regular.ttf") }
+    }
+
     // Tab button with visible text
     LeuwiTab = <Button> {
         width: Fit,
@@ -161,10 +169,7 @@ live_design! {
                                 text: "Starting Leuwi Panjang Terminal..."
                                 draw_text: {
                                     color: (LEUWI_FG),
-                                    text_style: {
-                                        font_size: 13.0,
-                                        line_spacing: 1.4,
-                                    }
+                                    text_style: (TERMINAL_TEXT_STYLE),
                                 }
                             }
                         }
@@ -198,10 +203,7 @@ live_design! {
                                 text: ""
                                 draw_text: {
                                     color: (LEUWI_FG),
-                                    text_style: {
-                                        font_size: 13.0,
-                                        line_spacing: 1.4,
-                                    }
+                                    text_style: (TERMINAL_TEXT_STYLE),
                                 }
                             }
                         }
@@ -524,45 +526,48 @@ impl LeuwiApp {
             Some(s) => s,
             None => return "No session".to_string(),
         };
-
-        let grid = session.grid.lock().unwrap();
-        let mut output = String::with_capacity(grid.cols() * grid.rows() * 2);
-
-        for row in 0..grid.rows() {
-            for col in 0..grid.cols() {
-                let cell = grid.cell(row, col);
-                if cell.c == '\0' {
-                    output.push(' ');
-                } else {
-                    output.push(cell.c);
-                }
-            }
-            let trimmed = output.trim_end_matches(' ');
-            output.truncate(trimmed.len());
-            if row < grid.rows() - 1 {
-                output.push('\n');
-            }
-        }
-
-        output
+        Self::render_grid_to_text_session(session)
     }
 
     fn render_grid_to_text_session(session: &TerminalSession) -> String {
         let grid = session.grid.lock().unwrap();
-        let mut output = String::with_capacity(grid.cols() * grid.rows() * 2);
+        let cols = grid.cols();
+        let rows = grid.rows();
+        // Pre-allocate: each row = cols chars + newline
+        let mut output = String::with_capacity((cols + 1) * rows);
 
-        for row in 0..grid.rows() {
-            for col in 0..grid.cols() {
-                let cell = grid.cell(row, col);
-                if cell.c == '\0' {
-                    output.push(' ');
-                } else {
-                    output.push(cell.c);
+        // Find last row with content (skip trailing empty rows)
+        let mut last_content_row = 0;
+        for row in 0..rows {
+            for col in 0..cols {
+                let c = grid.cell(row, col).c;
+                if c != '\0' && c != ' ' {
+                    last_content_row = row;
+                    break;
                 }
             }
-            let trimmed = output.trim_end_matches(' ');
-            output.truncate(trimmed.len());
-            if row < grid.rows() - 1 {
+        }
+
+        for row in 0..=last_content_row {
+            // Build row string — keep all characters for monospace alignment
+            let mut row_str = String::with_capacity(cols);
+            let mut last_non_space = 0;
+
+            for col in 0..cols {
+                let c = grid.cell(row, col).c;
+                let ch = if c == '\0' { ' ' } else { c };
+                row_str.push(ch);
+                if ch != ' ' {
+                    last_non_space = col + 1;
+                }
+            }
+
+            // Trim trailing spaces but keep minimum alignment
+            // For proper ls -la alignment, keep spaces up to last content
+            row_str.truncate(last_non_space);
+
+            output.push_str(&row_str);
+            if row < last_content_row {
                 output.push('\n');
             }
         }
