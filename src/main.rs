@@ -406,7 +406,7 @@ pub struct App {
     #[rust] pty_writer: Option<Box<dyn Write + Send>>,
     #[rust] grid: Arc<Mutex<TermGrid>>,
     #[rust] started: bool,
-    #[rust] last_sb_len: usize,
+    #[rust] last_content_key: usize,
 }
 
 impl LiveRegister for App {
@@ -476,15 +476,15 @@ impl AppMain for App {
         match event {
             Event::Startup => { self.start_pty(cx); }
             Event::Timer(_) => {
-                // Only auto-scroll when new output arrived
                 let grid = self.grid.lock().unwrap();
                 let sb = grid.scrollback.len();
                 let cur = grid.cur_r;
-                let changed = sb != self.last_sb_len;
+                let cur_c = grid.cur_c;
+                let key = sb * 1000 + cur * 100 + cur_c;
                 drop(grid);
 
-                if changed {
-                    self.last_sb_len = sb;
+                if key != self.last_content_key {
+                    self.last_content_key = key;
                     let total_y = ((sb + cur) as f64) * 20.0;
                     self.ui.view(id!(body)).set_scroll_pos(cx, DVec2 { x: 0.0, y: total_y });
                 }
