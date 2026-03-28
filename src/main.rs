@@ -26,6 +26,12 @@ struct Config {
     prompt: String,
     #[serde(default = "default_opacity")]
     opacity: f64,
+    #[serde(default = "default_cursor_style")]
+    cursor_style: String,  // "block" or "beam"
+    #[serde(default = "default_cell_width")]
+    cell_width: f64,
+    #[serde(default = "default_cell_height")]
+    cell_height: f64,
 }
 
 fn default_shell() -> String { std::env::var("SHELL").unwrap_or("/bin/zsh".into()) }
@@ -37,6 +43,9 @@ fn default_bg() -> String { "#1E1E1E".into() }
 fn default_fg() -> String { "#C5C8C6".into() }
 fn default_prompt() -> String { "%n@%m %~ %# ".into() }
 fn default_opacity() -> f64 { 0.97 }
+fn default_cursor_style() -> String { "block".into() }
+fn default_cell_width() -> f64 { 9.2 }
+fn default_cell_height() -> f64 { 20.0 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -46,6 +55,8 @@ impl Default for Config {
             scrollback: default_scrollback(),
             bg_color: default_bg(), fg_color: default_fg(),
             prompt: default_prompt(), opacity: default_opacity(),
+            cursor_style: default_cursor_style(),
+            cell_width: default_cell_width(), cell_height: default_cell_height(),
         }
     }
 }
@@ -762,6 +773,9 @@ pub struct TermView {
     #[rust] scroll_offset: i64,
     #[rust] blink_on: bool,
     #[rust] blink_counter: u32,
+    #[rust] cw: f64,
+    #[rust] ch: f64,
+    #[rust] cursor_block: bool,
 }
 
 impl Widget for TermView {
@@ -773,31 +787,42 @@ impl Widget for TermView {
                 self.redraw(cx);
             }
             Event::MouseDown(me) => {
-                let cw = 9.2_f64;
-                let ch = 20.0_f64;
+                let cw = if self.cw > 0.0 { self.cw } else { 9.2 };
+                let ch = if self.ch > 0.0 { self.ch } else { 20.0 };
                 let col = ((me.abs.x - 12.0) / cw).max(0.0) as usize;
                 let screen_row = ((me.abs.y - 8.0) / ch).max(0.0) as usize;
+
                 if let Some(grid) = &self.grid_ref {
                     let mut g = grid.lock().unwrap();
                     let sb = g.scrollback.len();
-                    let view_rows = (g.rows).min(sb + g.rows);
-                    let start = (sb + g.rows).saturating_sub(view_rows + self.scroll_offset as usize);
+                    let start = (sb + g.rows).saturating_sub(g.rows + self.scroll_offset as usize);
                     let abs_row = (start + screen_row).min(sb + g.rows - 1);
                     let max_col = g.cols.saturating_sub(1);
+
+                    // Ctrl+click = open URL
+                    if me.modifiers.control {
+                        let urls = g.find_urls();
+                        for (r, cs, ce, url) in &urls {
+                            if *r == abs_row && col >= *cs && col <= *ce {
+                                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+                                return;
+                            }
+                        }
+                    }
+
                     g.start_select(abs_row, col.min(max_col));
                 }
                 self.redraw(cx);
             }
             Event::MouseMove(me) => {
-                let cw = 9.2_f64;
-                let ch = 20.0_f64;
+                let cw = if self.cw > 0.0 { self.cw } else { 9.2 };
+                let ch = if self.ch > 0.0 { self.ch } else { 20.0 };
                 let col = ((me.abs.x - 12.0) / cw).max(0.0) as usize;
                 let screen_row = ((me.abs.y - 8.0) / ch).max(0.0) as usize;
                 if let Some(grid) = &self.grid_ref {
                     let mut g = grid.lock().unwrap();
                     let sb = g.scrollback.len();
-                    let view_rows = g.rows;
-                    let start = (sb + g.rows).saturating_sub(view_rows + self.scroll_offset as usize);
+                    let start = (sb + g.rows).saturating_sub(g.rows + self.scroll_offset as usize);
                     let abs_row = (start + screen_row).min(sb + g.rows - 1);
                     let max_col = g.cols.saturating_sub(1);
                     g.update_select(abs_row, col.min(max_col));
@@ -817,8 +842,8 @@ impl Widget for TermView {
             None => return DrawStep::done(),
         };
 
-        let cw = 9.2_f64;
-        let ch = 20.0_f64;
+        let cw = if self.cw > 0.0 { self.cw } else { 9.2 };
+        let ch = if self.ch > 0.0 { self.ch } else { 20.0 };
         let pad_x = 12.0;
         let pad_y = 8.0;
 
@@ -893,7 +918,8 @@ impl Widget for TermView {
             let cursor_x = px + (grid.cur_c as f64) * cw;
             // Block cursor with highlight color
             self.draw_cursor.color = vec4(0.345, 0.608, 0.976, 0.8);
-            self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(cw, ch) });
+            let cursor_w = if self.cursor_block { cw } else { 2.0 }; // block or beam
+            self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(cursor_w, ch) });
         }
 
         DrawStep::done()
@@ -905,6 +931,13 @@ impl TermViewRef {
         if let Some(mut inner) = self.borrow_mut() {
             inner.grid_ref = Some(grid);
             inner.scroll_offset = 0;
+        }
+    }
+    fn set_cell_size(&self, cw: f64, ch: f64, cursor_block: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.cw = cw;
+            inner.ch = ch;
+            inner.cursor_block = cursor_block;
         }
     }
     fn reset_scroll(&self) {
@@ -1077,6 +1110,9 @@ impl App {
         self.tabs.push(TermTab::spawn(1, &self.config));
         self.active_tab = 0;
         self.ui.term_view(id!(terminal)).set_grid(self.tabs[0].grid.clone());
+        let block = self.config.cursor_style == "block";
+        self.ui.term_view(id!(terminal)).set_cell_size(self.config.cell_width, self.config.cell_height, block);
+        self.ui.term_view(id!(terminal2)).set_cell_size(self.config.cell_width, self.config.cell_height, block);
         self.update_tab_label(cx);
         cx.start_interval(0.033);
     }
@@ -1203,8 +1239,8 @@ impl App {
 
     fn handle_resize(&mut self, width: f64, height: f64) {
         let chrome_h = 32.0 + 20.0;
-        let cw = 9.2;
-        let ch = 20.0;
+        let cw = self.config.cell_width;
+        let ch = self.config.cell_height;
         let cols = ((width - 24.0) / cw).max(20.0) as usize;
         let rows = ((height - chrome_h) / ch).max(5.0) as usize;
         for tab in &mut self.tabs {
