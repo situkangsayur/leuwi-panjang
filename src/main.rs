@@ -64,6 +64,23 @@ impl TermGrid {
     fn clear_screen(&mut self) { for r in &mut self.cells { for c in r.iter_mut() { *c = Cell::default(); } } self.cur_r = 0; self.cur_c = 0; }
     fn clear_below(&mut self) { self.clear_line_right(); for r in (self.cur_r+1)..self.rows { for c in 0..self.cols { self.cells[r][c] = Cell::default(); } } }
 
+    fn render(&self) -> String {
+        let mut out = String::with_capacity((self.cols + 1) * self.rows);
+        let mut last_row = 0;
+        for (r, row) in self.cells.iter().enumerate() {
+            if row.iter().any(|c| c.ch != ' ') { last_row = r; }
+        }
+        for r in 0..=last_row {
+            let mut last_col = 0;
+            for (c, cell) in self.cells[r].iter().enumerate() {
+                if cell.ch != ' ' { last_col = c + 1; }
+            }
+            for c in 0..last_col { out.push(self.cells[r][c].ch); }
+            if r < last_row { out.push('\n'); }
+        }
+        out
+    }
+
     fn process(&mut self, data: &[u8]) {
         let mut i = 0;
         while i < data.len() {
@@ -198,18 +215,11 @@ fn ansi_to_vec4(idx: u8) -> Vec4 {
     }
 }
 
-// ── Custom Terminal Widget ─────────────────────────────────
+// ── Makepad App ────────────────────────────────────────────
 
 live_design! {
     use link::theme::*;
     use link::widgets::*;
-
-    TermView = {{TermView}} {
-        width: Fill, height: Fill
-        draw_bg: { color: #x161B22 }
-        draw_text: { text_style: { font_size: 13.0 } }
-        draw_cursor: { color: #x58A6FF }
-    }
 
     App = {{App}} {
         ui: <Window> {
@@ -250,74 +260,17 @@ live_design! {
             }
             window_menu = <WindowMenu> { main = Main { items: [] } }
             body = <View> {
-                width: Fill, height: Fill
-                terminal = <TermView> {}
+                width: Fill, height: Fill, flow: Down
+                show_bg: true
+                draw_bg: { color: #x161B22 }
+                padding: { top: 8, left: 12, right: 12, bottom: 6 }
+                output = <Label> {
+                    width: Fill
+                    text: ""
+                    draw_text: { color: #xC9D1D9, text_style: { font_size: 13.0 } }
+                }
             }
         }
-    }
-}
-
-// ── TermView Widget ────────────────────────────────────────
-
-#[derive(Live, LiveHook, Widget)]
-pub struct TermView {
-    #[redraw] #[live] draw_bg: DrawColor,
-    #[live] draw_text: DrawText,
-    #[live] draw_cursor: DrawColor,
-    #[walk] walk: Walk,
-    #[layout] layout: Layout,
-    #[rust] grid: Option<Arc<Mutex<TermGrid>>>,
-}
-
-impl Widget for TermView {
-    fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
-        let rect = cx.walk_turtle(walk);
-        self.draw_bg.draw_abs(cx, rect);
-
-        let grid = match &self.grid {
-            Some(g) => g.lock().unwrap(),
-            None => return DrawStep::done(),
-        };
-
-        let cw = 7.8_f64;   // cell width (monospace char width at font_size 13)
-        let ch = 18.0_f64;  // cell height (line height)
-        let pad_x = 10.0;
-        let pad_y = 6.0;
-
-        for r in 0..grid.rows {
-            let y = rect.pos.y + pad_y + (r as f64) * ch;
-            if y > rect.pos.y + rect.size.y { break; }
-
-            for c in 0..grid.cols {
-                let cell = &grid.cells[r][c];
-                if cell.ch == ' ' || cell.ch == '\0' { continue; }
-
-                let x = rect.pos.x + pad_x + (c as f64) * cw;
-                if x > rect.pos.x + rect.size.x { break; }
-
-                self.draw_text.color = ansi_to_vec4(cell.fg);
-                let s = cell.ch.to_string();
-                self.draw_text.draw_abs(cx, dvec2(x, y), &s);
-            }
-        }
-
-        // Draw cursor
-        let cx_pos = rect.pos.x + pad_x + (grid.cur_c as f64) * cw;
-        let cy_pos = rect.pos.y + pad_y + (grid.cur_r as f64) * ch;
-        self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cx_pos, cy_pos), size: dvec2(2.0, ch) });
-
-        DrawStep::done()
-    }
-}
-
-impl TermView {
-    fn set_grid(&mut self, grid: Arc<Mutex<TermGrid>>) { self.grid = Some(grid); }
-}
-impl TermViewRef {
-    fn set_grid(&self, grid: Arc<Mutex<TermGrid>>) {
-        if let Some(mut inner) = self.borrow_mut() { inner.set_grid(grid); }
     }
 }
 
@@ -342,8 +295,7 @@ impl App {
         if self.started { return; }
         self.started = true;
 
-        // Pass grid to TermView widget
-        self.ui.term_view(id!(terminal)).set_grid(self.grid.clone());
+        // Grid used for rendering to Label
 
         let pty_system = portable_pty::native_pty_system();
         let size = portable_pty::PtySize { rows: 45, cols: 140, pixel_width: 0, pixel_height: 0 };
@@ -390,7 +342,11 @@ impl AppMain for App {
         self.ui.handle_event(cx, event, &mut Scope::empty());
         match event {
             Event::Startup => { self.start_pty(cx); }
-            Event::Timer(_) => { self.ui.redraw(cx); }
+            Event::Timer(_) => {
+                let text = self.grid.lock().unwrap().render();
+                self.ui.label(id!(output)).set_text(cx, &text);
+                self.ui.redraw(cx);
+            }
             Event::KeyDown(ke) => {
                 if let Some(w) = &mut self.pty_writer {
                     let b = key_to_bytes(ke);
