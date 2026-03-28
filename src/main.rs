@@ -240,77 +240,88 @@ pub struct TermView {
     #[walk] walk: Walk,
     #[layout] layout: Layout,
     #[rust] grid_ref: Option<Arc<Mutex<TermGrid>>>,
+    #[rust] scroll_offset: i64,  // lines scrolled up from bottom (0 = at bottom)
 }
 
 impl Widget for TermView {
-    fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        // Mouse wheel = scroll
+        if let Event::Scroll(se) = event {
+            let lines = (se.scroll.y / 20.0) as i64;
+            self.scroll_offset = (self.scroll_offset + lines).max(0);
+            self.redraw(cx);
+        }
+    }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        let rect = cx.walk_turtle(walk);
+        self.draw_bg.draw_abs(cx, rect);
+
         let grid = match &self.grid_ref {
             Some(g) => g.lock().unwrap(),
-            None => {
-                cx.walk_turtle(walk);
-                return DrawStep::done();
-            }
+            None => return DrawStep::done(),
         };
 
         let cw = 9.5_f64;
         let ch = 20.0_f64;
-        let pad = 12.0;
+        let pad_x = 12.0;
+        let pad_y = 8.0;
 
-        // Total rows = scrollback + visible grid
-        let sb_len = grid.scrollback.len();
-        let vis_last = grid.cur_r.max(
-            grid.cells.iter().enumerate()
-                .filter(|(_, row)| row.iter().any(|c| c.ch != ' '))
-                .map(|(r, _)| r).max().unwrap_or(0)
-        );
-        let total_rows = sb_len + vis_last + 2;
-        let content_h = (total_rows as f64) * ch + pad * 2.0;
-        let content_w = (grid.cols as f64) * cw + pad * 2.0;
+        // Build all rows: scrollback + visible
+        let sb = &grid.scrollback;
+        let sb_len = sb.len();
+        let vis_last = grid.cur_r;
+        let total_rows = sb_len + vis_last + 1;
 
-        let sized_walk = Walk {
-            width: Size::Fixed(content_w),
-            height: Size::Fixed(content_h),
-            ..walk
-        };
+        // How many rows fit in window
+        let view_rows = ((rect.size.y - pad_y * 2.0) / ch) as usize;
 
-        let rect = cx.walk_turtle(sized_walk);
-        self.draw_bg.draw_abs(cx, rect);
+        // Reset scroll if at bottom
+        if self.scroll_offset > 0 {
+            let max_scroll = total_rows.saturating_sub(view_rows) as i64;
+            self.scroll_offset = self.scroll_offset.min(max_scroll);
+        }
 
-        let px = rect.pos.x + pad;
-        let py = rect.pos.y + pad;
+        // Which rows to show (from bottom - scroll_offset)
+        let end_row = total_rows.saturating_sub(self.scroll_offset as usize);
+        let start_row = end_row.saturating_sub(view_rows);
+
+        let px = rect.pos.x + pad_x;
+        let py = rect.pos.y + pad_y;
         let mut char_buf = [0u8; 4];
+        let mut screen_row = 0;
 
-        // Draw scrollback rows
-        for (r, row) in grid.scrollback.iter().enumerate() {
-            let y = py + (r as f64) * ch;
-            for (c, cell) in row.iter().enumerate() {
+        for abs_row in start_row..end_row {
+            let y = py + (screen_row as f64) * ch;
+            if y > rect.pos.y + rect.size.y { break; }
+
+            // Get row data from scrollback or visible grid
+            let row_cells: &[Cell] = if abs_row < sb_len {
+                &sb[abs_row]
+            } else {
+                let grid_row = abs_row - sb_len;
+                if grid_row < grid.rows { &grid.cells[grid_row] } else { screen_row += 1; continue; }
+            };
+
+            for (c, cell) in row_cells.iter().enumerate() {
                 if cell.ch == ' ' { continue; }
                 let x = px + (c as f64) * cw;
+                if x > rect.pos.x + rect.size.x { break; }
                 self.draw_text.color = ansi_to_vec4(cell.fg);
                 let s = cell.ch.encode_utf8(&mut char_buf);
                 self.draw_text.draw_abs(cx, dvec2(x, y), s);
             }
+            screen_row += 1;
         }
 
-        // Draw visible grid rows
-        for r in 0..=vis_last {
-            let y = py + ((sb_len + r) as f64) * ch;
-            for c in 0..grid.cols {
-                let cell = &grid.cells[r][c];
-                if cell.ch == ' ' { continue; }
-                let x = px + (c as f64) * cw;
-                self.draw_text.color = ansi_to_vec4(cell.fg);
-                let s = cell.ch.encode_utf8(&mut char_buf);
-                self.draw_text.draw_abs(cx, dvec2(x, y), s);
-            }
+        // Cursor (only if visible — scroll_offset == 0 means at bottom)
+        if self.scroll_offset == 0 {
+            let cursor_screen_row = view_rows.min(vis_last + 1) - 1;
+            // Actually cursor is at the last visible row position
+            let cursor_y = py + ((end_row - start_row).saturating_sub(1).min(vis_last) as f64) * ch;
+            let cursor_x = px + (grid.cur_c as f64) * cw;
+            self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(2.0, ch) });
         }
-
-        // Cursor
-        let cx_pos = px + (grid.cur_c as f64) * cw;
-        let cy_pos = py + ((sb_len + grid.cur_r) as f64) * ch;
-        self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cx_pos, cy_pos), size: dvec2(2.0, ch) });
 
         DrawStep::done()
     }
@@ -384,14 +395,10 @@ live_design! {
                 }
             }
             window_menu = <WindowMenu> { main = Main { items: [] } }
-            body = <ScrollXYView> {
+            body = <View> {
                 width: Fill, height: Fill
                 show_bg: true
                 draw_bg: { color: #x1E1E1E }
-                scroll_bars: <ScrollBars> {
-                    show_scroll_x: false
-                    show_scroll_y: true
-                }
                 terminal = <TermView> {}
             }
         }
@@ -406,7 +413,6 @@ pub struct App {
     #[rust] pty_writer: Option<Box<dyn Write + Send>>,
     #[rust] grid: Arc<Mutex<TermGrid>>,
     #[rust] started: bool,
-    #[rust] last_content_key: usize,
 }
 
 impl LiveRegister for App {
@@ -476,18 +482,6 @@ impl AppMain for App {
         match event {
             Event::Startup => { self.start_pty(cx); }
             Event::Timer(_) => {
-                let grid = self.grid.lock().unwrap();
-                let sb = grid.scrollback.len();
-                let cur = grid.cur_r;
-                let cur_c = grid.cur_c;
-                let key = sb * 1000 + cur * 100 + cur_c;
-                drop(grid);
-
-                if key != self.last_content_key {
-                    self.last_content_key = key;
-                    let total_y = ((sb + cur) as f64) * 20.0;
-                    self.ui.view(id!(body)).set_scroll_pos(cx, DVec2 { x: 0.0, y: total_y });
-                }
                 self.ui.redraw(cx);
             }
             Event::KeyDown(ke) => {
