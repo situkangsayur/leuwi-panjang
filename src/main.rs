@@ -361,9 +361,29 @@ live_design! {
                 }
             }
             window_menu = <WindowMenu> { main = Main { items: [] } }
-            body = <View> {
-                width: Fill, height: Fill
-                terminal = <TermView> {}
+            body = <ScrollXYView> {
+                width: Fill, height: Fill, flow: Down
+                show_bg: true
+                draw_bg: { color: #x1E1E1E }
+                padding: { top: 6, left: 12, right: 12, bottom: 6 }
+                scroll_bars: <ScrollBars> {
+                    show_scroll_x: false
+                    show_scroll_y: true
+                }
+                output = <Label> {
+                    width: Fill
+                    text: ""
+                    draw_text: {
+                        color: #xC5C8C6
+                        text_style: {
+                            font_size: 12.0
+                            line_spacing: 1.3
+                            font_family: {
+                                latin = font("crate://makepad-widgets/resources/LiberationMono-Regular.ttf", 0.0, 0.0)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -390,8 +410,7 @@ impl App {
         if self.started { return; }
         self.started = true;
 
-        // Pass grid to TermView for colored rendering
-        self.ui.term_view(id!(terminal)).set_grid(self.grid.clone());
+        // Grid renders to text for Label display
 
         let pty_system = portable_pty::native_pty_system();
         let size = portable_pty::PtySize { rows: 33, cols: 110, pixel_width: 0, pixel_height: 0 };
@@ -449,6 +468,8 @@ impl AppMain for App {
         match event {
             Event::Startup => { self.start_pty(cx); }
             Event::Timer(_) => {
+                let text = self.grid.lock().unwrap().render();
+                self.ui.label(id!(output)).set_text(cx, &text);
                 self.ui.redraw(cx);
             }
             Event::KeyDown(ke) => {
