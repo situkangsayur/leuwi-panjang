@@ -30,8 +30,8 @@ struct Config {
 
 fn default_shell() -> String { std::env::var("SHELL").unwrap_or("/bin/zsh".into()) }
 fn default_font_size() -> f64 { 12.0 }
-fn default_cols() -> usize { 110 }
-fn default_rows() -> usize { 33 }
+fn default_cols() -> usize { 135 }
+fn default_rows() -> usize { 40 }
 fn default_scrollback() -> usize { 5000 }
 fn default_bg() -> String { "#1E1E1E".into() }
 fn default_fg() -> String { "#C5C8C6".into() }
@@ -650,8 +650,8 @@ impl Widget for TermView {
             None => return DrawStep::done(),
         };
 
-        let cw = 9.5_f64;
-        let ch = 20.0_f64;
+        let cw = 7.8_f64;
+        let ch = 16.0_f64;
         let pad_x = 12.0;
         let pad_y = 8.0;
 
@@ -710,8 +710,8 @@ impl Widget for TermView {
             let cursor_y = py + (screen_row.saturating_sub(1usize) as f64) * ch;
             let cursor_x = px + (grid.cur_c as f64) * cw;
             // Block cursor with highlight color
-            self.draw_cursor.color = vec4(0.345, 0.608, 0.976, 0.8); // #58A6FF
-            self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(9.5, ch) });
+            self.draw_cursor.color = vec4(0.345, 0.608, 0.976, 0.8);
+            self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(cw, ch) });
         }
 
         DrawStep::done()
@@ -830,7 +830,7 @@ pub struct App {
     #[rust] active_tab: usize,
     #[rust] started: bool,
     #[rust] tab_counter: usize,
-    #[rust] split_tab: Option<TermTab>,
+    // Split is now per-tab (stored in TermTab.split)
     #[rust] split_active: bool,
     #[rust] config: Config,
     #[rust] key_handled: bool,  // prevent double-input from KeyDown+TextInput
@@ -877,6 +877,7 @@ impl App {
 
     fn switch_to_active(&mut self, cx: &mut Cx) {
         self.ui.term_view(id!(terminal)).set_grid(self.tabs[self.active_tab].grid.clone());
+        self.show_tab_split(cx);
         self.update_tab_label(cx);
     }
 
@@ -894,26 +895,40 @@ impl App {
     }
 
     fn split_vertical(&mut self, cx: &mut Cx) {
-        if self.split_tab.is_some() { return; }
+        let tab = &self.tabs[self.active_tab];
+        if tab.split.is_some() { return; }
         self.tab_counter += 1;
-        let tab = TermTab::spawn(self.tab_counter, &self.config);
-        self.ui.term_view(id!(terminal2)).set_grid(tab.grid.clone());
-        self.split_tab = Some(tab);
+        let split = TermTab::spawn(self.tab_counter, &self.config);
+        self.ui.term_view(id!(terminal2)).set_grid(split.grid.clone());
+        self.tabs[self.active_tab].split = Some(Box::new(split));
         self.split_active = true;
         self.ui.view(id!(split_bar)).set_visible(cx, true);
         self.ui.term_view(id!(terminal2)).set_visible(cx, true);
     }
 
     fn close_split(&mut self, cx: &mut Cx) {
-        self.split_tab = None;
+        self.tabs[self.active_tab].split = None;
         self.split_active = false;
         self.ui.view(id!(split_bar)).set_visible(cx, false);
         self.ui.term_view(id!(terminal2)).set_visible(cx, false);
     }
 
     fn toggle_split_focus(&mut self) {
-        if self.split_tab.is_some() {
+        if self.tabs[self.active_tab].split.is_some() {
             self.split_active = !self.split_active;
+        }
+    }
+
+    fn show_tab_split(&mut self, cx: &mut Cx) {
+        let tab = &self.tabs[self.active_tab];
+        if let Some(split) = &tab.split {
+            self.ui.term_view(id!(terminal2)).set_grid(split.grid.clone());
+            self.ui.view(id!(split_bar)).set_visible(cx, true);
+            self.ui.term_view(id!(terminal2)).set_visible(cx, true);
+        } else {
+            self.ui.view(id!(split_bar)).set_visible(cx, false);
+            self.ui.term_view(id!(terminal2)).set_visible(cx, false);
+            self.split_active = false;
         }
     }
 
@@ -933,10 +948,10 @@ impl App {
         };
         if text.is_empty() { return; }
         if self.split_active {
-            if let Some(tab) = &mut self.split_tab {
-                tab.write(b"\x1b[200~");
-                tab.write(text.as_bytes());
-                tab.write(b"\x1b[201~");
+            if let Some(split) = &mut self.tabs[self.active_tab].split {
+                split.write(b"\x1b[200~");
+                split.write(text.as_bytes());
+                split.write(b"\x1b[201~");
             }
         } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.write(b"\x1b[200~");
@@ -946,17 +961,18 @@ impl App {
     }
 
     fn handle_resize(&mut self, width: f64, height: f64) {
-        let chrome_h = 32.0 + 20.0; // caption + padding
-        let cw = 9.5;
-        let ch = 20.0;
+        let chrome_h = 32.0 + 8.0;
+        let cw = 7.8;  // match actual render cell width
+        let ch = 16.0;
         let cols = ((width - 24.0) / cw).max(20.0) as usize;
         let rows = ((height - chrome_h) / ch).max(5.0) as usize;
-        // Resize all tabs
         for tab in &mut self.tabs {
-            tab.resize(cols, rows);
-        }
-        if let Some(tab) = &mut self.split_tab {
-            tab.resize(cols / 2, rows);
+            let has_split = tab.split.is_some();
+            let tab_cols = if has_split { cols / 2 } else { cols };
+            tab.resize(tab_cols, rows);
+            if let Some(split) = &mut tab.split {
+                split.resize(cols / 2, rows);
+            }
         }
     }
 }
@@ -985,7 +1001,7 @@ impl AppMain for App {
                     match ke.key_code {
                         KeyCode::KeyT => { self.new_tab(cx); return; }
                         KeyCode::KeyW => {
-                            if self.split_tab.is_some() && self.split_active {
+                            if self.tabs[self.active_tab].split.is_some() && self.split_active {
                                 self.close_split(cx);
                             } else if self.tabs.len() > 1 {
                                 self.close_active_tab(cx);
@@ -1036,8 +1052,8 @@ impl AppMain for App {
                 if !b.is_empty() {
                     self.key_handled = true;
                     if self.split_active {
-                        if let Some(tab) = &mut self.split_tab {
-                            tab.write(&b);
+                        if let Some(split) = &mut self.tabs[self.active_tab].split {
+                            split.write(&b);
                             self.ui.term_view(id!(terminal2)).reset_scroll();
                         }
                     } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -1047,12 +1063,11 @@ impl AppMain for App {
                 }
             }
             Event::TextInput(te) => {
-                // Only handle if KeyDown didn't already send this
                 if !self.key_handled && !te.input.is_empty() && !te.was_paste {
                     let ch = te.input.as_str();
                     if self.split_active {
-                        if let Some(tab) = &mut self.split_tab {
-                            tab.write(ch.as_bytes());
+                        if let Some(split) = &mut self.tabs[self.active_tab].split {
+                            split.write(ch.as_bytes());
                         }
                     } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                         tab.write(ch.as_bytes());

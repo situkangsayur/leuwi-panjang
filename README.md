@@ -1,6 +1,12 @@
+<p align="center">
+  <img src="assets/icons/logo.png" alt="Leuwi Panjang Terminal" width="200">
+</p>
+
 # Leuwi Panjang Terminal
 
 A lightweight, modern, GPU-accelerated terminal emulator built in Rust. Combines the best ideas from iTerm2, Kitty, and GNOME Terminal while being cross-platform including mobile.
+
+![Screenshot](assets/screenshot.png)
 
 ## Why Leuwi Panjang?
 
