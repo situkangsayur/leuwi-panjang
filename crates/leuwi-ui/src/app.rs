@@ -501,11 +501,31 @@ impl AppMain for LeuwiApp {
                     }
                 }
 
-                // Shift+PageUp/Down = scroll
+                // Shift+PageUp/Down = scroll, Shift+Home/End = top/bottom
                 if ke.modifiers.shift {
                     match ke.key_code {
-                        KeyCode::PageUp | KeyCode::PageDown => {
-                            // TODO: scrollback
+                        KeyCode::PageUp => {
+                            if let Some(tabs) = &mut self.tabs {
+                                tabs.active_tab_mut().active_pane_mut().scroll_up(20);
+                            }
+                            return;
+                        }
+                        KeyCode::PageDown => {
+                            if let Some(tabs) = &mut self.tabs {
+                                tabs.active_tab_mut().active_pane_mut().scroll_down(20);
+                            }
+                            return;
+                        }
+                        KeyCode::Home => {
+                            if let Some(tabs) = &mut self.tabs {
+                                tabs.active_tab_mut().active_pane_mut().scroll_up(99999);
+                            }
+                            return;
+                        }
+                        KeyCode::End => {
+                            if let Some(tabs) = &mut self.tabs {
+                                tabs.active_tab_mut().active_pane_mut().scroll_to_bottom();
+                            }
                             return;
                         }
                         _ => {}

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod menu;
+pub mod settings_panel;
 pub mod tab_manager;
 pub mod terminal_pane;
 pub mod terminal_view;

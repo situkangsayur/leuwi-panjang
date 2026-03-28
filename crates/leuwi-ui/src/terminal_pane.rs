@@ -177,6 +177,19 @@ impl TerminalPane {
         let mut grid = self.session.grid.lock().unwrap();
         grid.update_selection(row, col);
     }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        let max = self.session.grid.lock().unwrap().scrollback_len();
+        self.scroll_offset = (self.scroll_offset + lines).min(max);
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
 }
 
 impl Drop for TerminalPane {
