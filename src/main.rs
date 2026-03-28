@@ -152,25 +152,26 @@ impl TermTab {
         }
     }
 
-    /// Get dynamic title from current prompt line (last line with content)
     fn dynamic_title(&self) -> String {
         let grid = self.grid.lock().unwrap();
-        // Find current prompt line — extract CWD from it
+        // Use OSC title if set
+        if !grid.title.is_empty() {
+            return grid.title.clone();
+        }
+        // Fallback: extract from prompt
         for r in (0..grid.rows).rev() {
             let line: String = grid.cells[r].iter().map(|c| if c.ch == ' ' { ' ' } else { c.ch }).collect();
             let trimmed = line.trim();
             if trimmed.is_empty() { continue; }
-            // Look for pattern: user@host /path %
             if let Some(at_pos) = trimmed.find('@') {
                 if let Some(space_after) = trimmed[at_pos..].find(' ') {
                     let after = &trimmed[at_pos + space_after + 1..];
                     let path = after.split(' ').next().unwrap_or("~");
-                    // Get last component of path
                     let name = path.rsplit('/').next().unwrap_or(path);
-                    if name.is_empty() || name == "%" || name == "$" {
-                        return path.to_string();
+                    if !name.is_empty() && name != "%" && name != "$" {
+                        return name.to_string();
                     }
-                    return name.to_string();
+                    return path.to_string();
                 }
             }
             break;
@@ -388,6 +389,36 @@ impl TermGrid {
     fn clear_select(&mut self) {
         self.sel_start = None;
         self.sel_end = None;
+    }
+
+    fn select_all(&mut self) {
+        let sb = self.scrollback.len();
+        self.sel_start = Some((0, 0));
+        self.sel_end = Some((sb + self.rows - 1, self.cols - 1));
+    }
+
+    /// Find URLs in visible text (simple http/https detection)
+    fn find_urls(&self) -> Vec<(usize, usize, usize, String)> {
+        // Returns: (row, start_col, end_col, url)
+        let mut urls = Vec::new();
+        let all_rows: Vec<&Vec<Cell>> = self.scrollback.iter().chain(self.cells.iter()).collect();
+        for (r, row) in all_rows.iter().enumerate() {
+            let line: String = row.iter().map(|c| c.ch).collect();
+            let mut search_from = 0;
+            while let Some(pos) = line[search_from..].find("http") {
+                let start = search_from + pos;
+                // Find end of URL (space, ), ], or end of line)
+                let end = line[start..].find(|c: char| c == ' ' || c == ')' || c == ']' || c == '\'' || c == '"')
+                    .map(|e| start + e)
+                    .unwrap_or(line.len());
+                let url = line[start..end].trim().to_string();
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    urls.push((r, start, end, url));
+                }
+                search_from = end;
+            }
+        }
+        urls
     }
 
     fn is_selected(&self, abs_row: usize, col: usize) -> bool {
@@ -1246,6 +1277,15 @@ impl AppMain for App {
         match event {
             Event::Startup => { self.init(cx); }
             Event::Timer(_) => {
+                // Visual bell check
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    let mut g = tab.grid.lock().unwrap();
+                    if g.bell {
+                        g.bell = false;
+                        // Flash effect — briefly change status bar
+                        self.ui.label(id!(status_text)).set_text(cx, "🔔 BELL");
+                    }
+                }
                 self.update_tab_label(cx);
                 // Status bar info
                 let tab_info = format!(
@@ -1281,7 +1321,15 @@ impl AppMain for App {
                         KeyCode::KeyC => { self.copy_to_clipboard(); return; }
                         KeyCode::KeyV => { self.paste_from_clipboard(); return; }
                         KeyCode::KeyD => { self.split_vertical(cx); return; }
-                        KeyCode::KeyE => { self.split_vertical(cx); return; } // horizontal split (same impl for now)
+                        KeyCode::KeyE => { self.split_vertical(cx); return; }
+                        KeyCode::KeyA => {
+                            // Select all
+                            if let Some(tab) = self.tabs.get(self.active_tab) {
+                                tab.grid.lock().unwrap().select_all();
+                            }
+                            self.ui.redraw(cx);
+                            return;
+                        }
                         KeyCode::KeyF => {
                             // TODO: open search UI overlay
                             // For now, search is via shell (Ctrl+R in zsh)
@@ -1318,6 +1366,10 @@ impl AppMain for App {
                 }
                 // Forward ONLY special/control keys via KeyDown
                 // Printable chars come via TextInput (no double-send)
+                // Clear selection on any keypress
+                if let Some(tab) = self.tabs.get(self.active_tab) {
+                    tab.grid.lock().unwrap().clear_select();
+                }
                 self.key_handled = false;
                 let b = key_to_special_bytes(ke);
                 if !b.is_empty() {
@@ -1918,6 +1970,102 @@ mod tests {
     }
 
     // ── Config toml ──
+    // ── Selection ──
+    #[test]
+    fn test_selection() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Hello World");
+        g.start_select(0, 0);
+        g.update_select(0, 4);
+        assert!(g.is_selected(0, 2));
+        assert!(!g.is_selected(0, 6));
+        let text = g.get_selection_text().unwrap();
+        assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn test_select_all() {
+        let mut g = new_grid(10, 3);
+        g.process(b"ABC");
+        g.select_all();
+        assert!(g.is_selected(0, 0));
+        assert!(g.is_selected(2, 9));
+    }
+
+    #[test]
+    fn test_clear_select() {
+        let mut g = new_grid(80, 24);
+        g.start_select(0, 0);
+        g.update_select(0, 5);
+        g.clear_select();
+        assert!(!g.is_selected(0, 0));
+    }
+
+    // ── URL detection ──
+    #[test]
+    fn test_find_urls() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Visit https://github.com/test for info");
+        let urls = g.find_urls();
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].3.starts_with("https://"));
+    }
+
+    #[test]
+    fn test_no_urls() {
+        let mut g = new_grid(80, 24);
+        g.process(b"No urls here");
+        assert!(g.find_urls().is_empty());
+    }
+
+    // ── OSC title ──
+    #[test]
+    fn test_osc_title() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b]0;My Terminal Title\x07");
+        assert_eq!(g.title, "My Terminal Title");
+    }
+
+    #[test]
+    fn test_osc_title_2() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b]2;Window Title\x07Hello");
+        assert_eq!(g.title, "Window Title");
+        assert_eq!(g.cells[0][0].ch, 'H');
+    }
+
+    // ── Bell ──
+    #[test]
+    fn test_bell() {
+        let mut g = new_grid(80, 24);
+        assert!(!g.bell);
+        g.process(b"\x07");
+        assert!(g.bell);
+    }
+
+    // ── Bold bright ──
+    #[test]
+    fn test_bold_bright_color() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[1;31mX"); // bold red
+        assert!(g.cells[0][0].bold);
+        assert_eq!(g.cells[0][0].fg, 1);
+        // Bold red should render as bright red (9) — tested in rendering
+    }
+
+    // ── Multi-line selection ──
+    #[test]
+    fn test_multiline_selection() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Line1\r\nLine2\r\nLine3");
+        g.start_select(0, 0);
+        g.update_select(2, 4);
+        assert!(g.is_selected(0, 0));
+        assert!(g.is_selected(1, 3));
+        assert!(g.is_selected(2, 4));
+        assert!(!g.is_selected(2, 5));
+    }
+
     #[test]
     fn test_config_toml_parse() {
         let toml_str = "shell = \"/bin/bash\"\nfont_size = 14.0\ncols = 100\nrows = 30\nscrollback = 3000\n";
