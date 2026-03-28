@@ -419,8 +419,20 @@ impl TermGrid {
                                                     2 | 22 => self.cur_bold = false,
                                                     3 => {} // italic
                                                     4 => {} // underline
-                                                    7 => { std::mem::swap(&mut self.cur_fg, &mut self.cur_bg); } // reverse
-                                                    27 => { std::mem::swap(&mut self.cur_fg, &mut self.cur_bg); } // reverse off
+                                                    7 => {
+                                                        // Reverse video: swap fg/bg, using 254 for "default bg"
+                                                        let fg = if self.cur_fg == 255 { 7 } else { self.cur_fg }; // default fg → white
+                                                        let bg = if self.cur_bg == 255 { 254 } else { self.cur_bg }; // default bg → dark
+                                                        self.cur_fg = bg;
+                                                        self.cur_bg = fg;
+                                                    }
+                                                    27 => {
+                                                        // Reverse off — swap back
+                                                        let fg = if self.cur_fg == 254 { 255 } else { self.cur_fg };
+                                                        let bg = if self.cur_bg == 7 { 255 } else { self.cur_bg };
+                                                        self.cur_fg = fg;
+                                                        self.cur_bg = bg;
+                                                    }
                                                     30..=37 => self.cur_fg = (params[j] - 30) as u8,
                                                     39 => self.cur_fg = 255,
                                                     40..=47 => self.cur_bg = (params[j] - 40) as u8,
@@ -611,25 +623,27 @@ fn rgb_to_ansi(r: u8, g: u8, b: u8) -> u8 {
 }
 
 // ANSI color to Makepad vec4
+// Foreground color
 fn ansi_to_vec4(idx: u8) -> Vec4 {
     match idx {
-        0  => vec4(0.20, 0.24, 0.28, 1.0),  // black
+        0  => vec4(0.30, 0.34, 0.38, 1.0),  // black (visible on dark bg)
         1  => vec4(1.00, 0.33, 0.33, 1.0),  // red
         2  => vec4(0.25, 0.73, 0.31, 1.0),  // green
         3  => vec4(0.83, 0.69, 0.22, 1.0),  // yellow
         4  => vec4(0.35, 0.61, 0.98, 1.0),  // blue
         5  => vec4(0.74, 0.50, 0.98, 1.0),  // magenta
         6  => vec4(0.32, 0.83, 0.89, 1.0),  // cyan
-        7  => vec4(0.79, 0.82, 0.89, 1.0),  // white
-        8  => vec4(0.41, 0.46, 0.52, 1.0),  // bright black
+        7  => vec4(0.85, 0.87, 0.91, 1.0),  // white
+        8  => vec4(0.45, 0.50, 0.56, 1.0),  // bright black (comments)
         9  => vec4(1.00, 0.47, 0.47, 1.0),  // bright red
         10 => vec4(0.35, 0.83, 0.42, 1.0),  // bright green
         11 => vec4(0.93, 0.83, 0.32, 1.0),  // bright yellow
         12 => vec4(0.50, 0.74, 1.00, 1.0),  // bright blue
         13 => vec4(0.84, 0.64, 1.00, 1.0),  // bright magenta
         14 => vec4(0.44, 0.91, 0.97, 1.0),  // bright cyan
-        15 => vec4(0.91, 0.93, 0.98, 1.0),  // bright white
-        _  => vec4(0.90, 0.93, 0.96, 1.0),  // default fg
+        15 => vec4(0.93, 0.95, 0.99, 1.0),  // bright white
+        254 => vec4(0.12, 0.12, 0.12, 1.0), // default bg (for reverse)
+        _  => vec4(0.77, 0.79, 0.82, 1.0),  // default fg (#C5C8D1)
     }
 }
 
@@ -1528,11 +1542,10 @@ mod tests {
     #[test]
     fn test_sgr_reverse() {
         let mut g = new_grid(80, 24);
-        g.cur_fg = 1; g.cur_bg = 2;
-        g.process(b"\x1b[7mX"); // reverse
-        // After reverse, fg and bg should be swapped
-        assert_eq!(g.cells[0][0].fg, 2);
-        assert_eq!(g.cells[0][0].bg, 1);
+        // Default fg=255, bg=255 → reverse: fg=254(dark bg), bg=7(white)
+        g.process(b"\x1b[7mX");
+        assert_eq!(g.cells[0][0].fg, 254); // default bg as fg
+        assert_eq!(g.cells[0][0].bg, 7);   // white as bg (was default fg)
     }
 
     // ── Alt screen ──
