@@ -28,7 +28,7 @@ struct TermGrid {
 }
 
 impl Default for TermGrid {
-    fn default() -> Self { Self::new(140, 45) }
+    fn default() -> Self { Self::new(130, 36) }
 }
 
 impl TermGrid {
@@ -254,44 +254,60 @@ impl Widget for TermView {
             None => return DrawStep::done(),
         };
 
-        let cw = 6.65_f64;
-        let ch = 15.0_f64;
-        let px = rect.pos.x + 10.0;
-        let py = rect.pos.y + 4.0;
+        let cw = 8.0_f64;   // wider for JetBrainsMono 11pt
+        let ch = 18.0_f64;  // taller line height
+        let px = rect.pos.x + 12.0;
+        let py = rect.pos.y + 8.0;
 
-        for r in 0..grid.rows {
+        // Find last row with content
+        let mut last_row = 0;
+        for (r, row) in grid.cells.iter().enumerate() {
+            if row.iter().any(|c| c.ch != ' ') { last_row = r; }
+        }
+        let last_row = last_row.max(grid.cur_r);
+
+        for r in 0..=last_row {
             let y = py + (r as f64) * ch;
             if y > rect.pos.y + rect.size.y { break; }
 
-            // Build spans of same-color chars for efficient rendering
+            // Render row as color spans — group consecutive same-color chars
             let mut c = 0;
             while c < grid.cols {
-                let cell = &grid.cells[r][c];
-                if cell.ch == ' ' { c += 1; continue; }
+                // Skip trailing spaces
+                if grid.cells[r][c].ch == ' ' {
+                    c += 1;
+                    continue;
+                }
 
-                // Collect consecutive chars with same color
-                let fg = cell.fg;
-                let mut text = String::new();
-                let start_c = c;
-                while c < grid.cols && grid.cells[r][c].fg == fg && grid.cells[r][c].ch != ' ' {
-                    text.push(grid.cells[r][c].ch);
+                let fg = grid.cells[r][c].fg;
+                let start = c;
+                let mut span = String::new();
+
+                // Collect chars with same fg color (including spaces within)
+                while c < grid.cols {
+                    let cell = &grid.cells[r][c];
+                    if cell.ch == ' ' {
+                        // Check if there are more non-space chars with same color ahead
+                        let mut peek = c + 1;
+                        while peek < grid.cols && grid.cells[r][peek].ch == ' ' { peek += 1; }
+                        if peek < grid.cols && grid.cells[r][peek].fg == fg && grid.cells[r][peek].ch != ' ' {
+                            // Include the spaces
+                            while c < peek { span.push(' '); c += 1; }
+                            continue;
+                        } else {
+                            break; // End of this color span
+                        }
+                    }
+                    if cell.fg != fg { break; }
+                    span.push(cell.ch);
                     c += 1;
                 }
-                // Include spaces between same-color non-space chars
-                while c < grid.cols && grid.cells[r][c].ch == ' ' {
-                    // Look ahead — if next non-space has same color, include spaces
-                    let mut peek = c;
-                    while peek < grid.cols && grid.cells[r][peek].ch == ' ' { peek += 1; }
-                    if peek < grid.cols && grid.cells[r][peek].fg == fg {
-                        while c < peek { text.push(' '); c += 1; }
-                    } else {
-                        break;
-                    }
-                }
 
-                let x = px + (start_c as f64) * cw;
-                self.draw_text.color = ansi_to_vec4(fg);
-                self.draw_text.draw_abs(cx, dvec2(x, y), &text);
+                if !span.is_empty() {
+                    let x = px + (start as f64) * cw;
+                    self.draw_text.color = ansi_to_vec4(fg);
+                    self.draw_text.draw_abs(cx, dvec2(x, y), &span);
+                }
             }
         }
 
@@ -405,16 +421,18 @@ impl App {
         self.ui.term_view(id!(terminal)).set_grid(self.grid.clone());
 
         let pty_system = portable_pty::native_pty_system();
-        let size = portable_pty::PtySize { rows: 45, cols: 140, pixel_width: 0, pixel_height: 0 };
+        let size = portable_pty::PtySize { rows: 36, cols: 130, pixel_width: 0, pixel_height: 0 };
         let pair = pty_system.openpty(size).unwrap();
 
         let mut cmd = portable_pty::CommandBuilder::new("/bin/zsh");
         cmd.args(["--no-globalrcs", "--no-rcs"]);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("PROMPT", "%n@%m %~ %# ");
+        // Colored prompt: green user, cyan host, yellow dir
+        cmd.env("PROMPT", "%F{2}%n%f@%F{6}%m%f %F{3}%~%f %# ");
         cmd.env("RPROMPT", "");
-        cmd.env("LS_COLORS", "di=1;34:ln=36:so=35:pi=33:ex=1;32:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.md=37:*.toml=33:*.json=33:*.yaml=33:*.sh=32:*.txt=37");
+        cmd.env("LS_COLORS", "di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=33;40:cd=33;40:*.tar=1;31:*.gz=1;31:*.zip=1;31:*.jpg=1;35:*.png=1;35:*.rs=33:*.go=36:*.py=33:*.js=33:*.ts=36:*.java=31:*.toml=33:*.json=33:*.md=37:*.sh=32");
+        cmd.env("CLICOLOR", "1");
         for v in &["HOME","USER","PATH","LANG","DISPLAY","WAYLAND_DISPLAY","XDG_RUNTIME_DIR","DBUS_SESSION_BUS_ADDRESS","SSH_AUTH_SOCK","EDITOR"] {
             if let Ok(val) = std::env::var(v) { cmd.env(v, &val); }
         }
@@ -423,6 +441,13 @@ impl App {
 
         let reader = pair.master.try_clone_reader().unwrap();
         self.pty_writer = Some(pair.master.take_writer().unwrap());
+
+        // Send aliases for colored output
+        {
+            let w = self.pty_writer.as_mut().unwrap();
+            let _ = w.write_all(b"alias ls='ls --color=auto'\nalias ll='ls -lah --color=auto'\nalias grep='grep --color=auto'\nclear\n");
+            let _ = w.flush();
+        }
 
         let grid = self.grid.clone();
         std::thread::spawn(move || {
