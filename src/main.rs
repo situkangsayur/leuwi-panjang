@@ -247,7 +247,7 @@ impl Widget for TermView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
         // Mouse wheel = scroll
         if let Event::Scroll(se) = event {
-            let lines = (se.scroll.y / 20.0) as i64;
+            let lines = (-se.scroll.y / 20.0) as i64;  // natural scroll (inverted)
             self.scroll_offset = (self.scroll_offset + lines).max(0);
             self.redraw(cx);
         }
