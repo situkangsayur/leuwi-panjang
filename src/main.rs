@@ -76,8 +76,9 @@ impl Config {
 struct TermTab {
     grid: Arc<Mutex<TermGrid>>,
     writer: Option<Box<dyn Write + Send>>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     title: String,
-    split: Option<Box<TermTab>>,  // per-tab split pane
+    split: Option<Box<TermTab>>,
     split_focused: bool,
 }
 
@@ -105,6 +106,7 @@ impl TermTab {
 
         let reader = pair.master.try_clone_reader().unwrap();
         let mut writer = pair.master.take_writer().unwrap();
+        let master = pair.master;
 
         let _ = writer.write_all(b"alias ls='ls --color=auto'\nalias ll='ls -lah --color=auto'\nalias grep='grep --color=auto'\nclear\n");
         let _ = writer.flush();
@@ -121,7 +123,7 @@ impl TermTab {
             }
         });
 
-        Self { grid, writer: Some(writer), title: format!("Terminal {}", id), split: None, split_focused: false }
+        Self { grid, writer: Some(writer), master: Some(master), title: format!("Terminal {}", id), split: None, split_focused: false }
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -139,7 +141,15 @@ impl TermTab {
     fn resize(&mut self, cols: usize, rows: usize) {
         let mut grid = self.grid.lock().unwrap();
         grid.resize(cols, rows);
-        // TODO: also resize the PTY (requires keeping master handle)
+        grid.scroll_bottom = rows.saturating_sub(1);
+        drop(grid);
+        // Resize PTY — triggers SIGWINCH so vim/htop adapt
+        if let Some(master) = &self.master {
+            let _ = master.resize(portable_pty::PtySize {
+                rows: rows as u16, cols: cols as u16,
+                pixel_width: 0, pixel_height: 0,
+            });
+        }
     }
 
     /// Get dynamic title from current prompt line (last line with content)
