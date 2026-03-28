@@ -200,6 +200,9 @@ struct TermGrid {
     // Saved cursor
     saved_cur_r: usize,
     saved_cur_c: usize,
+    // Scroll region
+    scroll_top: usize,
+    scroll_bottom: usize,
 }
 
 impl Default for TermGrid {
@@ -216,6 +219,7 @@ impl TermGrid {
             cur_r: 0, cur_c: 0, cur_fg: 255, cur_bold: false,
             alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
             saved_cur_r: 0, saved_cur_c: 0,
+            scroll_top: 0, scroll_bottom: rows.saturating_sub(1),
         }
     }
 
@@ -224,22 +228,24 @@ impl TermGrid {
         self.in_alt_screen = true;
         self.alt_cur_r = self.cur_r;
         self.alt_cur_c = self.cur_c;
-        // Save main screen, replace with blank
         self.alt_cells = Some(self.cells.clone());
         self.cells = vec![vec![Cell::default(); self.cols]; self.rows];
         self.cur_r = 0;
         self.cur_c = 0;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
     }
 
     fn leave_alt_screen(&mut self) {
         if !self.in_alt_screen { return; }
         self.in_alt_screen = false;
-        // Restore main screen
         if let Some(main) = self.alt_cells.take() {
             self.cells = main;
         }
         self.cur_r = self.alt_cur_r;
         self.cur_c = self.alt_cur_c;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
     }
 
     fn save_cursor(&mut self) {
@@ -261,15 +267,17 @@ impl TermGrid {
     }
 
     fn newline(&mut self) {
-        if self.cur_r + 1 >= self.rows {
-            // Save top row to scrollback
-            let top = self.cells.remove(0);
-            self.scrollback.push(top);
-            if self.scrollback.len() > self.max_scrollback {
-                self.scrollback.remove(0);
+        if self.cur_r == self.scroll_bottom {
+            // Scroll within region
+            let top = self.cells.remove(self.scroll_top);
+            if self.scroll_top == 0 && !self.in_alt_screen {
+                self.scrollback.push(top);
+                if self.scrollback.len() > self.max_scrollback {
+                    self.scrollback.remove(0);
+                }
             }
-            self.cells.push(vec![Cell::default(); self.cols]);
-        } else {
+            self.cells.insert(self.scroll_bottom, vec![Cell::default(); self.cols]);
+        } else if self.cur_r + 1 < self.rows {
             self.cur_r += 1;
         }
     }
@@ -496,7 +504,29 @@ impl TermGrid {
                                         }
                                     }
                                     b'r' => {
-                                        // DECSTBM — set scroll region (ignored for now)
+                                        // DECSTBM — set scroll region
+                                        let top = if p0 > 0 { p0 - 1 } else { 0 };
+                                        let bot = if p1 > 0 { (p1 - 1).min(self.rows - 1) } else { self.rows - 1 };
+                                        self.scroll_top = top;
+                                        self.scroll_bottom = bot;
+                                        self.cur_r = 0;
+                                        self.cur_c = 0;
+                                    }
+                                    b'S' => {
+                                        // SU — scroll up N lines
+                                        let n = p0.max(1);
+                                        for _ in 0..n {
+                                            self.cells.remove(self.scroll_top);
+                                            self.cells.insert(self.scroll_bottom, vec![Cell::default(); self.cols]);
+                                        }
+                                    }
+                                    b'T' => {
+                                        // SD — scroll down N lines
+                                        let n = p0.max(1);
+                                        for _ in 0..n {
+                                            self.cells.remove(self.scroll_bottom);
+                                            self.cells.insert(self.scroll_top, vec![Cell::default(); self.cols]);
+                                        }
                                     }
                                     _ => {} // silently ignore other CSI
                                 }
@@ -793,6 +823,7 @@ pub struct App {
     #[rust] split_tab: Option<TermTab>,
     #[rust] split_active: bool,
     #[rust] config: Config,
+    #[rust] key_handled: bool,  // prevent double-input from KeyDown+TextInput
 }
 
 impl LiveRegister for App {
@@ -989,9 +1020,11 @@ impl AppMain for App {
                         _ => {}
                     }
                 }
-                // Forward ONLY special keys to PTY (printable chars via TextInput)
+                // Forward special keys to PTY (printable chars via TextInput)
+                self.key_handled = false;
                 let b = key_to_special_bytes(ke);
                 if !b.is_empty() {
+                    self.key_handled = true;
                     if self.split_active {
                         if let Some(tab) = &mut self.split_tab {
                             tab.write(&b);
@@ -1004,12 +1037,9 @@ impl AppMain for App {
                 }
             }
             Event::TextInput(te) => {
-                // TextInput gives us the actual typed character (handles shift, etc.)
-                // Only use if not a control key combo
-                if !te.input.is_empty() && !te.was_paste {
+                // Only handle if KeyDown didn't already send this
+                if !self.key_handled && !te.input.is_empty() && !te.was_paste {
                     let ch = te.input.as_str();
-                    // Don't double-send if we already handled it in KeyDown
-                    // TextInput handles: :, ", {, }, <, >, ?, etc.
                     if self.split_active {
                         if let Some(tab) = &mut self.split_tab {
                             tab.write(ch.as_bytes());
@@ -1019,6 +1049,7 @@ impl AppMain for App {
                     }
                     self.ui.term_view(id!(terminal)).reset_scroll();
                 }
+                self.key_handled = false;
             }
             Event::WindowGeomChange(ev) => {
                 let size = ev.new_geom.inner_size;
