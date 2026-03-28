@@ -30,8 +30,8 @@ struct Config {
 
 fn default_shell() -> String { std::env::var("SHELL").unwrap_or("/bin/zsh".into()) }
 fn default_font_size() -> f64 { 12.0 }
-fn default_cols() -> usize { 135 }
-fn default_rows() -> usize { 40 }
+fn default_cols() -> usize { 125 }
+fn default_rows() -> usize { 36 }
 fn default_scrollback() -> usize { 5000 }
 fn default_bg() -> String { "#1E1E1E".into() }
 fn default_fg() -> String { "#C5C8C6".into() }
@@ -667,8 +667,8 @@ impl Widget for TermView {
             None => return DrawStep::done(),
         };
 
-        let cw = 7.8_f64;
-        let ch = 16.0_f64;
+        let cw = 8.5_f64;
+        let ch = 18.0_f64;
         let pad_x = 12.0;
         let pad_y = 8.0;
 
@@ -1015,9 +1015,9 @@ impl App {
     }
 
     fn handle_resize(&mut self, width: f64, height: f64) {
-        let chrome_h = 32.0 + 8.0;
-        let cw = 7.8;  // match actual render cell width
-        let ch = 16.0;
+        let chrome_h = 32.0 + 20.0; // caption + status bar
+        let cw = 8.5;
+        let ch = 18.0;
         let cols = ((width - 24.0) / cw).max(20.0) as usize;
         let rows = ((height - chrome_h) / ch).max(5.0) as usize;
         for tab in &mut self.tabs {
