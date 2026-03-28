@@ -1,340 +1,296 @@
-use gtk4 as gtk;
-use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow, Box as GtkBox, Button, Label, Notebook, Orientation, CssProvider, WindowControls, PackType};
-use gdk4 as gdk;
-use vte4::prelude::*;
-use vte4::Terminal;
+use makepad_widgets::*;
+use std::sync::{Arc, Mutex};
+use std::io::{Read, Write};
 
-const APP_ID: &str = "com.situkangsayur.leuwi-panjang";
+live_design! {
+    use link::theme::*;
+    use link::widgets::*;
 
-fn main() {
-    let app = Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| load_css());
-    app.connect_activate(build_ui);
-    app.run();
-}
+    App = {{App}} {
+        ui: <Window> {
+            window: { title: "Leuwi Panjang", inner_size: vec2(1100, 700) }
+            show_bg: true
+            draw_bg: { color: #x161B22 }
 
-fn load_css() {
-    let provider = CssProvider::new();
-    provider.load_from_data(r#"
-        window, window.background { background-color: #0D1117; }
-        
-        /* Tab bar = titlebar area */
-        .tab-titlebar {
-            background-color: #0D1117;
-            min-height: 36px;
-            padding: 0 4px;
-        }
-        
-        /* Tabs like Chrome */
-        notebook header {
-            background-color: #0D1117;
-            border: none;
-            padding: 0;
-            margin: 0;
-        }
-        notebook header tab {
-            background-color: transparent;
-            color: #8B949E;
-            border: none;
-            padding: 6px 16px;
-            margin: 4px 1px 0 1px;
-            border-radius: 10px 10px 0 0;
-            min-height: 24px;
-        }
-        notebook header tab:checked {
-            background-color: #161B22;
-            color: #E6EDF3;
-        }
-        notebook header tab:hover:not(:checked) {
-            background-color: #1C2129;
-            color: #C9D1D9;
-        }
-        notebook header tab button {
-            min-height: 16px;
-            min-width: 16px;
-            padding: 0;
-            margin: 0;
-            border-radius: 50%;
-            color: #8B949E;
-        }
-        notebook header tab button:hover {
-            background-color: rgba(255,255,255,0.1);
-            color: #E6EDF3;
-        }
-        notebook > stack {
-            background-color: #161B22;
-        }
-        
-        /* Window control buttons */
-        windowcontrols button {
-            min-height: 20px;
-            min-width: 20px;
-            padding: 4px;
-            margin: 0 1px;
-            border-radius: 50%;
-            background: transparent;
-            color: #8B949E;
-        }
-        windowcontrols button:hover {
-            background-color: rgba(255,255,255,0.1);
-        }
-        windowcontrols button.close:hover {
-            background-color: #E94560;
-            color: white;
-        }
-        
-        /* + new tab button */
-        .new-tab-btn {
-            color: #8B949E;
-            background: transparent;
-            border: none;
-            padding: 4px 8px;
-            margin: 4px 2px;
-            border-radius: 8px;
-            min-height: 24px;
-        }
-        .new-tab-btn:hover {
-            background-color: #1C2129;
-            color: #E6EDF3;
-        }
-        
-        /* Menu button */
-        .menu-btn {
-            color: #8B949E;
-            background: transparent;
-            border: none;
-            padding: 4px 8px;
-            border-radius: 8px;
-        }
-        .menu-btn:hover {
-            background-color: #1C2129;
-            color: #E6EDF3;
-        }
-        
-        /* Status bar */
-        .status-bar {
-            background-color: #0D1117;
-            color: #8B949E;
-            padding: 1px 12px;
-            font-size: 11px;
-            min-height: 22px;
-        }
-        .status-green { color: #3FB950; }
-    "#);
-    gtk::style_context_add_provider_for_display(
-        &gdk::Display::default().unwrap(),
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-}
+            caption_bar = <SolidView> {
+                visible: true
+                flow: Right
+                height: 32
+                draw_bg: { color: #x0D1117 }
 
-fn build_ui(app: &Application) {
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("Leuwi Panjang")
-        .default_width(1200)
-        .default_height(800)
-        .build();
+                caption_label = <View> { visible: false, width: 0, height: 0 }
 
-    // === TITLEBAR = TAB BAR (Chrome style) ===
-    let titlebar = GtkBox::new(Orientation::Horizontal, 0);
-    titlebar.add_css_class("tab-titlebar");
+                tabs = <View> {
+                    width: Fill, height: Fill
+                    flow: Right
+                    align: { y: 0.5 }
+                    padding: { left: 8 }
 
-    // Notebook for tabs
-    let notebook = Notebook::new();
-    notebook.set_scrollable(true);
-    notebook.set_show_border(false);
-    notebook.set_vexpand(true);
-    notebook.set_hexpand(true);
-
-    // The notebook header (tabs) goes INTO the titlebar
-    // We move notebook tab strip to titlebar by placing notebook action widgets
-    
-    // + button at end of tabs
-    let nb_clone = notebook.clone();
-    let add_btn = Button::with_label("+");
-    add_btn.add_css_class("new-tab-btn");
-    add_btn.connect_clicked(move |_| {
-        let n = nb_clone.n_pages() + 1;
-        add_terminal_tab(&nb_clone, &format!("Terminal {n}"));
-    });
-    
-    let end_box = GtkBox::new(Orientation::Horizontal, 2);
-    
-    // Hamburger menu
-    let menu_btn = Button::with_label("≡");
-    menu_btn.add_css_class("menu-btn");
-    end_box.append(&menu_btn);
-    
-    end_box.append(&add_btn);
-    notebook.set_action_widget(&end_box, PackType::End);
-
-    // First tab
-    add_terminal_tab(&notebook, "Terminal 1");
-
-    // Use the NOTEBOOK ITSELF as titlebar — tabs ARE the titlebar
-    // We wrap notebook header area + window controls
-    let tab_header = gtk::HeaderBar::new();
-    tab_header.set_show_title_buttons(true);
-    tab_header.set_decoration_layout(Some(":minimize,maximize,close"));
-    tab_header.set_title_widget(Some(&Label::new(None))); // empty title
-    tab_header.add_css_class("tab-titlebar");
-    
-    // This doesn't work well... let me use a different approach
-    // Just set decorated=false and build our own header
-    
-    // Actually the BEST way for Chrome-style:
-    // Use HeaderBar with notebook as title widget
-    // But notebook needs to be separate...
-    
-    // Simplest working approach: decorated(false) + custom top bar
-    window.set_decorated(false);
-    
-    // Top bar with tabs area + window controls
-    let top_bar = GtkBox::new(Orientation::Horizontal, 0);
-    top_bar.add_css_class("tab-titlebar");
-    top_bar.set_hexpand(true);
-    
-    // Make top bar draggable for window move
-    let drag_handle = gtk::WindowHandle::new();
-    drag_handle.set_child(Some(&top_bar));
-    drag_handle.set_hexpand(true);
-    
-    // Spacer (draggable area before controls)
-    let spacer = GtkBox::new(Orientation::Horizontal, 0);
-    spacer.set_hexpand(true);
-    top_bar.append(&spacer);
-    
-    // Window controls (minimize, maximize, close)
-    let win_controls = WindowControls::new(PackType::End);
-    top_bar.append(&win_controls);
-    
-    // Main layout
-    let main_box = GtkBox::new(Orientation::Vertical, 0);
-    main_box.append(&drag_handle);  // tab bar + window controls
-    main_box.append(&notebook);      // terminal content
-    
-    // Status bar
-    let status = GtkBox::new(Orientation::Horizontal, 6);
-    status.add_css_class("status-bar");
-    let dot = Label::new(Some("●"));
-    dot.add_css_class("status-green");
-    status.append(&dot);
-    status.append(&Label::new(Some("leuwi-panjang v0.1.0")));
-    main_box.append(&status);
-    
-    window.set_child(Some(&main_box));
-    
-    // Move notebook tabs to top_bar
-    // GTK4 Notebook places tabs inside itself. 
-    // For Chrome-style we set notebook tab position to top
-    // and it naturally sits below our drag handle.
-    notebook.set_tab_pos(gtk::PositionType::Top);
-    
-    // Keyboard shortcuts
-    let nb_k = notebook.clone();
-    let win_k = window.clone();
-    let kc = gtk::EventControllerKey::new();
-    kc.connect_key_pressed(move |_, key, _, mods| {
-        let cs = mods.contains(gdk::ModifierType::CONTROL_MASK) && mods.contains(gdk::ModifierType::SHIFT_MASK);
-        if cs {
-            match key {
-                gdk::Key::T | gdk::Key::t => {
-                    let n = nb_k.n_pages() + 1;
-                    add_terminal_tab(&nb_k, &format!("Terminal {n}"));
-                    return gtk::glib::Propagation::Stop;
-                }
-                gdk::Key::W | gdk::Key::w => {
-                    if let Some(p) = nb_k.current_page() {
-                        if nb_k.n_pages() > 1 { nb_k.remove_page(Some(p)); }
+                    tab1 = <Button> {
+                        text: " Terminal 1 "
+                        draw_text: { color: #xC9D1D9, text_style: { font_size: 9.0 } }
+                        draw_bg: { color: #x161B22, fn pixel(self) -> vec4 { return self.color; } }
+                        padding: { left: 12, right: 12, top: 4, bottom: 4 }
                     }
-                    return gtk::glib::Propagation::Stop;
+
+                    <View> { width: Fill, height: Fill }
+
+                    plus_btn = <Button> {
+                        text: "+"
+                        draw_text: { color: #x8B949E, text_style: { font_size: 13.0 } }
+                        draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #x30363D60, self.hover); } }
+                        width: 28, padding: { left: 6, right: 6 }
+                    }
+                    menu_btn = <Button> {
+                        text: "≡"
+                        draw_text: { color: #x8B949E, text_style: { font_size: 14.0 } }
+                        draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #x30363D60, self.hover); } }
+                        width: 32, padding: { left: 6, right: 6 }
+                    }
                 }
-                _ => {}
+
+                windows_buttons = <View> {
+                    visible: true
+                    width: Fit, height: Fit
+                    align: { y: 0.5 }
+                    min = <DesktopButton> { draw_bg: { button_type: WindowsMin } }
+                    max = <DesktopButton> { draw_bg: { button_type: WindowsMax } }
+                    close = <DesktopButton> { draw_bg: { button_type: WindowsClose } }
+                }
+            }
+
+            window_menu = <WindowMenu> { main = Main { items: [] } }
+
+            body = <View> {
+                width: Fill, height: Fill
+                flow: Down
+                show_bg: true
+                draw_bg: { color: #x161B22 }
+                padding: { top: 6, left: 10, right: 10, bottom: 4 }
+
+                output = <Label> {
+                    width: Fill
+                    text: ""
+                    draw_text: {
+                        color: #xC9D1D9
+                        text_style: { font_size: 13.0 }
+                    }
+                }
             }
         }
-        if mods.contains(gdk::ModifierType::CONTROL_MASK) && key == gdk::Key::Tab {
-            let c = nb_k.current_page().unwrap_or(0);
-            nb_k.set_current_page(Some((c + 1) % nb_k.n_pages()));
-            return gtk::glib::Propagation::Stop;
-        }
-        if key == gdk::Key::F11 {
-            if win_k.is_fullscreen() { win_k.unfullscreen(); } else { win_k.fullscreen(); }
-            return gtk::glib::Propagation::Stop;
-        }
-        gtk::glib::Propagation::Proceed
-    });
-    window.add_controller(kc);
-    
-    window.present();
+    }
 }
 
-fn add_terminal_tab(notebook: &Notebook, title: &str) {
-    let terminal = Terminal::new();
-    
-    let fg = gdk::RGBA::new(0.902, 0.910, 0.957, 1.0);   // #E6EDF3
-    let bg = gdk::RGBA::new(0.086, 0.106, 0.133, 1.0);   // #161B22
-    let palette: Vec<gdk::RGBA> = vec![
-        gdk::RGBA::new(0.282, 0.322, 0.376, 1.0),  // #48515E
-        gdk::RGBA::new(1.0, 0.475, 0.435, 1.0),     // #FF796F - red
-        gdk::RGBA::new(0.247, 0.725, 0.314, 1.0),   // #3FB950 - green
-        gdk::RGBA::new(0.831, 0.690, 0.220, 1.0),   // #D4B036 - yellow
-        gdk::RGBA::new(0.345, 0.608, 0.976, 1.0),   // #589BF9 - blue
-        gdk::RGBA::new(0.741, 0.502, 0.976, 1.0),   // #BD80F9 - purple
-        gdk::RGBA::new(0.318, 0.827, 0.886, 1.0),   // #51D3E2 - cyan
-        gdk::RGBA::new(0.788, 0.820, 0.886, 1.0),   // #C9D1E2 - white
-        gdk::RGBA::new(0.408, 0.455, 0.518, 1.0),   // #687484 - bright black
-        gdk::RGBA::new(1.0, 0.584, 0.553, 1.0),     // #FF958D
-        gdk::RGBA::new(0.345, 0.827, 0.424, 1.0),   // #58D36C
-        gdk::RGBA::new(0.929, 0.827, 0.318, 1.0),   // #EDD351
-        gdk::RGBA::new(0.498, 0.737, 1.0, 1.0),     // #7FBCFF
-        gdk::RGBA::new(0.839, 0.639, 1.0, 1.0),     // #D6A3FF
-        gdk::RGBA::new(0.435, 0.914, 0.965, 1.0),   // #6FE9F6
-        gdk::RGBA::new(0.910, 0.929, 0.976, 1.0),   // #E8EDF9
-    ];
-    let prefs: Vec<&gdk::RGBA> = palette.iter().collect();
-    terminal.set_colors(Some(&fg), Some(&bg), &prefs);
-    
-    let font = gtk4::pango::FontDescription::from_string("JetBrainsMono Nerd Font 13");
-    terminal.set_font(Some(&font));
-    terminal.set_scrollback_lines(10000);
-    terminal.set_scroll_on_output(false);
-    terminal.set_scroll_on_keystroke(true);
-    terminal.set_mouse_autohide(true);
-    terminal.set_vexpand(true);
-    terminal.set_hexpand(true);
-    
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let pty = vte4::Pty::new_sync(vte4::PtyFlags::DEFAULT, gtk::gio::Cancellable::NONE).unwrap();
-    pty.spawn_async(
-        None, &[&shell], &[], gtk::glib::SpawnFlags::DEFAULT,
-        || {}, -1, gtk::gio::Cancellable::NONE, |_| {},
-    );
-    terminal.set_pty(Some(&pty));
-    
-    let nb = notebook.clone();
-    terminal.connect_child_exited(move |term, _| {
-        if let Some(p) = nb.page_num(term) {
-            if nb.n_pages() > 1 { nb.remove_page(Some(p)); }
+#[derive(Live, LiveHook)]
+pub struct App {
+    #[live] ui: WidgetRef,
+    #[rust] pty_writer: Option<Box<dyn Write + Send>>,
+    #[rust] pty_output: Arc<Mutex<String>>,
+    #[rust] started: bool,
+}
+
+impl LiveRegister for App {
+    fn live_register(cx: &mut Cx) {
+        makepad_widgets::live_design(cx);
+    }
+}
+
+impl App {
+    fn start_pty(&mut self, cx: &mut Cx) {
+        if self.started { return; }
+        self.started = true;
+
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system.openpty(portable_pty::PtySize {
+            rows: 40, cols: 120, pixel_width: 0, pixel_height: 0,
+        }).unwrap();
+
+        let shell = std::env::var("SHELL").unwrap_or("/bin/bash".into());
+        let mut cmd = portable_pty::CommandBuilder::new(&shell);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        for v in &["HOME","USER","PATH","LANG","DISPLAY","WAYLAND_DISPLAY","XDG_RUNTIME_DIR"] {
+            if let Ok(val) = std::env::var(v) { cmd.env(v, &val); }
         }
-    });
-    
-    // Tab label
-    let tab_box = GtkBox::new(Orientation::Horizontal, 4);
-    tab_box.append(&Label::new(Some(title)));
-    let close = Button::with_label("×");
-    close.set_has_frame(false);
-    let nb2 = notebook.clone();
-    let t = terminal.clone();
-    close.connect_clicked(move |_| {
-        if let Some(p) = nb2.page_num(&t) {
-            if nb2.n_pages() > 1 { nb2.remove_page(Some(p)); }
+        pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+
+        let reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        self.pty_writer = Some(writer);
+
+        let output = self.pty_output.clone();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let text = String::from_utf8_lossy(&buf[..n]);
+                        // Strip common escape sequences
+                        let clean = strip_escapes(&text);
+                        let mut out = output.lock().unwrap();
+                        out.push_str(&clean);
+                        // Keep last 8000 chars
+                        if out.len() > 8000 {
+                            let start = out.len() - 6000;
+                            *out = out[start..].to_string();
+                        }
+                    }
+                }
+            }
+        });
+
+        cx.start_interval(0.033); // 30fps
+    }
+}
+
+impl MatchEvent for App {
+    fn handle_actions(&mut self, _cx: &mut Cx, _actions: &Actions) {}
+}
+
+impl AppMain for App {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        self.match_event(cx, event);
+        self.ui.handle_event(cx, event, &mut Scope::empty());
+
+        match event {
+            Event::Startup => { self.start_pty(cx); }
+            Event::Timer(_) => {
+                let text = self.pty_output.lock().unwrap().clone();
+                self.ui.label(id!(output)).set_text(cx, &text);
+                self.ui.redraw(cx);
+            }
+            Event::KeyDown(ke) => {
+                if let Some(writer) = &mut self.pty_writer {
+                    let bytes = key_to_bytes(ke);
+                    if !bytes.is_empty() { let _ = writer.write_all(&bytes); let _ = writer.flush(); }
+                }
+            }
+            _ => {}
         }
-    });
-    tab_box.append(&close);
-    
-    notebook.append_page(&terminal, Some(&tab_box));
-    notebook.set_tab_reorderable(&terminal, true);
-    notebook.set_current_page(Some(notebook.n_pages() - 1));
+    }
+}
+
+fn key_to_bytes(ke: &KeyEvent) -> Vec<u8> {
+    if ke.modifiers.control {
+        if let Some(c) = kc_char(&ke.key_code) {
+            let c = c.to_ascii_lowercase();
+            if ('a'..='z').contains(&c) { return vec![(c as u8) - b'a' + 1]; }
+        }
+    }
+    match ke.key_code {
+        KeyCode::ReturnKey => vec![13],
+        KeyCode::Backspace => vec![127],
+        KeyCode::Tab => vec![9],
+        KeyCode::Escape => vec![27],
+        KeyCode::ArrowUp => vec![27, b'[', b'A'],
+        KeyCode::ArrowDown => vec![27, b'[', b'B'],
+        KeyCode::ArrowRight => vec![27, b'[', b'C'],
+        KeyCode::ArrowLeft => vec![27, b'[', b'D'],
+        KeyCode::Home => vec![27, b'[', b'H'],
+        KeyCode::End => vec![27, b'[', b'F'],
+        KeyCode::Delete => vec![27, b'[', b'3', b'~'],
+        _ => {
+            if let Some(c) = kc_char(&ke.key_code) {
+                let c = if ke.modifiers.shift { shift_char(c) } else { c };
+                let mut b = [0u8; 4];
+                c.encode_utf8(&mut b);
+                return b[..c.len_utf8()].to_vec();
+            }
+            match ke.key_code {
+                KeyCode::Space => vec![32],
+                _ => vec![],
+            }
+        }
+    }
+}
+
+fn kc_char(kc: &KeyCode) -> Option<char> {
+    match kc {
+        KeyCode::KeyA => Some('a'), KeyCode::KeyB => Some('b'), KeyCode::KeyC => Some('c'),
+        KeyCode::KeyD => Some('d'), KeyCode::KeyE => Some('e'), KeyCode::KeyF => Some('f'),
+        KeyCode::KeyG => Some('g'), KeyCode::KeyH => Some('h'), KeyCode::KeyI => Some('i'),
+        KeyCode::KeyJ => Some('j'), KeyCode::KeyK => Some('k'), KeyCode::KeyL => Some('l'),
+        KeyCode::KeyM => Some('m'), KeyCode::KeyN => Some('n'), KeyCode::KeyO => Some('o'),
+        KeyCode::KeyP => Some('p'), KeyCode::KeyQ => Some('q'), KeyCode::KeyR => Some('r'),
+        KeyCode::KeyS => Some('s'), KeyCode::KeyT => Some('t'), KeyCode::KeyU => Some('u'),
+        KeyCode::KeyV => Some('v'), KeyCode::KeyW => Some('w'), KeyCode::KeyX => Some('x'),
+        KeyCode::KeyY => Some('y'), KeyCode::KeyZ => Some('z'),
+        KeyCode::Key0 => Some('0'), KeyCode::Key1 => Some('1'), KeyCode::Key2 => Some('2'),
+        KeyCode::Key3 => Some('3'), KeyCode::Key4 => Some('4'), KeyCode::Key5 => Some('5'),
+        KeyCode::Key6 => Some('6'), KeyCode::Key7 => Some('7'), KeyCode::Key8 => Some('8'),
+        KeyCode::Key9 => Some('9'),
+        KeyCode::Minus => Some('-'), KeyCode::Equals => Some('='),
+        KeyCode::LBracket => Some('['), KeyCode::RBracket => Some(']'),
+        KeyCode::Backslash => Some('\\'), KeyCode::Semicolon => Some(';'),
+        KeyCode::Quote => Some('\''), KeyCode::Comma => Some(','),
+        KeyCode::Period => Some('.'), KeyCode::Slash => Some('/'),
+        KeyCode::Backtick => Some('`'),
+        _ => None,
+    }
+}
+
+fn shift_char(c: char) -> char {
+    match c {
+        'a'..='z' => c.to_ascii_uppercase(),
+        '0' => ')', '1' => '!', '2' => '@', '3' => '#', '4' => '$',
+        '5' => '%', '6' => '^', '7' => '&', '8' => '*', '9' => '(',
+        '-' => '_', '=' => '+', '[' => '{', ']' => '}', '\\' => '|',
+        ';' => ':', '\'' => '"', ',' => '<', '.' => '>', '/' => '?',
+        '`' => '~',
+        c => c,
+    }
+}
+
+/// Strip ANSI escape sequences for clean display
+fn strip_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    // Skip until letter
+                    while let Some(&nc) = chars.peek() {
+                        chars.next();
+                        if nc.is_ascii_alphabetic() || nc == '~' || nc == '@' { break; }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    // Skip until BEL or ST
+                    while let Some(&nc) = chars.peek() {
+                        chars.next();
+                        if nc == '\x07' { break; }
+                        if nc == '\x1b' { chars.next(); break; }
+                    }
+                }
+                Some('(' | ')' | '*' | '+') => { chars.next(); chars.next(); }
+                _ => { chars.next(); }
+            }
+        } else if c == '\r' {
+            // Carriage return — move to beginning of line
+            if let Some(last_newline) = out.rfind('\n') {
+                out.truncate(last_newline + 1);
+            } else {
+                out.clear();
+            }
+        } else if c == '\x08' {
+            // Backspace
+            out.pop();
+        } else if c >= ' ' || c == '\n' || c == '\t' {
+            out.push(c);
+        }
+        // Skip other control chars
+    }
+    out
+}
+
+app_main!(App);
+
+fn main() {
+    app_main()
 }

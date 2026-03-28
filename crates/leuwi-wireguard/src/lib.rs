@@ -1,1 +1,0 @@
-// leuwi-wireguard - stub
