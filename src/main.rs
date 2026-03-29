@@ -934,9 +934,15 @@ impl Widget for TermView {
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
 
-                // Cell background (separate DrawColor from cursor)
                 let selected = grid.is_selected(abs_row, c);
-                let has_bg = cell.bg != DEFAULT_BG;
+                // Skip bg close to terminal bg #1E1E1E (vim dark grey, 256-color 233-237)
+                let has_bg = if cell.bg == DEFAULT_BG { false }
+                else {
+                    let v = color_to_vec4(cell.bg);
+                    // Distance from terminal bg (0.118, 0.118, 0.118)
+                    let d = ((v.x - 0.118) * (v.x - 0.118) + (v.y - 0.118) * (v.y - 0.118) + (v.z - 0.118) * (v.z - 0.118)).sqrt();
+                    d > 0.12  // skip very similar colors
+                };
 
                 if has_bg {
                     self.draw_cell_bg.color = color_to_vec4(cell.bg);
