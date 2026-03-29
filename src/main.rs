@@ -935,17 +935,23 @@ impl Widget for TermView {
 
                 // Background: selection, colored bg, or skip
                 let selected = grid.is_selected(abs_row, c);
-                let has_bg = cell.bg != DEFAULT_BG;
+                // Background rendering
+                let bg_color = if cell.bg != DEFAULT_BG { Some(color_to_vec4(cell.bg)) } else { None };
+                // Skip bg if too close to terminal bg (avoids grey wash)
+                let has_visible_bg = bg_color.map_or(false, |c| {
+                    let brightness = c.x * 0.299 + c.y * 0.587 + c.z * 0.114;
+                    brightness > 0.15 || brightness < 0.08 // skip near-black that matches bg
+                });
+
                 if selected {
                     self.draw_cursor.color = vec4(0.20, 0.40, 0.65, 0.6);
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
-                } else if has_bg {
-                    self.draw_cursor.color = color_to_vec4(cell.bg);
+                } else if has_visible_bg {
+                    self.draw_cursor.color = bg_color.unwrap();
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
                 }
 
-                // Skip only if space AND no bg AND no underline
-                if cell.ch == ' ' && !has_bg && !cell.underline { continue; }
+                if cell.ch == ' ' && !has_visible_bg && !cell.underline { continue; }
 
                 // Foreground text
                 let fg = if cell.bold && cell.fg < 8 && !is_truecolor(cell.fg) { cell.fg + 8 } else { cell.fg };
@@ -1438,11 +1444,17 @@ impl AppMain for App {
                 }
             }
             Event::KeyDown(ke) => {
-                // Escape closes menu
-                if ke.key_code == KeyCode::Escape && self.menu_open {
-                    self.menu_open = false;
-                    self.ui.view(id!(menu_panel)).set_visible(cx, false);
-                    self.ui.redraw(cx);
+                // Escape: close menu if open, otherwise send to PTY
+                if ke.key_code == KeyCode::Escape {
+                    if self.menu_open {
+                        self.menu_open = false;
+                        self.ui.view(id!(menu_panel)).set_visible(cx, false);
+                        self.ui.redraw(cx);
+                        return;
+                    }
+                    // Send ESC to PTY (vim mode switch)
+                    self.write_to_active(&[0x1b]);
+                    self.key_handled = true;
                     return;
                 }
                 // Ctrl+Shift shortcuts
