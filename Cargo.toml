@@ -1,6 +1,6 @@
 [package]
 name = "leuwi-panjang"
-version = "0.1.0-dev.10"
+version = "0.1.0-dev.11"
 edition = "2021"
 
 [dependencies]
