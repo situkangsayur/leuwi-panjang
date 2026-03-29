@@ -935,12 +935,14 @@ impl Widget for TermView {
 
                 // Background: selection, colored bg, or skip
                 let selected = grid.is_selected(abs_row, c);
-                // Background rendering
+                // Background: skip colors too close to terminal bg (#1E1E1E ≈ 0.118)
                 let bg_color = if cell.bg != DEFAULT_BG { Some(color_to_vec4(cell.bg)) } else { None };
-                // Skip bg if too close to terminal bg (avoids grey wash)
                 let has_visible_bg = bg_color.map_or(false, |c| {
-                    let brightness = c.x * 0.299 + c.y * 0.587 + c.z * 0.114;
-                    brightness > 0.15 || brightness < 0.08 // skip near-black that matches bg
+                    // Terminal bg brightness ≈ 0.118
+                    // Skip if bg brightness is 0.08-0.20 (dark grey = vim cursorline junk)
+                    // Keep if clearly different (htop blue=0.35, green=0.45, cyan=0.55, white=0.90)
+                    let lum = c.x * 0.299 + c.y * 0.587 + c.z * 0.114;
+                    lum > 0.22 || lum < 0.05
                 });
 
                 if selected {
