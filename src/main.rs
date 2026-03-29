@@ -785,7 +785,7 @@ fn rgb_to_ansi(r: u8, g: u8, b: u8) -> u8 {
 // Foreground color
 fn ansi_to_vec4(idx: u8) -> Vec4 {
     match idx {
-        0  => vec4(0.18, 0.20, 0.24, 1.0),  // black — dark but distinct from bg
+        0  => vec4(0.08, 0.08, 0.10, 1.0),  // black — actually dark (visible on colored bg)
         1  => vec4(0.95, 0.30, 0.30, 1.0),  // red
         2  => vec4(0.30, 0.75, 0.35, 1.0),  // green
         3  => vec4(0.85, 0.72, 0.25, 1.0),  // yellow
