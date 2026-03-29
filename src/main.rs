@@ -84,6 +84,7 @@ impl Config {
 }
 
 // ── Terminal Tab ───────────────────────────────────────────
+#[allow(dead_code)]
 struct TermTab {
     grid: Arc<Mutex<TermGrid>>,
     writer: Option<Box<dyn Write + Send>>,
@@ -144,6 +145,7 @@ impl TermTab {
         }
     }
 
+    #[allow(dead_code)]
     fn get_selected_text(&self) -> String {
         let grid = self.grid.lock().unwrap();
         grid.render()
@@ -341,6 +343,7 @@ impl TermGrid {
     }
 
     /// Search scrollback + visible for text, return list of (abs_row, col) matches
+    #[allow(dead_code)]
     fn search(&self, query: &str) -> Vec<(usize, usize)> {
         let mut results = Vec::new();
         if query.is_empty() { return results; }
@@ -1549,6 +1552,7 @@ fn kc_char(kc: &KeyCode) -> Option<char> {
     }
 }
 
+#[allow(dead_code)]
 fn shift_char(c: char) -> char {
     match c {
         'a'..='z' => c.to_ascii_uppercase(),
@@ -2158,5 +2162,150 @@ mod tests {
         assert_eq!(cfg.font_size, 14.0);
         assert_eq!(cfg.cols, 100);
         assert_eq!(cfg.scrollback, 3000);
+    }
+
+    // ── Edge cases ──
+    #[test]
+    fn test_empty_grid_render() {
+        let g = new_grid(80, 24);
+        let text = g.render();
+        assert!(text.is_empty() || text.chars().all(|c| c == ' ' || c == '\n'));
+    }
+
+    #[test]
+    fn test_cursor_at_boundary() {
+        let mut g = new_grid(5, 3);
+        g.cur_c = 4;
+        g.put('X');
+        assert_eq!(g.cur_c, 5); // at boundary
+        g.put('Y'); // wraps
+        assert_eq!(g.cur_r, 1);
+    }
+
+    #[test]
+    fn test_backspace_at_zero() {
+        let mut g = new_grid(80, 24);
+        g.cur_c = 0;
+        g.bs();
+        assert_eq!(g.cur_c, 0); // doesn't go negative
+    }
+
+    #[test]
+    fn test_cursor_up_at_top() {
+        let mut g = new_grid(80, 24);
+        g.cur_r = 0;
+        g.process(b"\x1b[5A"); // up 5 from row 0
+        assert_eq!(g.cur_r, 0); // stays at 0
+    }
+
+    #[test]
+    fn test_cursor_right_at_end() {
+        let mut g = new_grid(10, 5);
+        g.process(b"\x1b[999C"); // forward 999
+        assert_eq!(g.cur_c, 9); // clamped
+    }
+
+    #[test]
+    fn test_clear_below() {
+        let mut g = new_grid(80, 5);
+        g.process(b"AAA\r\nBBB\r\nCCC");
+        g.cur_r = 1; g.cur_c = 0;
+        g.clear_below();
+        assert_eq!(g.cells[0][0].ch, 'A'); // above: untouched
+        assert_eq!(g.cells[1][0].ch, ' '); // cleared
+        assert_eq!(g.cells[2][0].ch, ' '); // cleared
+    }
+
+    #[test]
+    fn test_tab_at_end_of_line() {
+        let mut g = new_grid(10, 3);
+        g.cur_c = 9;
+        g.tab();
+        assert_eq!(g.cur_c, 9); // clamped to cols-1
+    }
+
+    #[test]
+    fn test_utf8_emoji() {
+        let mut g = new_grid(80, 24);
+        g.process("🎉".as_bytes());
+        assert_eq!(g.cells[0][0].ch, '🎉');
+    }
+
+    #[test]
+    fn test_multiple_colors_one_line() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[31mR\x1b[32mG\x1b[34mB\x1b[0mN");
+        assert_eq!(g.cells[0][0].fg, 1); // red
+        assert_eq!(g.cells[0][1].fg, 2); // green
+        assert_eq!(g.cells[0][2].fg, 4); // blue
+        assert_eq!(g.cells[0][3].fg, 255); // reset
+    }
+
+    #[test]
+    fn test_reverse_then_reset() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[7mR\x1b[0mN");
+        // R should have reversed colors
+        assert_ne!(g.cells[0][0].fg, 255);
+        // N should be default
+        assert_eq!(g.cells[0][1].fg, 255);
+    }
+
+    #[test]
+    fn test_alt_screen_preserves_scrollback() {
+        let mut g = new_grid(10, 3);
+        g.process(b"A\r\nB\r\nC\r\nD"); // D causes scroll, A goes to scrollback
+        let sb_before = g.scrollback.len();
+        g.enter_alt_screen();
+        g.leave_alt_screen();
+        assert_eq!(g.scrollback.len(), sb_before); // scrollback preserved
+    }
+
+    #[test]
+    fn test_selection_empty_grid() {
+        let g = new_grid(80, 24);
+        assert!(g.get_selection_text().is_none());
+    }
+
+    #[test]
+    fn test_config_defaults_valid() {
+        let cfg = Config::default();
+        assert!(cfg.cell_width > 0.0);
+        assert!(cfg.cell_height > 0.0);
+        assert!(cfg.cols > 0);
+        assert!(cfg.rows > 0);
+        assert!(!cfg.cursor_style.is_empty());
+    }
+
+    #[test]
+    fn test_find_urls_multiple() {
+        let mut g = new_grid(200, 24);
+        g.process(b"Go to https://example.com and https://rust-lang.org for info");
+        let urls = g.find_urls();
+        assert_eq!(urls.len(), 2);
+    }
+
+    #[test]
+    fn test_osc_no_crash_on_invalid() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b]999;garbage\x07OK");
+        assert_eq!(g.cells[0][0].ch, 'O');
+    }
+
+    #[test]
+    fn test_csi_no_crash_on_large_params() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[99999;99999HX");
+        assert_eq!(g.cells[g.rows-1][g.cols-1].ch, 'X');
+    }
+
+    #[test]
+    fn test_resize_preserves_content() {
+        let mut g = new_grid(80, 24);
+        g.process(b"Hello World");
+        g.resize(40, 12);
+        assert_eq!(g.cells[0][0].ch, 'H');
+        assert_eq!(g.cols, 40);
+        assert_eq!(g.rows, 12);
     }
 }
