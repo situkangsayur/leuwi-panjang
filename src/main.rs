@@ -1326,40 +1326,69 @@ impl MatchEvent for App {
             self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
             if self.menu_open {
                 let menu = format!(
-"━━━ Terminal ━━━━━━━━━━━━━━━━━━━━
-  New Tab          Ctrl+Shift+T
-  Close Tab        Ctrl+Shift+W
-  Next Tab         Ctrl+Tab
+"━━━ KEY MAP ━━━━━━━━━━━━━━━━━━━━
 
-━━━ Split ━━━━━━━━━━━━━━━━━━━━━━
-  Split Vertical   Ctrl+Shift+D
-  Split Horizontal Ctrl+Shift+E
-  Switch Pane      Alt+Left/Right
+ TABS
+  New Tab           Ctrl+Shift+T
+  Close Tab/Pane    Ctrl+Shift+W
+  Next Tab          Ctrl+Tab
+  Tab 1-5           Alt+1 .. Alt+5
 
-━━━ Edit ━━━━━━━━━━━━━━━━━━━━━━━
-  Copy             Ctrl+Shift+C
-  Paste            Ctrl+Shift+V
+ SPLIT SCREEN
+  Split Vertical    Ctrl+Shift+D
+  Split Horizontal  Ctrl+Shift+E
+  Switch Pane       Alt+Left/Right
+  Close Split       Ctrl+Shift+W
 
-━━━ Config ━━━━━━━━━━━━━━━━━━━━━
+ CLIPBOARD
+  Copy (selection)  Ctrl+Shift+C
+  Paste             Ctrl+Shift+V
+  Select All        Ctrl+Shift+A
+
+ NAVIGATION
+  Scroll Up         Mouse Wheel
+  Scroll Down       Mouse Wheel
+  Select Text       Mouse Drag
+  Open URL          Ctrl+Click
+
+ WINDOW
+  Minimize          Min button
+  Maximize          Max button
+  Close App         Alt+F4
+  Fullscreen        F11
+  Menu              ≡ button
+
+ TERMINAL
+  Cancel/Interrupt  Ctrl+C
+  EOF               Ctrl+D
+  Clear Screen      Ctrl+L
+  Search History    Ctrl+R (shell)
+
+━━━ CONFIG ━━━━━━━━━━━━━━━━━━━━━
   Shell: {}
-  Font: {}pt
+  Font: {}pt  Cell: {}x{}
   Grid: {}x{}
   Scrollback: {} lines
-  Config: ~/.config/leuwi-panjang/
+  Cursor: {}
+  File: ~/.config/leuwi-panjang/
+        config.toml
 
-━━━ About ━━━━━━━━━━━━━━━━━━━━━━
-  Leuwi Panjang Terminal
+━━━ ABOUT ━━━━━━━━━━━━━━━━━━━━━━
+  Leuwi Panjang Terminal v0.1.0
   Pure Rust + Makepad
+  GPU-accelerated, chromeless
+
   github.com/situkangsayur/
-      leuwi-panjang
+    leuwi-panjang
   License: GPL-3.0
 
-  Close: Alt+F4  |  Esc: close menu",
+  Esc: close this menu",
                     self.config.shell,
                     self.config.font_size,
-                    self.config.cols,
-                    self.config.rows,
+                    self.config.cell_width, self.config.cell_height,
+                    self.config.cols, self.config.rows,
                     self.config.scrollback,
+                    self.config.cursor_style,
                 );
                 self.ui.label(id!(menu_content)).set_text(cx, &menu);
             }
@@ -1506,13 +1535,20 @@ impl AppMain for App {
                     cx.quit();
                     return;
                 }
-                // Alt+Arrow = switch panes
+                // Alt shortcuts
                 if ke.modifiers.alt {
                     match ke.key_code {
+                        // Alt+Arrow = switch panes in split
                         KeyCode::ArrowLeft | KeyCode::ArrowRight => {
                             self.toggle_split_focus();
                             return;
                         }
+                        // Alt+1-5 = switch to tab N
+                        KeyCode::Key1 => { if self.tabs.len() > 0 { self.active_tab = 0; self.switch_to_active(cx); } return; }
+                        KeyCode::Key2 => { if self.tabs.len() > 1 { self.active_tab = 1; self.switch_to_active(cx); } return; }
+                        KeyCode::Key3 => { if self.tabs.len() > 2 { self.active_tab = 2; self.switch_to_active(cx); } return; }
+                        KeyCode::Key4 => { if self.tabs.len() > 3 { self.active_tab = 3; self.switch_to_active(cx); } return; }
+                        KeyCode::Key5 => { if self.tabs.len() > 4 { self.active_tab = 4; self.switch_to_active(cx); } return; }
                         _ => {}
                     }
                 }
