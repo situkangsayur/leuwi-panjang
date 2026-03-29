@@ -934,40 +934,48 @@ impl Widget for TermView {
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
 
-                let selected = grid.is_selected(abs_row, c);
-                // Skip bg close to terminal bg #1E1E1E (vim dark grey, 256-color 233-237)
-                let has_bg = if cell.bg == DEFAULT_BG { false }
-                else {
-                    let v = color_to_vec4(cell.bg);
-                    // Distance from terminal bg (0.118, 0.118, 0.118)
-                    let d = ((v.x - 0.118) * (v.x - 0.118) + (v.y - 0.118) * (v.y - 0.118) + (v.z - 0.118) * (v.z - 0.118)).sqrt();
-                    d > 0.12  // skip very similar colors
-                };
-
+                // PASS 1: backgrounds only
+                let has_bg = cell.bg != DEFAULT_BG;
                 if has_bg {
                     self.draw_cell_bg.color = color_to_vec4(cell.bg);
                     self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
                 }
+                let selected = grid.is_selected(abs_row, c);
                 if selected {
                     self.draw_cell_bg.color = vec4(0.20, 0.40, 0.65, 0.5);
                     self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
                 }
+            }
+            screen_row += 1;
+        }
 
-                if cell.ch == ' ' && !has_bg && !cell.underline { continue; }
+        // PASS 2: text on top of backgrounds
+        screen_row = 0;
+        for abs_row in start_row..end_row {
+            let y = py + (screen_row as f64) * ch;
+            if y > rect.pos.y + rect.size.y { break; }
 
-                // Foreground text
+            let row_cells: &[Cell] = if abs_row < sb_len {
+                &sb[abs_row]
+            } else {
+                let grid_row = abs_row - sb_len;
+                if grid_row < grid.rows { &grid.cells[grid_row] } else { screen_row += 1; continue; }
+            };
+
+            for (c, cell) in row_cells.iter().enumerate() {
+                if cell.ch == ' ' { continue; }
+                let x = px + (c as f64) * cw;
+                if x > rect.pos.x + rect.size.x { break; }
+
                 let fg = if cell.bold && cell.fg < 8 && !is_truecolor(cell.fg) { cell.fg + 8 } else { cell.fg };
                 self.draw_text.color = color_to_vec4(fg);
+                let s = cell.ch.encode_utf8(&mut char_buf);
+                self.draw_text.draw_abs(cx, dvec2(x, y), s);
 
                 if cell.underline {
                     self.draw_cell_bg.color = color_to_vec4(fg);
                     self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y + ch - 2.0), size: dvec2(cw, 1.0) });
                 }
-
-                // Don't draw space character (bg already drawn above)
-                if cell.ch == ' ' { continue; }
-                let s = cell.ch.encode_utf8(&mut char_buf);
-                self.draw_text.draw_abs(cx, dvec2(x, y), s);
             }
             screen_row += 1;
         }
