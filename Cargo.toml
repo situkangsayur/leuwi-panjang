@@ -1,6 +1,6 @@
 [package]
 name = "leuwi-panjang"
-version = "0.1.0-dev.8"
+version = "0.1.0-dev.9"
 edition = "2021"
 
 [dependencies]
@@ -10,6 +10,7 @@ arboard = "3"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 dirs = "6"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

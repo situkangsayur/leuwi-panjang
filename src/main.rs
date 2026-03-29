@@ -180,11 +180,12 @@ impl TermTab {
                 if let Some(space_after) = trimmed[at_pos..].find(' ') {
                     let after = &trimmed[at_pos + space_after + 1..];
                     let path = after.split(' ').next().unwrap_or("~");
-                    let name = path.rsplit('/').next().unwrap_or(path);
+                    let display_path = if path == "~" { "home/" } else { path };
+                    let name = display_path.rsplit('/').next().unwrap_or(display_path);
                     if !name.is_empty() && name != "%" && name != "$" {
                         return name.to_string();
                     }
-                    return path.to_string();
+                    return display_path.to_string();
                 }
             }
             break;
@@ -197,13 +198,34 @@ impl TermTab {
 #[derive(Clone, Copy)]
 struct Cell {
     ch: char,
-    fg: u8,   // ANSI color index 0-15, 255=default
-    bg: u8,   // ANSI bg color, 255=default (transparent)
+    fg: u32,   // packed: 0xFF=default, 0-15=ansi, 0x01RRGGBB=truecolor
+    bg: u32,   // same format
     bold: bool,
+    underline: bool,
 }
 
+const DEFAULT_FG: u32 = 0xFF;
+const DEFAULT_BG: u32 = 0xFF;
+
 impl Default for Cell {
-    fn default() -> Self { Self { ch: ' ', fg: 255, bg: 255, bold: false } }
+    fn default() -> Self { Self { ch: ' ', fg: DEFAULT_FG, bg: DEFAULT_BG, bold: false, underline: false } }
+}
+
+fn pack_rgb(r: u8, g: u8, b: u8) -> u32 {
+    0x01000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+fn is_truecolor(c: u32) -> bool { c & 0x01000000 != 0 }
+
+fn color_to_vec4(c: u32) -> Vec4 {
+    if is_truecolor(c) {
+        let r = ((c >> 16) & 0xFF) as f32 / 255.0;
+        let g = ((c >> 8) & 0xFF) as f32 / 255.0;
+        let b = (c & 0xFF) as f32 / 255.0;
+        vec4(r, g, b, 1.0)
+    } else {
+        ansi_to_vec4(c as u8)
+    }
 }
 
 // ── Terminal Grid ──────────────────────────────────────────
@@ -215,9 +237,13 @@ struct TermGrid {
     max_scrollback: usize,
     cur_r: usize,
     cur_c: usize,
-    cur_fg: u8,
-    cur_bg: u8,
+    cur_fg: u32,
+    cur_bg: u32,
     cur_bold: bool,
+    cur_underline: bool,
+    // Mouse reporting
+    mouse_reporting: bool,
+    bracketed_paste: bool,
     // Alternate screen buffer (for vim, htop, less, etc.)
     alt_cells: Option<Vec<Vec<Cell>>>,
     alt_cur_r: usize,
@@ -249,7 +275,8 @@ impl TermGrid {
             cells: vec![vec![Cell::default(); cols]; rows],
             scrollback: Vec::new(),
             max_scrollback: 5000,
-            cur_r: 0, cur_c: 0, cur_fg: 255, cur_bg: 255, cur_bold: false,
+            cur_r: 0, cur_c: 0, cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false, cur_underline: false,
+            mouse_reporting: false, bracketed_paste: false,
             alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
             saved_cur_r: 0, saved_cur_c: 0,
             scroll_top: 0, scroll_bottom: rows.saturating_sub(1),
@@ -296,7 +323,7 @@ impl TermGrid {
     fn put(&mut self, ch: char) {
         if self.cur_c >= self.cols { self.cur_c = 0; self.newline(); }
         if self.cur_r < self.rows {
-            self.cells[self.cur_r][self.cur_c] = Cell { ch, fg: self.cur_fg, bg: self.cur_bg, bold: self.cur_bold };
+            self.cells[self.cur_r][self.cur_c] = Cell { ch, fg: self.cur_fg, bg: self.cur_bg, bold: self.cur_bold, underline: self.cur_underline };
             self.cur_c += 1;
         }
     }
@@ -509,53 +536,51 @@ impl TermGrid {
                                     b'F' => { self.cur_c = 0; self.cur_r = self.cur_r.saturating_sub(p0.max(1)); }
                                     b'm' => {
                                         // SGR — process colors
-                                        if params.is_empty() { self.cur_fg = 255; self.cur_bg = 255; self.cur_bold = false; }
+                                        if params.is_empty() { self.cur_fg = DEFAULT_FG; self.cur_bg = DEFAULT_BG; self.cur_bold = false; self.cur_underline = false; }
                                         else {
                                             let mut j = 0;
                                             while j < params.len() {
                                                 match params[j] {
-                                                    0 => { self.cur_fg = 255; self.cur_bg = 255; self.cur_bold = false; }
+                                                    0 => { self.cur_fg = DEFAULT_FG; self.cur_bg = DEFAULT_BG; self.cur_bold = false; self.cur_underline = false; }
                                                     1 => self.cur_bold = true,
                                                     2 | 22 => self.cur_bold = false,
                                                     3 => {} // italic
-                                                    4 => {} // underline
+                                                    4 => self.cur_underline = true,
+                                                    24 => self.cur_underline = false,
                                                     7 => {
-                                                        // Reverse video: swap fg/bg, using 254 for "default bg"
-                                                        let fg = if self.cur_fg == 255 { 7 } else { self.cur_fg }; // default fg → white
-                                                        let bg = if self.cur_bg == 255 { 254 } else { self.cur_bg }; // default bg → dark
+                                                        let fg = if self.cur_fg == DEFAULT_FG { 7 } else { self.cur_fg };
+                                                        let bg = if self.cur_bg == DEFAULT_BG { 254 } else { self.cur_bg };
                                                         self.cur_fg = bg;
                                                         self.cur_bg = fg;
                                                     }
                                                     27 => {
-                                                        // Reverse off — swap back
-                                                        let fg = if self.cur_fg == 254 { 255 } else { self.cur_fg };
-                                                        let bg = if self.cur_bg == 7 { 255 } else { self.cur_bg };
+                                                        let fg = if self.cur_fg == 254 { DEFAULT_FG } else { self.cur_fg };
+                                                        let bg = if self.cur_bg == 7 { DEFAULT_BG } else { self.cur_bg };
                                                         self.cur_fg = fg;
                                                         self.cur_bg = bg;
                                                     }
-                                                    30..=37 => self.cur_fg = (params[j] - 30) as u8,
-                                                    39 => self.cur_fg = 255,
-                                                    40..=47 => self.cur_bg = (params[j] - 40) as u8,
-                                                    49 => self.cur_bg = 255,
-                                                    90..=97 => self.cur_fg = (params[j] - 90 + 8) as u8,
-                                                    100..=107 => self.cur_bg = (params[j] - 100 + 8) as u8,
+                                                    30..=37 => self.cur_fg = (params[j] - 30) as u32,
+                                                    39 => self.cur_fg = DEFAULT_FG,
+                                                    40..=47 => self.cur_bg = (params[j] - 40) as u32,
+                                                    49 => self.cur_bg = DEFAULT_BG,
+                                                    90..=97 => self.cur_fg = (params[j] - 90 + 8) as u32,
+                                                    100..=107 => self.cur_bg = (params[j] - 100 + 8) as u32,
                                                     38 => {
                                                         if j+2 < params.len() && params[j+1] == 5 {
-                                                            self.cur_fg = params[j+2].min(255) as u8;
+                                                            self.cur_fg = params[j+2].min(255) as u32;
                                                             j += 2;
                                                         } else if j+4 < params.len() && params[j+1] == 2 {
-                                                            let r = params[j+2]; let g = params[j+3]; let b = params[j+4];
-                                                            self.cur_fg = rgb_to_ansi(r as u8, g as u8, b as u8);
+                                                            // TRUE COLOR RGB
+                                                            self.cur_fg = pack_rgb(params[j+2] as u8, params[j+3] as u8, params[j+4] as u8);
                                                             j += 4;
                                                         }
                                                     }
                                                     48 => {
                                                         if j+2 < params.len() && params[j+1] == 5 {
-                                                            self.cur_bg = params[j+2].min(255) as u8;
+                                                            self.cur_bg = params[j+2].min(255) as u32;
                                                             j += 2;
                                                         } else if j+4 < params.len() && params[j+1] == 2 {
-                                                            let r = params[j+2]; let g = params[j+3]; let b = params[j+4];
-                                                            self.cur_bg = rgb_to_ansi(r as u8, g as u8, b as u8);
+                                                            self.cur_bg = pack_rgb(params[j+2] as u8, params[j+3] as u8, params[j+4] as u8);
                                                             j += 4;
                                                         }
                                                     }
@@ -566,28 +591,26 @@ impl TermGrid {
                                         }
                                     }
                                     b'h' => {
-                                        // DECSET — enable modes
                                         if private {
                                             for &p in &params {
                                                 match p {
-                                                    1049 => self.enter_alt_screen(), // alt screen
-                                                    1 => {} // app cursor keys
-                                                    25 => {} // show cursor
-                                                    2004 => {} // bracketed paste
+                                                    1049 | 47 | 1047 => self.enter_alt_screen(),
+                                                    1000 | 1002 | 1003 | 1006 => self.mouse_reporting = true,
+                                                    2004 => self.bracketed_paste = true,
+                                                    1 | 12 | 25 | 1004 | 1005 | 7 => {} // app cursor, blink, show, focus, utf8, autowrap
                                                     _ => {}
                                                 }
                                             }
                                         }
                                     }
                                     b'l' => {
-                                        // DECRST — disable modes
                                         if private {
                                             for &p in &params {
                                                 match p {
-                                                    1049 => self.leave_alt_screen(), // leave alt screen
-                                                    1 => {} // normal cursor keys
-                                                    25 => {} // hide cursor
-                                                    2004 => {} // disable bracketed paste
+                                                    1049 | 47 | 1047 => self.leave_alt_screen(),
+                                                    1000 | 1002 | 1003 | 1006 => self.mouse_reporting = false,
+                                                    2004 => self.bracketed_paste = false,
+                                                    1 | 12 | 25 | 1004 | 1005 | 7 => {}
                                                     _ => {}
                                                 }
                                             }
@@ -742,24 +765,24 @@ fn rgb_to_ansi(r: u8, g: u8, b: u8) -> u8 {
 // Foreground color
 fn ansi_to_vec4(idx: u8) -> Vec4 {
     match idx {
-        0  => vec4(0.30, 0.34, 0.38, 1.0),  // black (visible on dark bg)
-        1  => vec4(1.00, 0.33, 0.33, 1.0),  // red
-        2  => vec4(0.25, 0.73, 0.31, 1.0),  // green
-        3  => vec4(0.83, 0.69, 0.22, 1.0),  // yellow
-        4  => vec4(0.35, 0.61, 0.98, 1.0),  // blue
-        5  => vec4(0.74, 0.50, 0.98, 1.0),  // magenta
-        6  => vec4(0.32, 0.83, 0.89, 1.0),  // cyan
-        7  => vec4(0.85, 0.87, 0.91, 1.0),  // white
-        8  => vec4(0.45, 0.50, 0.56, 1.0),  // bright black (comments)
-        9  => vec4(1.00, 0.47, 0.47, 1.0),  // bright red
-        10 => vec4(0.35, 0.83, 0.42, 1.0),  // bright green
-        11 => vec4(0.93, 0.83, 0.32, 1.0),  // bright yellow
-        12 => vec4(0.50, 0.74, 1.00, 1.0),  // bright blue
-        13 => vec4(0.84, 0.64, 1.00, 1.0),  // bright magenta
-        14 => vec4(0.44, 0.91, 0.97, 1.0),  // bright cyan
-        15 => vec4(0.93, 0.95, 0.99, 1.0),  // bright white
-        254 => vec4(0.12, 0.12, 0.12, 1.0), // default bg (for reverse)
-        _  => vec4(0.77, 0.79, 0.82, 1.0),  // default fg (#C5C8D1)
+        0  => vec4(0.18, 0.20, 0.24, 1.0),  // black — dark but distinct from bg
+        1  => vec4(0.95, 0.30, 0.30, 1.0),  // red
+        2  => vec4(0.30, 0.75, 0.35, 1.0),  // green
+        3  => vec4(0.85, 0.72, 0.25, 1.0),  // yellow
+        4  => vec4(0.40, 0.62, 0.95, 1.0),  // blue
+        5  => vec4(0.75, 0.45, 0.95, 1.0),  // magenta
+        6  => vec4(0.35, 0.80, 0.85, 1.0),  // cyan
+        7  => vec4(0.88, 0.90, 0.94, 1.0),  // white (bright enough for bg text)
+        8  => vec4(0.50, 0.55, 0.62, 1.0),  // bright black (comments)
+        9  => vec4(1.00, 0.45, 0.45, 1.0),  // bright red
+        10 => vec4(0.40, 0.88, 0.48, 1.0),  // bright green
+        11 => vec4(0.96, 0.86, 0.38, 1.0),  // bright yellow
+        12 => vec4(0.55, 0.76, 1.00, 1.0),  // bright blue
+        13 => vec4(0.88, 0.65, 1.00, 1.0),  // bright magenta
+        14 => vec4(0.50, 0.93, 0.98, 1.0),  // bright cyan
+        15 => vec4(0.95, 0.97, 1.00, 1.0),  // bright white
+        254 => vec4(0.12, 0.12, 0.12, 1.0), // default bg (reverse)
+        _  => vec4(0.77, 0.79, 0.82, 1.0),  // default fg
     }
 }
 
@@ -890,22 +913,28 @@ impl Widget for TermView {
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
 
-                // Selection highlight
                 let selected = grid.is_selected(abs_row, c);
                 if selected {
-                    self.draw_cursor.color = vec4(0.20, 0.40, 0.65, 0.6); // blue selection
+                    self.draw_cursor.color = vec4(0.20, 0.40, 0.65, 0.6);
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
-                }
-                // Draw bg color
-                else if cell.bg != 255 {
-                    self.draw_cursor.color = ansi_to_vec4(cell.bg);
+                } else if cell.bg != DEFAULT_BG {
+                    self.draw_cursor.color = color_to_vec4(cell.bg);
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
                 }
 
+                if cell.ch == ' ' && !cell.underline { continue; }
+
+                // Bold = bright variant for ANSI colors (not truecolor)
+                let fg = if cell.bold && cell.fg < 8 { cell.fg + 8 } else { cell.fg };
+                self.draw_text.color = color_to_vec4(fg);
+
+                // Underline
+                if cell.underline {
+                    self.draw_cursor.color = color_to_vec4(fg);
+                    self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y + ch - 2.0), size: dvec2(cw, 1.0) });
+                }
+
                 if cell.ch == ' ' { continue; }
-                // Bold = use bright variant (add 8 to color index if basic color)
-                let fg_idx = if cell.bold && cell.fg < 8 { cell.fg + 8 } else { cell.fg };
-                self.draw_text.color = ansi_to_vec4(fg_idx);
                 let s = cell.ch.encode_utf8(&mut char_buf);
                 self.draw_text.draw_abs(cx, dvec2(x, y), s);
             }
@@ -1564,7 +1593,14 @@ fn shift_char(c: char) -> char {
 }
 
 app_main!(App);
-fn main() { app_main() }
+fn main() {
+    // Ignore SIGINT — Ctrl+C should go to PTY, not kill terminal
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+    }
+    app_main()
+}
 
 // ── Tests ──────────────────────────────────────────────────
 #[cfg(test)]
