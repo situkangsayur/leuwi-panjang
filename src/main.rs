@@ -222,9 +222,25 @@ fn color_to_vec4(c: u32) -> Vec4 {
         let r = ((c >> 16) & 0xFF) as f32 / 255.0;
         let g = ((c >> 8) & 0xFF) as f32 / 255.0;
         let b = (c & 0xFF) as f32 / 255.0;
-        vec4(r, g, b, 1.0)
-    } else {
-        ansi_to_vec4(c as u8)
+        return vec4(r, g, b, 1.0);
+    }
+    let idx = c as u8;
+    match idx {
+        0..=15 | 254 | 255 => ansi_to_vec4(idx),
+        // 256-color: 16-231 = 6x6x6 color cube
+        16..=231 => {
+            let n = idx - 16;
+            let r = (n / 36) as f32 * 51.0 / 255.0;
+            let g = ((n / 6) % 6) as f32 * 51.0 / 255.0;
+            let b = (n % 6) as f32 * 51.0 / 255.0;
+            // Boost slightly for visibility on dark bg
+            vec4(r.max(0.02), g.max(0.02), b.max(0.02), 1.0)
+        }
+        // 256-color: 232-253 = grayscale ramp
+        232..=253 => {
+            let v = ((idx - 232) as f32 * 10.0 + 8.0) / 255.0;
+            vec4(v, v, v, 1.0)
+        }
     }
 }
 
