@@ -813,6 +813,7 @@ pub struct TermView {
     #[redraw] #[live] draw_text: DrawText,
     #[live] draw_bg: DrawColor,
     #[live] draw_cursor: DrawColor,
+    #[live] draw_cell_bg: DrawColor,
     #[walk] walk: Walk,
     #[layout] layout: Layout,
     #[rust] grid_ref: Option<Arc<Mutex<TermGrid>>>,
@@ -933,16 +934,17 @@ impl Widget for TermView {
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
 
-                // Background
+                // Cell background (separate DrawColor from cursor)
                 let selected = grid.is_selected(abs_row, c);
                 let has_bg = cell.bg != DEFAULT_BG;
 
+                if has_bg {
+                    self.draw_cell_bg.color = color_to_vec4(cell.bg);
+                    self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
+                }
                 if selected {
-                    self.draw_cursor.color = vec4(0.20, 0.40, 0.65, 0.6);
-                    self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
-                } else if has_bg {
-                    self.draw_cursor.color = color_to_vec4(cell.bg);
-                    self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
+                    self.draw_cell_bg.color = vec4(0.20, 0.40, 0.65, 0.5);
+                    self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
                 }
 
                 if cell.ch == ' ' && !has_bg && !cell.underline { continue; }
@@ -951,10 +953,9 @@ impl Widget for TermView {
                 let fg = if cell.bold && cell.fg < 8 && !is_truecolor(cell.fg) { cell.fg + 8 } else { cell.fg };
                 self.draw_text.color = color_to_vec4(fg);
 
-                // Underline
                 if cell.underline {
-                    self.draw_cursor.color = color_to_vec4(fg);
-                    self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y + ch - 2.0), size: dvec2(cw, 1.0) });
+                    self.draw_cell_bg.color = color_to_vec4(fg);
+                    self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y + ch - 2.0), size: dvec2(cw, 1.0) });
                 }
 
                 // Don't draw space character (bg already drawn above)
@@ -1023,6 +1024,7 @@ live_design! {
         width: Fill, height: Fill
         draw_bg: { color: #x1E1E1E, fn pixel(self) -> vec4 { return self.color; } }
         draw_cursor: { color: #x58A6FF, fn pixel(self) -> vec4 { return self.color; } }
+        draw_cell_bg: { fn pixel(self) -> vec4 { return self.color; } }
         draw_text: {
             color: #xC5C8C6
             text_style: {
@@ -1544,14 +1546,15 @@ impl AppMain for App {
                 }
                 // Forward ONLY special/control keys via KeyDown
                 // Printable chars come via TextInput (no double-send)
-                // Clear selection on any keypress
-                if let Some(tab) = self.tabs.get(self.active_tab) {
-                    tab.grid.lock().unwrap().clear_select();
-                }
+                // Clear selection AFTER processing Ctrl+Shift+C (copy needs selection)
                 self.key_handled = false;
                 let b = key_to_special_bytes(ke);
                 if !b.is_empty() {
                     self.key_handled = true;
+                    // Clear selection when typing (not for Ctrl+Shift combos which are handled above)
+                    if let Some(tab) = self.tabs.get(self.active_tab) {
+                        tab.grid.lock().unwrap().clear_select();
+                    }
                     self.write_to_active(&b);
                     self.ui.term_view(id!(terminal)).reset_scroll();
                     if self.split_active {
