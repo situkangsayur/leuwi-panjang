@@ -933,27 +933,19 @@ impl Widget for TermView {
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
 
-                // Background: selection, colored bg, or skip
+                // Background
                 let selected = grid.is_selected(abs_row, c);
-                // Background: skip colors too close to terminal bg (#1E1E1E ≈ 0.118)
-                let bg_color = if cell.bg != DEFAULT_BG { Some(color_to_vec4(cell.bg)) } else { None };
-                let has_visible_bg = bg_color.map_or(false, |c| {
-                    // Terminal bg brightness ≈ 0.118
-                    // Skip if bg brightness is 0.08-0.20 (dark grey = vim cursorline junk)
-                    // Keep if clearly different (htop blue=0.35, green=0.45, cyan=0.55, white=0.90)
-                    let lum = c.x * 0.299 + c.y * 0.587 + c.z * 0.114;
-                    lum > 0.22 || lum < 0.05
-                });
+                let has_bg = cell.bg != DEFAULT_BG;
 
                 if selected {
                     self.draw_cursor.color = vec4(0.20, 0.40, 0.65, 0.6);
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
-                } else if has_visible_bg {
-                    self.draw_cursor.color = bg_color.unwrap();
+                } else if has_bg {
+                    self.draw_cursor.color = color_to_vec4(cell.bg);
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
                 }
 
-                if cell.ch == ' ' && !has_visible_bg && !cell.underline { continue; }
+                if cell.ch == ' ' && !has_bg && !cell.underline { continue; }
 
                 // Foreground text
                 let fg = if cell.bold && cell.fg < 8 && !is_truecolor(cell.fg) { cell.fg + 8 } else { cell.fg };
@@ -1291,6 +1283,61 @@ impl App {
     }
 
     /// Write bytes to the currently focused pane (main or split)
+    fn show_menu(&self, cx: &mut Cx) {
+        let menu = format!(
+"━━━ KEY MAP ━━━━━━━━━━━━━━━━━━━━
+
+ TABS
+  New Tab           Ctrl+Shift+T
+  Close Tab/Pane    Ctrl+Shift+W
+  Next Tab          Ctrl+Tab
+  Tab 1-5           Alt+1 .. Alt+5
+
+ SPLIT SCREEN
+  Split Vertical    Ctrl+Shift+D
+  Split Horizontal  Ctrl+Shift+E
+  Switch Pane       Alt+Left/Right
+  Close Split       Ctrl+Shift+W
+
+ CLIPBOARD
+  Copy (selection)  Ctrl+Shift+C
+  Paste             Ctrl+Shift+V
+  Select All        Ctrl+Shift+A
+
+ NAVIGATION
+  Scroll Up/Down    Mouse Wheel
+  Select Text       Mouse Drag
+  Open URL          Ctrl+Click
+
+ MENU
+  Open/Close Menu   Ctrl+Shift+M
+
+ WINDOW
+  Close App         Alt+F4
+  Cancel/Interrupt  Ctrl+C
+  Clear Screen      Ctrl+L
+
+━━━ CONFIG ━━━━━━━━━━━━━━━━━━━━━
+  Shell: {}
+  Cell: {}x{} | Grid: {}x{}
+  Scrollback: {} | Cursor: {}
+  ~/.config/leuwi-panjang/config.toml
+
+━━━ ABOUT ━━━━━━━━━━━━━━━━━━━━━━
+  Leuwi Panjang Terminal v0.1.0
+  Rust + Makepad | GPL-3.0
+  github.com/situkangsayur/
+    leuwi-panjang
+
+  Esc: close menu",
+            self.config.shell,
+            self.config.cell_width, self.config.cell_height,
+            self.config.cols, self.config.rows,
+            self.config.scrollback, self.config.cursor_style,
+        );
+        self.ui.label(id!(menu_content)).set_text(cx, &menu);
+    }
+
     fn write_to_active(&mut self, data: &[u8]) {
         if self.split_active {
             if let Some(split) = &mut self.tabs[self.active_tab].split {
@@ -1326,74 +1373,7 @@ impl MatchEvent for App {
         if self.ui.button(id!(menu_btn)).clicked(&actions) {
             self.menu_open = !self.menu_open;
             self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
-            if self.menu_open {
-                let menu = format!(
-"━━━ KEY MAP ━━━━━━━━━━━━━━━━━━━━
-
- TABS
-  New Tab           Ctrl+Shift+T
-  Close Tab/Pane    Ctrl+Shift+W
-  Next Tab          Ctrl+Tab
-  Tab 1-5           Alt+1 .. Alt+5
-
- SPLIT SCREEN
-  Split Vertical    Ctrl+Shift+D
-  Split Horizontal  Ctrl+Shift+E
-  Switch Pane       Alt+Left/Right
-  Close Split       Ctrl+Shift+W
-
- CLIPBOARD
-  Copy (selection)  Ctrl+Shift+C
-  Paste             Ctrl+Shift+V
-  Select All        Ctrl+Shift+A
-
- NAVIGATION
-  Scroll Up         Mouse Wheel
-  Scroll Down       Mouse Wheel
-  Select Text       Mouse Drag
-  Open URL          Ctrl+Click
-
- WINDOW
-  Minimize          Min button
-  Maximize          Max button
-  Close App         Alt+F4
-  Fullscreen        F11
-  Menu              ≡ button
-
- TERMINAL
-  Cancel/Interrupt  Ctrl+C
-  EOF               Ctrl+D
-  Clear Screen      Ctrl+L
-  Search History    Ctrl+R (shell)
-
-━━━ CONFIG ━━━━━━━━━━━━━━━━━━━━━
-  Shell: {}
-  Font: {}pt  Cell: {}x{}
-  Grid: {}x{}
-  Scrollback: {} lines
-  Cursor: {}
-  File: ~/.config/leuwi-panjang/
-        config.toml
-
-━━━ ABOUT ━━━━━━━━━━━━━━━━━━━━━━
-  Leuwi Panjang Terminal v0.1.0
-  Pure Rust + Makepad
-  GPU-accelerated, chromeless
-
-  github.com/situkangsayur/
-    leuwi-panjang
-  License: GPL-3.0
-
-  Esc: close this menu",
-                    self.config.shell,
-                    self.config.font_size,
-                    self.config.cell_width, self.config.cell_height,
-                    self.config.cols, self.config.rows,
-                    self.config.scrollback,
-                    self.config.cursor_style,
-                );
-                self.ui.label(id!(menu_content)).set_text(cx, &menu);
-            }
+            if self.menu_open { self.show_menu(cx); }
             self.ui.redraw(cx);
         }
     }
@@ -1510,6 +1490,14 @@ impl AppMain for App {
                             if let Some(tab) = self.tabs.get(self.active_tab) {
                                 tab.grid.lock().unwrap().select_all();
                             }
+                            self.ui.redraw(cx);
+                            return;
+                        }
+                        KeyCode::KeyM => {
+                            // Toggle menu
+                            self.menu_open = !self.menu_open;
+                            self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
+                            if self.menu_open { self.show_menu(cx); }
                             self.ui.redraw(cx);
                             return;
                         }
