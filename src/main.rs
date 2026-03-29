@@ -715,11 +715,15 @@ impl TermGrid {
                         b'(' | b')' | b'*' | b'+' => { i += 1; if i < data.len() { i += 1; } }
                         b'7' => { self.save_cursor(); }     // DECSC
                         b'8' => { self.restore_cursor(); }  // DECRC
-                        b'M' => {                           // RI — reverse index (scroll down)
-                            if self.cur_r == 0 {
-                                self.cells.insert(0, vec![Cell::default(); self.cols]);
-                                self.cells.truncate(self.rows);
-                            } else {
+                        b'M' => {                           // RI — reverse index
+                            if self.cur_r == self.scroll_top {
+                                // Scroll down within region
+                                if self.scroll_bottom < self.rows {
+                                    self.cells.remove(self.scroll_bottom);
+                                }
+                                self.cells.insert(self.scroll_top, vec![Cell::default(); self.cols]);
+                                if self.cells.len() > self.rows { self.cells.truncate(self.rows); }
+                            } else if self.cur_r > 0 {
                                 self.cur_r -= 1;
                             }
                         }
@@ -913,19 +917,22 @@ impl Widget for TermView {
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
 
+                // Background: selection, colored bg, or skip
                 let selected = grid.is_selected(abs_row, c);
+                let has_bg = cell.bg != DEFAULT_BG;
                 if selected {
                     self.draw_cursor.color = vec4(0.20, 0.40, 0.65, 0.6);
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
-                } else if cell.bg != DEFAULT_BG {
+                } else if has_bg {
                     self.draw_cursor.color = color_to_vec4(cell.bg);
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
                 }
 
-                if cell.ch == ' ' && !cell.underline { continue; }
+                // Skip only if space AND no bg AND no underline
+                if cell.ch == ' ' && !has_bg && !cell.underline { continue; }
 
-                // Bold = bright variant for ANSI colors (not truecolor)
-                let fg = if cell.bold && cell.fg < 8 { cell.fg + 8 } else { cell.fg };
+                // Foreground text
+                let fg = if cell.bold && cell.fg < 8 && !is_truecolor(cell.fg) { cell.fg + 8 } else { cell.fg };
                 self.draw_text.color = color_to_vec4(fg);
 
                 // Underline
@@ -934,6 +941,7 @@ impl Widget for TermView {
                     self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(x, y + ch - 2.0), size: dvec2(cw, 1.0) });
                 }
 
+                // Don't draw space character (bg already drawn above)
                 if cell.ch == ' ' { continue; }
                 let s = cell.ch.encode_utf8(&mut char_buf);
                 self.draw_text.draw_abs(cx, dvec2(x, y), s);
