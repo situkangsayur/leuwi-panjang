@@ -260,7 +260,9 @@ struct TermGrid {
     // Modes
     mouse_reporting: bool,
     bracketed_paste: bool,
-    app_cursor_keys: bool,  // DECCKM — application cursor keys (for vim/nvim)
+    app_cursor_keys: bool,
+    // Response buffer (for DA, DSR replies sent back to PTY)
+    response_buf: Vec<u8>,
     // Alternate screen buffer (for vim, htop, less, etc.)
     alt_cells: Option<Vec<Vec<Cell>>>,
     alt_cur_r: usize,
@@ -293,7 +295,7 @@ impl TermGrid {
             scrollback: Vec::new(),
             max_scrollback: 5000,
             cur_r: 0, cur_c: 0, cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false, cur_underline: false,
-            mouse_reporting: false, bracketed_paste: false, app_cursor_keys: false,
+            mouse_reporting: false, bracketed_paste: false, app_cursor_keys: false, response_buf: Vec::new(),
             alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
             saved_cur_r: 0, saved_cur_c: 0,
             scroll_top: 0, scroll_bottom: rows.saturating_sub(1),
@@ -709,7 +711,24 @@ impl TermGrid {
                                             self.cells.insert(self.scroll_top, vec![Cell::default(); self.cols]);
                                         }
                                     }
-                                    _ => {} // silently ignore other CSI
+                                    b'c' => {
+                                        // DA — Device Attributes. Report as VT220
+                                        if private || p0 == 0 {
+                                            self.response_buf.extend_from_slice(b"\x1b[?62;22c");
+                                        }
+                                    }
+                                    b'n' => {
+                                        // DSR — Device Status Report
+                                        if p0 == 6 {
+                                            // CPR — Cursor Position Report
+                                            let resp = format!("\x1b[{};{}R", self.cur_r + 1, self.cur_c + 1);
+                                            self.response_buf.extend_from_slice(resp.as_bytes());
+                                        } else if p0 == 5 {
+                                            // Status report: OK
+                                            self.response_buf.extend_from_slice(b"\x1b[0n");
+                                        }
+                                    }
+                                    _ => {}
                                 }
                                 i += 1; break;
                             }
@@ -1405,6 +1424,15 @@ impl AppMain for App {
         match event {
             Event::Startup => { self.init(cx); }
             Event::Timer(_) => {
+                // Flush response buffer (DA, DSR replies to PTY)
+                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                    let mut g = tab.grid.lock().unwrap();
+                    if !g.response_buf.is_empty() {
+                        let resp = g.response_buf.drain(..).collect::<Vec<u8>>();
+                        drop(g);
+                        tab.write(&resp);
+                    }
+                }
                 // Visual bell check
                 if let Some(tab) = self.tabs.get(self.active_tab) {
                     let mut g = tab.grid.lock().unwrap();
@@ -1608,10 +1636,24 @@ impl AppMain for App {
                         self.new_tab(cx);
                     }
                 } else if self.menu_open {
-                    // Click outside menu closes it
                     self.menu_open = false;
                     self.ui.view(id!(menu_panel)).set_visible(cx, false);
                     self.ui.redraw(cx);
+                } else {
+                    // Send mouse click to PTY if mouse reporting enabled
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        let g = tab.grid.lock().unwrap();
+                        if g.mouse_reporting {
+                            let cw = self.config.cell_width;
+                            let ch = self.config.cell_height;
+                            let col = ((me.abs.x - 12.0) / cw).max(0.0) as usize + 1; // 1-based
+                            let row = ((me.abs.y - 32.0) / ch).max(0.0) as usize + 1;
+                            drop(g);
+                            // SGR mouse: ESC [ < 0 ; col ; row M
+                            let seq = format!("\x1b[<0;{};{}M", col, row);
+                            tab.write(seq.as_bytes());
+                        }
+                    }
                 }
             }
             Event::WindowGeomChange(ev) => {
