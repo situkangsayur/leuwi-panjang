@@ -257,9 +257,10 @@ struct TermGrid {
     cur_bg: u32,
     cur_bold: bool,
     cur_underline: bool,
-    // Mouse reporting
+    // Modes
     mouse_reporting: bool,
     bracketed_paste: bool,
+    app_cursor_keys: bool,  // DECCKM — application cursor keys (for vim/nvim)
     // Alternate screen buffer (for vim, htop, less, etc.)
     alt_cells: Option<Vec<Vec<Cell>>>,
     alt_cur_r: usize,
@@ -292,7 +293,7 @@ impl TermGrid {
             scrollback: Vec::new(),
             max_scrollback: 5000,
             cur_r: 0, cur_c: 0, cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false, cur_underline: false,
-            mouse_reporting: false, bracketed_paste: false,
+            mouse_reporting: false, bracketed_paste: false, app_cursor_keys: false,
             alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
             saved_cur_r: 0, saved_cur_c: 0,
             scroll_top: 0, scroll_bottom: rows.saturating_sub(1),
@@ -613,7 +614,8 @@ impl TermGrid {
                                                     1049 | 47 | 1047 => self.enter_alt_screen(),
                                                     1000 | 1002 | 1003 | 1006 => self.mouse_reporting = true,
                                                     2004 => self.bracketed_paste = true,
-                                                    1 | 12 | 25 | 1004 | 1005 | 7 => {} // app cursor, blink, show, focus, utf8, autowrap
+                                                    1 => self.app_cursor_keys = true, // DECCKM
+                                                    12 | 25 | 1004 | 1005 | 7 => {}
                                                     _ => {}
                                                 }
                                             }
@@ -626,7 +628,8 @@ impl TermGrid {
                                                     1049 | 47 | 1047 => self.leave_alt_screen(),
                                                     1000 | 1002 | 1003 | 1006 => self.mouse_reporting = false,
                                                     2004 => self.bracketed_paste = false,
-                                                    1 | 12 | 25 | 1004 | 1005 | 7 => {}
+                                                    1 => self.app_cursor_keys = false,
+                                                    12 | 25 | 1004 | 1005 | 7 => {}
                                                     _ => {}
                                                 }
                                             }
@@ -1562,7 +1565,9 @@ impl AppMain for App {
                 // Printable chars come via TextInput (no double-send)
                 // Clear selection AFTER processing Ctrl+Shift+C (copy needs selection)
                 self.key_handled = false;
-                let b = key_to_special_bytes(ke);
+                let app_cur = self.tabs.get(self.active_tab)
+                    .map(|t| t.grid.lock().unwrap().app_cursor_keys).unwrap_or(false);
+                let b = key_to_special_bytes(ke, app_cur);
                 if !b.is_empty() {
                     self.key_handled = true;
                     // Clear selection when typing (not for Ctrl+Shift combos which are handled above)
@@ -1587,6 +1592,28 @@ impl AppMain for App {
                     self.ui.term_view(id!(terminal)).reset_scroll();
                 }
             }
+            Event::MouseDown(me) => {
+                // Detect clicks in caption bar area (y < 32)
+                if me.abs.y < 32.0 {
+                    let win_w = 1100.0; // approximate, TODO: get actual
+                    // ≡ button area: right side before window controls (~120px from right)
+                    if me.abs.x > win_w - 180.0 && me.abs.x < win_w - 140.0 {
+                        self.menu_open = !self.menu_open;
+                        self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
+                        if self.menu_open { self.show_menu(cx); }
+                        self.ui.redraw(cx);
+                    }
+                    // + button area
+                    if me.abs.x > win_w - 220.0 && me.abs.x < win_w - 185.0 {
+                        self.new_tab(cx);
+                    }
+                } else if self.menu_open {
+                    // Click outside menu closes it
+                    self.menu_open = false;
+                    self.ui.view(id!(menu_panel)).set_visible(cx, false);
+                    self.ui.redraw(cx);
+                }
+            }
             Event::WindowGeomChange(ev) => {
                 let size = ev.new_geom.inner_size;
                 self.handle_resize(size.x, size.y);
@@ -1597,23 +1624,24 @@ impl AppMain for App {
 }
 
 /// Only handle special/control keys — printable chars come via TextInput
-fn key_to_special_bytes(ke: &KeyEvent) -> Vec<u8> {
-    // Ctrl+key combos
+fn key_to_special_bytes(ke: &KeyEvent, app_cursor: bool) -> Vec<u8> {
     if ke.modifiers.control {
         if let Some(c) = kc_char(&ke.key_code) {
             let c = c.to_ascii_lowercase();
             if ('a'..='z').contains(&c) { return vec![(c as u8) - b'a' + 1]; }
         }
     }
+    // Arrow keys: ESC [ X (normal) or ESC O X (application mode / DECCKM)
+    let arrow_prefix = if app_cursor { b'O' } else { b'[' };
     match ke.key_code {
         KeyCode::ReturnKey => vec![13],
         KeyCode::Backspace => vec![127],
         KeyCode::Tab => vec![9],
         KeyCode::Escape => vec![27],
-        KeyCode::ArrowUp => vec![27, b'[', b'A'],
-        KeyCode::ArrowDown => vec![27, b'[', b'B'],
-        KeyCode::ArrowRight => vec![27, b'[', b'C'],
-        KeyCode::ArrowLeft => vec![27, b'[', b'D'],
+        KeyCode::ArrowUp => vec![27, arrow_prefix, b'A'],
+        KeyCode::ArrowDown => vec![27, arrow_prefix, b'B'],
+        KeyCode::ArrowRight => vec![27, arrow_prefix, b'C'],
+        KeyCode::ArrowLeft => vec![27, arrow_prefix, b'D'],
         KeyCode::Home => vec![27, b'[', b'H'],
         KeyCode::End => vec![27, b'[', b'F'],
         KeyCode::PageUp => vec![27, b'[', b'5', b'~'],
