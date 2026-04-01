@@ -549,8 +549,30 @@ impl TermGrid {
                                     b'H' | b'f' => { self.cur_r = p0.max(1).saturating_sub(1).min(self.rows-1); self.cur_c = p1.max(1).saturating_sub(1).min(self.cols-1); }
                                     b'G' => self.cur_c = p0.max(1).saturating_sub(1).min(self.cols-1),
                                     b'd' => self.cur_r = p0.max(1).saturating_sub(1).min(self.rows-1),
-                                    b'J' => match p0 { 0 => self.clear_below(), 2|3 => self.clear_screen(), _ => {} },
-                                    b'K' => match p0 { 0 => self.clear_line_right(), 2 => self.clear_line_full(), _ => {} },
+                                    b'J' => match p0 {
+                                        0 => self.clear_below(),
+                                        1 => {
+                                            // Clear from start to cursor
+                                            for r in 0..self.cur_r {
+                                                for c in 0..self.cols { self.cells[r][c] = Cell::default(); }
+                                            }
+                                            for c in 0..=self.cur_c.min(self.cols.saturating_sub(1)) {
+                                                self.cells[self.cur_r][c] = Cell::default();
+                                            }
+                                        }
+                                        2 | 3 => self.clear_screen(),
+                                        _ => {}
+                                    },
+                                    b'K' => match p0 {
+                                        0 => self.clear_line_right(),
+                                        1 => { // clear from start to cursor
+                                            for c in 0..=self.cur_c.min(self.cols.saturating_sub(1)) {
+                                                self.cells[self.cur_r][c] = Cell::default();
+                                            }
+                                        }
+                                        2 => self.clear_line_full(),
+                                        _ => {}
+                                    },
                                     b'E' => { self.cur_c = 0; self.cur_r = (self.cur_r + p0.max(1)).min(self.rows-1); }
                                     b'F' => { self.cur_c = 0; self.cur_r = self.cur_r.saturating_sub(p0.max(1)); }
                                     b'm' => {
@@ -712,20 +734,49 @@ impl TermGrid {
                                         }
                                     }
                                     b'c' => {
-                                        // DA — Device Attributes. Report as VT220
+                                        // DA — Report as xterm-256color compatible
                                         if private || p0 == 0 {
                                             self.response_buf.extend_from_slice(b"\x1b[?62;22c");
                                         }
                                     }
                                     b'n' => {
-                                        // DSR — Device Status Report
                                         if p0 == 6 {
-                                            // CPR — Cursor Position Report
                                             let resp = format!("\x1b[{};{}R", self.cur_r + 1, self.cur_c + 1);
                                             self.response_buf.extend_from_slice(resp.as_bytes());
                                         } else if p0 == 5 {
-                                            // Status report: OK
                                             self.response_buf.extend_from_slice(b"\x1b[0n");
+                                        }
+                                    }
+                                    b't' => {
+                                        // Window ops
+                                        match p0 {
+                                            14 => {
+                                                // Report window size in pixels
+                                                let pw = self.cols as u32 * 9;
+                                                let ph = self.rows as u32 * 20;
+                                                let resp = format!("\x1b[4;{};{}t", ph, pw);
+                                                self.response_buf.extend_from_slice(resp.as_bytes());
+                                            }
+                                            18 => {
+                                                // Report text area size in chars
+                                                let resp = format!("\x1b[8;{};{}t", self.rows, self.cols);
+                                                self.response_buf.extend_from_slice(resp.as_bytes());
+                                            }
+                                            22 => {} // push title
+                                            23 => {} // pop title
+                                            _ => {}
+                                        }
+                                    }
+                                    b'q' => {
+                                        // DECSCUSR — Set Cursor Style
+                                        // 0,1=block blink, 2=block steady, 3=underline blink,
+                                        // 4=underline steady, 5=beam blink, 6=beam steady
+                                        // We store this for rendering
+                                        match p0 {
+                                            0 | 1 | 2 => {} // block (default)
+                                            3 | 4 => {}      // underline
+                                            5 | 6 => {}      // beam
+                                            _ => {}
                                         }
                                     }
                                     _ => {}
@@ -746,6 +797,14 @@ impl TermGrid {
                             if let Ok(s) = std::str::from_utf8(&osc_data) {
                                 if s.starts_with("0;") || s.starts_with("2;") {
                                     self.title = s[2..].to_string();
+                                } else if s.starts_with("10;?") {
+                                    // Query fg color → respond with #C5C8C6
+                                    self.response_buf.extend_from_slice(b"\x1b]10;rgb:c5c5/c8c8/c6c6\x1b\\");
+                                } else if s.starts_with("11;?") {
+                                    // Query bg color → respond with #1E1E1E
+                                    self.response_buf.extend_from_slice(b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\");
+                                } else if s.starts_with("4;") && s.contains("?") {
+                                    // Query color palette — respond with empty (skip)
                                 }
                             }
                         }
@@ -1656,6 +1715,23 @@ impl AppMain for App {
                     }
                 }
             }
+            Event::MouseUp(me) => {
+                // Send mouse release to PTY if reporting
+                if me.abs.y > 32.0 {
+                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                        let g = tab.grid.lock().unwrap();
+                        if g.mouse_reporting {
+                            let cw = self.config.cell_width;
+                            let ch = self.config.cell_height;
+                            let col = ((me.abs.x - 12.0) / cw).max(0.0) as usize + 1;
+                            let row = ((me.abs.y - 32.0) / ch).max(0.0) as usize + 1;
+                            drop(g);
+                            let seq = format!("\x1b[<0;{};{}m", col, row); // lowercase m = release
+                            tab.write(seq.as_bytes());
+                        }
+                    }
+                }
+            }
             Event::WindowGeomChange(ev) => {
                 let size = ev.new_geom.inner_size;
                 self.handle_resize(size.x, size.y);
@@ -2492,5 +2568,128 @@ mod tests {
         assert_eq!(g.cells[0][0].ch, 'H');
         assert_eq!(g.cols, 40);
         assert_eq!(g.rows, 12);
+    }
+
+    // ── DA/DSR responses ──
+    #[test]
+    fn test_da_response() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[c"); // DA query
+        assert!(!g.response_buf.is_empty());
+        let resp = String::from_utf8_lossy(&g.response_buf);
+        assert!(resp.contains("?62"));
+    }
+
+    #[test]
+    fn test_dsr_cursor_position() {
+        let mut g = new_grid(80, 24);
+        g.cur_r = 5; g.cur_c = 10;
+        g.process(b"\x1b[6n"); // DSR cursor pos
+        let resp = String::from_utf8_lossy(&g.response_buf);
+        assert!(resp.contains("6;11")); // 1-based
+    }
+
+    #[test]
+    fn test_dsr_status() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[5n");
+        assert_eq!(&g.response_buf, b"\x1b[0n");
+    }
+
+    // ── Window ops ──
+    #[test]
+    fn test_window_size_report() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[18t"); // query text size
+        let resp = String::from_utf8_lossy(&g.response_buf);
+        assert!(resp.contains("8;24;80"));
+    }
+
+    // ── Erase modes ──
+    #[test]
+    fn test_erase_line_left() {
+        let mut g = new_grid(80, 24);
+        g.process(b"ABCDE");
+        g.cur_c = 2;
+        g.process(b"\x1b[1K"); // erase from start to cursor
+        assert_eq!(g.cells[0][0].ch, ' ');
+        assert_eq!(g.cells[0][2].ch, ' ');
+        assert_eq!(g.cells[0][3].ch, 'D');
+    }
+
+    #[test]
+    fn test_erase_display_above() {
+        let mut g = new_grid(80, 5);
+        g.process(b"AAA\r\nBBB\r\nCCC");
+        g.cur_r = 1; g.cur_c = 1;
+        g.process(b"\x1b[1J"); // erase from start to cursor
+        assert_eq!(g.cells[0][0].ch, ' '); // row 0 cleared
+        assert_eq!(g.cells[1][0].ch, ' '); // row 1 col 0 cleared
+        assert_eq!(g.cells[1][1].ch, ' '); // row 1 col 1 cleared
+        assert_eq!(g.cells[2][0].ch, 'C'); // row 2 untouched
+    }
+
+    // ── App cursor keys ──
+    #[test]
+    fn test_app_cursor_keys() {
+        let mut g = new_grid(80, 24);
+        assert!(!g.app_cursor_keys);
+        g.process(b"\x1b[?1h"); // enable DECCKM
+        assert!(g.app_cursor_keys);
+        g.process(b"\x1b[?1l"); // disable
+        assert!(!g.app_cursor_keys);
+    }
+
+    // ── OSC color queries ──
+    #[test]
+    fn test_osc_fg_query() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b]10;?\x07");
+        let resp = String::from_utf8_lossy(&g.response_buf);
+        assert!(resp.contains("10;rgb:"));
+    }
+
+    #[test]
+    fn test_osc_bg_query() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b]11;?\x07");
+        let resp = String::from_utf8_lossy(&g.response_buf);
+        assert!(resp.contains("11;rgb:"));
+    }
+
+    // ── Truecolor ──
+    #[test]
+    fn test_truecolor_fg() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[38;2;255;128;0mX");
+        assert!(is_truecolor(g.cells[0][0].fg));
+        let v = color_to_vec4(g.cells[0][0].fg);
+        assert!((v.x - 1.0).abs() < 0.01); // r=255
+        assert!((v.y - 0.502).abs() < 0.01); // g=128
+    }
+
+    #[test]
+    fn test_truecolor_bg() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[48;2;0;100;200mX");
+        assert!(is_truecolor(g.cells[0][0].bg));
+    }
+
+    // ── 256 color cube ──
+    #[test]
+    fn test_256_color_cube() {
+        // Color 196 = red (5,0,0) in 6x6x6 cube
+        let v = color_to_vec4(196);
+        assert!(v.x > 0.9); // very red
+        assert!(v.y < 0.1); // no green
+    }
+
+    #[test]
+    fn test_256_grayscale() {
+        // 232 = darkest grey, 255 would be lightest but 255=default
+        let v = color_to_vec4(232);
+        assert!(v.x < 0.1); // very dark
+        let v2 = color_to_vec4(250);
+        assert!(v2.x > 0.5); // lighter
     }
 }
