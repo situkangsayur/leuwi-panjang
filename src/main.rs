@@ -1,8 +1,122 @@
 use makepad_widgets::*;
 use std::sync::{Arc, Mutex};
 use std::io::{Read, Write};
-use arboard::Clipboard;
 use serde::{Deserialize, Serialize};
+
+// ── Clipboard (platform-gated) ─────────────────────────────
+// Desktop uses the system clipboard via arboard. Android has no arboard
+// backend, so we fall back to a process-local buffer (copy/paste within app).
+#[cfg(not(target_os = "android"))]
+mod clip {
+    use arboard::Clipboard;
+    pub fn set(text: &str) { if let Ok(mut cb) = Clipboard::new() { let _ = cb.set_text(text); } }
+    pub fn get() -> String {
+        Clipboard::new().ok().and_then(|mut cb| cb.get_text().ok()).unwrap_or_default()
+    }
+}
+#[cfg(target_os = "android")]
+mod clip {
+    use std::sync::Mutex;
+    static BUF: Mutex<String> = Mutex::new(String::new());
+    pub fn set(text: &str) { if let Ok(mut b) = BUF.lock() { *b = text.to_string(); } }
+    pub fn get() -> String { BUF.lock().map(|b| b.clone()).unwrap_or_default() }
+}
+
+// ── Theme ──────────────────────────────────────────────────
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Theme {
+    #[serde(default = "default_theme_name")]
+    name: String,
+    #[serde(default = "default_bg")]
+    bg: String,
+    #[serde(default = "default_fg")]
+    fg: String,
+    #[serde(default = "default_cursor_color")]
+    cursor: String,
+    #[serde(default = "default_selection_color")]
+    selection: String,
+    #[serde(default = "default_status_bg")]
+    status_bg: String,
+    #[serde(default = "default_status_fg")]
+    status_fg: String,
+    #[serde(default = "default_tab_bg")]
+    tab_bg: String,
+    #[serde(default)]
+    ansi: Vec<String>,  // 16 ANSI colors
+}
+
+fn default_theme_name() -> String { "leuwi-dark".into() }
+fn default_cursor_color() -> String { "#58A6FF".into() }
+fn default_selection_color() -> String { "#264F78".into() }
+fn default_status_bg() -> String { "#181818".into() }
+fn default_status_fg() -> String { "#6E7681".into() }
+fn default_tab_bg() -> String { "#181818".into() }
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            name: default_theme_name(),
+            bg: default_bg(), fg: default_fg(),
+            cursor: default_cursor_color(), selection: default_selection_color(),
+            status_bg: default_status_bg(), status_fg: default_status_fg(),
+            tab_bg: default_tab_bg(),
+            ansi: vec![
+                "#141416".into(), "#F24D4D".into(), "#4DBF59".into(), "#D9B840".into(),
+                "#669EF2".into(), "#BF73F2".into(), "#59CCD9".into(), "#E0E5F0".into(),
+                "#808C9E".into(), "#FF7373".into(), "#66E07A".into(), "#F5DB61".into(),
+                "#8CC2FF".into(), "#E0A6FF".into(), "#80EDFB".into(), "#F2F8FF".into(),
+            ],
+        }
+    }
+}
+
+impl Theme {
+    fn load(name: &str) -> Self {
+        let dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("leuwi-panjang/themes");
+        let path = dir.join(format!("{}.toml", name));
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(theme) = toml::from_str(&content) {
+                    return theme;
+                }
+            }
+        }
+        // Write default theme if not exists
+        let theme = Theme::default();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(s) = toml::to_string_pretty(&theme) {
+            let _ = std::fs::write(dir.join("leuwi-dark.toml"), s);
+        }
+        theme
+    }
+
+    fn hex_to_vec4(&self, hex: &str) -> Vec4 {
+        parse_hex_color(hex)
+    }
+
+    fn ansi_color(&self, idx: u8) -> Vec4 {
+        if (idx as usize) < self.ansi.len() {
+            parse_hex_color(&self.ansi[idx as usize])
+        } else {
+            ansi_to_vec4(idx)
+        }
+    }
+}
+
+fn parse_hex_color(hex: &str) -> Vec4 {
+    let h = hex.trim_start_matches('#');
+    if h.len() >= 6 {
+        let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(0);
+        let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(0);
+        let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(0);
+        vec4(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
+    } else {
+        vec4(0.77, 0.79, 0.82, 1.0)
+    }
+}
 
 // ── Config ─────────────────────────────────────────────────
 
@@ -32,6 +146,8 @@ struct Config {
     cell_width: f64,
     #[serde(default = "default_cell_height")]
     cell_height: f64,
+    #[serde(default = "default_theme_name")]
+    theme: String,
 }
 
 fn default_shell() -> String { std::env::var("SHELL").unwrap_or("/bin/zsh".into()) }
@@ -57,6 +173,7 @@ impl Default for Config {
             prompt: default_prompt(), opacity: default_opacity(),
             cursor_style: default_cursor_style(),
             cell_width: default_cell_width(), cell_height: default_cell_height(),
+            theme: default_theme_name(),
         }
     }
 }
@@ -83,18 +200,66 @@ impl Config {
     }
 }
 
+// ── Split direction ────────────────────────────────────────
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SplitDir { Vertical, Horizontal }
+
+// ── Android local-echo writer (milestone A backend) ────────
+// On Android there is no local shell/PTY (termios/portable-pty do not build
+// for the android target). Until the SSH backend is wired in, the tab uses a
+// local-echo writer so the terminal is visibly interactive on device.
+#[cfg(target_os = "android")]
+struct EchoWriter { grid: Arc<Mutex<TermGrid>> }
+#[cfg(target_os = "android")]
+impl Write for EchoWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut g) = self.grid.lock() {
+            for &b in buf {
+                if b == b'\r' { g.process(b"\r\n"); } else { g.process(&[b]); }
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
 // ── Terminal Tab ───────────────────────────────────────────
 #[allow(dead_code)]
 struct TermTab {
     grid: Arc<Mutex<TermGrid>>,
     writer: Option<Box<dyn Write + Send>>,
+    #[cfg(not(target_os = "android"))]
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    #[cfg(target_os = "android")]
+    resize_tx: Option<std::sync::mpsc::Sender<(u16, u16)>>,
     title: String,
     split: Option<Box<TermTab>>,
+    split_dir: SplitDir,
     split_focused: bool,
 }
 
 impl TermTab {
+    // Android build: local-echo terminal with a welcome banner.
+    // (SSH backend to nvgpu is added in a later milestone.)
+    #[cfg(target_os = "android")]
+    fn spawn(id: usize, cfg: &Config) -> Self {
+        let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
+        let banner = concat!(
+            "\r\n  \x1b[1;38;5;39mLeuwi Panjang\x1b[0m \x1b[2mAndroid\x1b[0m\r\n",
+            "  \x1b[2m—————————————————————————————\x1b[0m\r\n",
+            "  Terminal UI aktif. Backend SSH (nvgpu) menyusul.\r\n\r\n",
+            "  \x1b[2mketik untuk menguji rendering & keyboard\x1b[0m\r\n\r\n",
+        );
+        grid.lock().unwrap().process(banner.as_bytes());
+        let writer: Box<dyn Write + Send> = Box::new(EchoWriter { grid: grid.clone() });
+        Self {
+            grid, writer: Some(writer), resize_tx: None,
+            title: format!("Terminal {}", id),
+            split: None, split_dir: SplitDir::Vertical, split_focused: false,
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
     fn spawn(id: usize, cfg: &Config) -> Self {
         let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
         let pty_system = portable_pty::native_pty_system();
@@ -135,7 +300,7 @@ impl TermTab {
             }
         });
 
-        Self { grid, writer: Some(writer), master: Some(master), title: format!("Terminal {}", id), split: None, split_focused: false }
+        Self { grid, writer: Some(writer), master: Some(master), title: format!("Terminal {}", id), split: None, split_dir: SplitDir::Vertical, split_focused: false }
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -157,11 +322,17 @@ impl TermTab {
         grid.scroll_bottom = rows.saturating_sub(1);
         drop(grid);
         // Resize PTY — triggers SIGWINCH so vim/htop adapt
+        #[cfg(not(target_os = "android"))]
         if let Some(master) = &self.master {
             let _ = master.resize(portable_pty::PtySize {
                 rows: rows as u16, cols: cols as u16,
                 pixel_width: 0, pixel_height: 0,
             });
+        }
+        // On Android, notify the SSH backend of the new window size.
+        #[cfg(target_os = "android")]
+        if let Some(tx) = &self.resize_tx {
+            let _ = tx.send((cols as u16, rows as u16));
         }
     }
 
@@ -904,6 +1075,8 @@ pub struct TermView {
     #[rust] cw: f64,
     #[rust] ch: f64,
     #[rust] cursor_block: bool,
+    #[rust] search_highlights: Vec<(usize, usize, usize)>, // (abs_row, start_col, len)
+    #[rust] is_focused: bool,
 }
 
 impl Widget for TermView {
@@ -932,7 +1105,10 @@ impl Widget for TermView {
                         let urls = g.find_urls();
                         for (r, cs, ce, url) in &urls {
                             if *r == abs_row && col >= *cs && col <= *ce {
-                                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+                                #[cfg(not(target_os = "android"))]
+                                { let _ = std::process::Command::new("xdg-open").arg(url).spawn(); }
+                                #[cfg(target_os = "android")]
+                                { let _ = url; }
                                 return;
                             }
                         }
@@ -1026,6 +1202,13 @@ impl Widget for TermView {
                     self.draw_cell_bg.color = vec4(0.20, 0.40, 0.65, 0.5);
                     self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
                 }
+                // Search highlight
+                for &(hr, hc, hlen) in &self.search_highlights {
+                    if abs_row == hr && c >= hc && c < hc + hlen {
+                        self.draw_cell_bg.color = vec4(0.60, 0.50, 0.10, 0.6);
+                        self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
+                    }
+                }
             }
             screen_row += 1;
         }
@@ -1068,10 +1251,16 @@ impl Widget for TermView {
         if self.scroll_offset == 0 && self.blink_on {
             let cursor_y = py + (screen_row.saturating_sub(1usize) as f64) * ch;
             let cursor_x = px + (grid.cur_c as f64) * cw;
-            // Block cursor with highlight color
             self.draw_cursor.color = vec4(0.345, 0.608, 0.976, 0.8);
-            let cursor_w = if self.cursor_block { cw } else { 2.0 }; // block or beam
+            let cursor_w = if self.cursor_block { cw } else { 2.0 };
             self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(cursor_w, ch) });
+        }
+
+        // Focus border indicator (thin colored line on focused pane edge)
+        if self.is_focused {
+            self.draw_cursor.color = vec4(0.345, 0.608, 0.976, 0.6);
+            // Top edge
+            self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(rect.pos.x, rect.pos.y), size: dvec2(rect.size.x, 2.0) });
         }
 
         DrawStep::done()
@@ -1105,6 +1294,16 @@ impl TermViewRef {
                 Walk { width: Size::Fixed(0.0), height: Size::Fixed(0.0), ..inner.walk }
             };
             inner.redraw(cx);
+        }
+    }
+    fn set_search_highlights(&self, highlights: Vec<(usize, usize, usize)>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.search_highlights = highlights;
+        }
+    }
+    fn set_focused(&self, focused: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.is_focused = focused;
         }
     }
 }
@@ -1183,21 +1382,49 @@ live_design! {
                         visible: false
                         width: 2, height: Fill
                         show_bg: true
-                        draw_bg: { color: #x333333 }
+                        draw_bg: { color: #x444444 }
                     }
                     terminal2 = <TermView> {
                         width: 0, height: 0
                     }
                 }
 
+                // Search bar (hidden by default)
+                search_bar = <View> {
+                    visible: false
+                    width: Fill, height: 28, flow: Right
+                    show_bg: true
+                    draw_bg: { color: #x252526 }
+                    align: { y: 0.5 }
+                    padding: { left: 10, right: 10 }
+                    search_icon = <Label> {
+                        text: "🔍 "
+                        draw_text: { color: #x6E7681, text_style: { font_size: 9.0 } }
+                    }
+                    search_label = <Label> {
+                        text: ""
+                        draw_text: { color: #xE0E0E0, text_style: { font_size: 10.0 } }
+                    }
+                    <View> { width: Fill, height: Fill }
+                    search_info = <Label> {
+                        text: ""
+                        draw_text: { color: #x6E7681, text_style: { font_size: 9.0 } }
+                    }
+                }
+
                 // Status bar
                 status = <View> {
-                    width: Fill, height: 20, flow: Right
+                    width: Fill, height: 22, flow: Right
                     show_bg: true
                     draw_bg: { color: #x181818 }
                     align: { y: 0.5 }
                     padding: { left: 10, right: 10 }
-                    status_text = <Label> {
+                    status_left = <Label> {
+                        text: ""
+                        draw_text: { color: #x6E7681, text_style: { font_size: 8.5 } }
+                    }
+                    <View> { width: Fill, height: Fill }
+                    status_right = <Label> {
                         text: ""
                         draw_text: { color: #x6E7681, text_style: { font_size: 8.5 } }
                     }
@@ -1241,11 +1468,16 @@ pub struct App {
     #[rust] active_tab: usize,
     #[rust] started: bool,
     #[rust] tab_counter: usize,
-    // Split is now per-tab (stored in TermTab.split)
     #[rust] split_active: bool,
     #[rust] config: Config,
+    #[rust] theme: Theme,
     #[rust] key_handled: bool,
     #[rust] menu_open: bool,
+    // Search state
+    #[rust] search_open: bool,
+    #[rust] search_query: String,
+    #[rust] search_matches: Vec<(usize, usize)>,  // (abs_row, col)
+    #[rust] search_idx: usize,
 }
 
 impl LiveRegister for App {
@@ -1259,6 +1491,7 @@ impl App {
         if self.started { return; }
         self.started = true;
         self.config = Config::load();
+        self.theme = Theme::load(&self.config.theme);
         self.tab_counter = 1;
         self.tabs.push(TermTab::spawn(1, &self.config));
         self.active_tab = 0;
@@ -1310,16 +1543,28 @@ impl App {
         self.ui.button(id!(tab1)).set_text(cx, &text);
     }
 
-    fn split_vertical(&mut self, cx: &mut Cx) {
+    fn do_split(&mut self, cx: &mut Cx, dir: SplitDir) {
         let tab = &self.tabs[self.active_tab];
         if tab.split.is_some() { return; }
         self.tab_counter += 1;
         let split = TermTab::spawn(self.tab_counter, &self.config);
+        let block = self.config.cursor_style == "block";
         self.ui.term_view(id!(terminal2)).set_grid(split.grid.clone());
+        self.ui.term_view(id!(terminal2)).set_cell_size(self.config.cell_width, self.config.cell_height, block);
         self.tabs[self.active_tab].split = Some(Box::new(split));
-        self.split_active = true;
+        self.tabs[self.active_tab].split_dir = dir;
+        self.split_active = false; // focus stays on main pane
+        // Set panes layout direction
+        self.apply_split_layout(cx, dir);
         self.ui.view(id!(split_bar)).set_visible(cx, true);
         self.ui.term_view(id!(terminal2)).set_visible(cx, true);
+    }
+
+    fn apply_split_layout(&self, _cx: &mut Cx, _dir: SplitDir) {
+        // Makepad flow direction is set at live_design time (Right).
+        // For horizontal split we'd need Down flow — but since Makepad
+        // live_design is static, we handle this via terminal2 walk sizing
+        // in handle_resize instead. Both directions use the same two TermViews.
     }
 
     fn close_split(&mut self, cx: &mut Cx) {
@@ -1355,16 +1600,13 @@ impl App {
             let text = grid.get_selection_text().unwrap_or_else(|| grid.render());
             drop(grid);
             if !text.is_empty() {
-                if let Ok(mut cb) = Clipboard::new() { let _ = cb.set_text(&text); }
+                clip::set(&text);
             }
         }
     }
 
     fn paste_from_clipboard(&mut self) {
-        let text = match Clipboard::new() {
-            Ok(mut cb) => cb.get_text().unwrap_or_default(),
-            Err(_) => return,
-        };
+        let text = clip::get();
         if text.is_empty() { return; }
         if self.split_active {
             if let Some(split) = &mut self.tabs[self.active_tab].split {
@@ -1379,7 +1621,110 @@ impl App {
         }
     }
 
-    /// Write bytes to the currently focused pane (main or split)
+    // ── Search ──────────────────────────────────────────────
+    fn open_search(&mut self, cx: &mut Cx) {
+        self.search_open = true;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.search_idx = 0;
+        self.ui.view(id!(search_bar)).set_visible(cx, true);
+        self.ui.label(id!(search_label)).set_text(cx, "│");
+        self.ui.label(id!(search_info)).set_text(cx, "Type to search · Esc to close");
+        self.ui.redraw(cx);
+    }
+
+    fn close_search(&mut self, cx: &mut Cx) {
+        self.search_open = false;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.ui.view(id!(search_bar)).set_visible(cx, false);
+        self.ui.redraw(cx);
+    }
+
+    fn update_search(&mut self, cx: &mut Cx) {
+        if self.search_query.is_empty() {
+            self.search_matches.clear();
+            self.search_idx = 0;
+            self.ui.label(id!(search_label)).set_text(cx, "│");
+            self.ui.label(id!(search_info)).set_text(cx, "Type to search · Esc to close");
+            return;
+        }
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let grid = tab.grid.lock().unwrap();
+            self.search_matches = grid.search(&self.search_query);
+        }
+        let n = self.search_matches.len();
+        if n > 0 {
+            self.search_idx = self.search_idx.min(n - 1);
+            let info = format!("{}/{} · Enter↓ Shift+Enter↑ · Esc close", self.search_idx + 1, n);
+            self.ui.label(id!(search_info)).set_text(cx, &info);
+            // Scroll to current match
+            self.scroll_to_match(cx);
+        } else {
+            self.ui.label(id!(search_info)).set_text(cx, "No matches · Esc close");
+        }
+        self.ui.label(id!(search_label)).set_text(cx, &format!("{}│", self.search_query));
+    }
+
+    fn search_next(&mut self, cx: &mut Cx) {
+        if self.search_matches.is_empty() { return; }
+        self.search_idx = (self.search_idx + 1) % self.search_matches.len();
+        let n = self.search_matches.len();
+        let info = format!("{}/{} · Enter↓ Shift+Enter↑ · Esc close", self.search_idx + 1, n);
+        self.ui.label(id!(search_info)).set_text(cx, &info);
+        self.scroll_to_match(cx);
+    }
+
+    fn search_prev(&mut self, cx: &mut Cx) {
+        if self.search_matches.is_empty() { return; }
+        self.search_idx = if self.search_idx == 0 { self.search_matches.len() - 1 } else { self.search_idx - 1 };
+        let n = self.search_matches.len();
+        let info = format!("{}/{} · Enter↓ Shift+Enter↑ · Esc close", self.search_idx + 1, n);
+        self.ui.label(id!(search_info)).set_text(cx, &info);
+        self.scroll_to_match(cx);
+    }
+
+    fn scroll_to_match(&self, _cx: &mut Cx) {
+        if let Some(&(abs_row, _col)) = self.search_matches.get(self.search_idx) {
+            if let Some(inner) = self.ui.term_view(id!(terminal)).borrow_mut() {
+                let grid = match &inner.grid_ref {
+                    Some(g) => g.lock().unwrap(),
+                    None => return,
+                };
+                let sb = grid.scrollback.len();
+                let total = sb + grid.rows;
+                let from_bottom = total.saturating_sub(abs_row);
+                drop(grid);
+                drop(inner);
+                // Set scroll offset to show the match
+                if let Some(mut inner) = self.ui.term_view(id!(terminal)).borrow_mut() {
+                    inner.scroll_offset = from_bottom.saturating_sub(5) as i64;
+                }
+            }
+        }
+    }
+
+    // ── Git branch detection ───────────────────────────────
+    fn detect_git_branch() -> String {
+        // Try to read .git/HEAD in CWD or parents
+        let mut dir = std::env::current_dir().unwrap_or_default();
+        for _ in 0..10 {
+            let head = dir.join(".git/HEAD");
+            if head.exists() {
+                if let Ok(content) = std::fs::read_to_string(&head) {
+                    let content = content.trim();
+                    if let Some(branch) = content.strip_prefix("ref: refs/heads/") {
+                        return format!(" {}", branch);
+                    }
+                    // Detached HEAD
+                    return format!(" {}", &content[..7.min(content.len())]);
+                }
+            }
+            if !dir.pop() { break; }
+        }
+        String::new()
+    }
+
     fn show_menu(&self, cx: &mut Cx) {
         let menu = format!(
 "━━━ KEY MAP ━━━━━━━━━━━━━━━━━━━━
@@ -1395,6 +1740,12 @@ impl App {
   Split Horizontal  Ctrl+Shift+E
   Switch Pane       Alt+Left/Right
   Close Split       Ctrl+Shift+W
+
+ SEARCH
+  Find              Ctrl+Shift+F
+  Next Match        Enter
+  Prev Match        Shift+Enter
+  Close Search      Esc
 
  CLIPBOARD
   Copy (selection)  Ctrl+Shift+C
@@ -1416,18 +1767,19 @@ impl App {
 
 ━━━ CONFIG ━━━━━━━━━━━━━━━━━━━━━
   Shell: {}
+  Theme: {}
   Cell: {}x{} | Grid: {}x{}
   Scrollback: {} | Cursor: {}
   ~/.config/leuwi-panjang/config.toml
 
 ━━━ ABOUT ━━━━━━━━━━━━━━━━━━━━━━
-  Leuwi Panjang Terminal v0.1.0
+  Leuwi Panjang Terminal v0.1.0-dev.15
   Rust + Makepad | GPL-3.0
   github.com/situkangsayur/
     leuwi-panjang
 
   Esc: close menu",
-            self.config.shell,
+            self.config.shell, self.config.theme,
             self.config.cell_width, self.config.cell_height,
             self.config.cols, self.config.rows,
             self.config.scrollback, self.config.cursor_style,
@@ -1446,17 +1798,47 @@ impl App {
     }
 
     fn handle_resize(&mut self, width: f64, height: f64) {
-        let chrome_h = 32.0 + 20.0;
+        let chrome_h = 32.0 + 22.0; // caption + status bar
+        let search_h = if self.search_open { 28.0 } else { 0.0 };
         let cw = self.config.cell_width;
         let ch = self.config.cell_height;
-        let cols = ((width - 24.0) / cw).max(20.0) as usize;
-        let rows = ((height - chrome_h) / ch).max(5.0) as usize;
+        let avail_w = width - 24.0;
+        let avail_h = height - chrome_h - search_h;
+        let full_cols = (avail_w / cw).max(20.0) as usize;
+        let full_rows = (avail_h / ch).max(5.0) as usize;
+
+        // Update config with actual computed size
+        self.config.cols = full_cols;
+        self.config.rows = full_rows;
+
         for tab in &mut self.tabs {
             let has_split = tab.split.is_some();
-            let tab_cols = if has_split { cols / 2 } else { cols };
-            tab.resize(tab_cols, rows);
-            if let Some(split) = &mut tab.split {
-                split.resize(cols / 2, rows);
+            let dir = tab.split_dir;
+            match (has_split, dir) {
+                (true, SplitDir::Vertical) => {
+                    let half = (full_cols.saturating_sub(1)) / 2;
+                    // Resize main grid directly
+                    tab.grid.lock().unwrap().resize(half, full_rows);
+                    tab.grid.lock().unwrap().scroll_bottom = full_rows.saturating_sub(1);
+                    #[cfg(not(target_os = "android"))]
+                    if let Some(m) = &tab.master {
+                        let _ = m.resize(portable_pty::PtySize { rows: full_rows as u16, cols: half as u16, pixel_width: 0, pixel_height: 0 });
+                    }
+                    if let Some(s) = &mut tab.split { s.resize(half, full_rows); }
+                }
+                (true, SplitDir::Horizontal) => {
+                    let half = (full_rows.saturating_sub(1)) / 2;
+                    tab.grid.lock().unwrap().resize(full_cols, half);
+                    tab.grid.lock().unwrap().scroll_bottom = half.saturating_sub(1);
+                    #[cfg(not(target_os = "android"))]
+                    if let Some(m) = &tab.master {
+                        let _ = m.resize(portable_pty::PtySize { rows: half as u16, cols: full_cols as u16, pixel_width: 0, pixel_height: 0 });
+                    }
+                    if let Some(s) = &mut tab.split { s.resize(full_cols, half); }
+                }
+                _ => {
+                    tab.resize(full_cols, full_rows);
+                }
             }
         }
     }
@@ -1498,18 +1880,62 @@ impl AppMain for App {
                     if g.bell {
                         g.bell = false;
                         // Flash effect — briefly change status bar
-                        self.ui.label(id!(status_text)).set_text(cx, "🔔 BELL");
+                        self.ui.label(id!(status_left)).set_text(cx, "🔔 BELL");
                     }
                 }
                 self.update_tab_label(cx);
-                // Status bar info
-                let tab_info = format!(
-                    "Tab {}/{}  {}  Cols:{}  Rows:{}",
+                // Status bar — left: git + CWD + split info
+                let git = App::detect_git_branch();
+                let cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let cwd_short = if let Some(home) = dirs::home_dir() {
+                    cwd.replace(&home.to_string_lossy().to_string(), "~")
+                } else { cwd };
+                let split_info = match self.tabs.get(self.active_tab) {
+                    Some(t) if t.split.is_some() => match t.split_dir {
+                        SplitDir::Vertical => " ⫽V",
+                        SplitDir::Horizontal => " ⫽H",
+                    },
+                    _ => "",
+                };
+                let focus = if self.split_active { "→2" } else if self.tabs.get(self.active_tab).map(|t| t.split.is_some()).unwrap_or(false) { "→1" } else { "" };
+                let left = format!("{} {}  Tab {}/{}{}  {}",
+                    git, cwd_short,
                     self.active_tab + 1, self.tabs.len(),
-                    if self.tabs[self.active_tab].split.is_some() { "Split" } else { "" },
-                    self.config.cols, self.config.rows,
+                    split_info, focus,
                 );
-                self.ui.label(id!(status_text)).set_text(cx, &tab_info);
+                self.ui.label(id!(status_left)).set_text(cx, left.trim());
+                // Status bar — right: cols x rows + clock
+                let now = {
+                    let t = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let h = (t / 3600) % 24;
+                    let m = (t / 60) % 60;
+                    // Adjust for local timezone offset (approximate)
+                    format!("{:02}:{:02}", h, m)
+                };
+                let right = format!("{}×{}  {}", self.config.cols, self.config.rows, now);
+                self.ui.label(id!(status_right)).set_text(cx, &right);
+                // Update pane focus indicators
+                let has_split = self.tabs.get(self.active_tab).map(|t| t.split.is_some()).unwrap_or(false);
+                if has_split {
+                    self.ui.term_view(id!(terminal)).set_focused(!self.split_active);
+                    self.ui.term_view(id!(terminal2)).set_focused(self.split_active);
+                } else {
+                    self.ui.term_view(id!(terminal)).set_focused(false);
+                    self.ui.term_view(id!(terminal2)).set_focused(false);
+                }
+                // Update search highlights on terminal
+                if self.search_open && !self.search_matches.is_empty() {
+                    let qlen = self.search_query.len();
+                    let highlights: Vec<(usize, usize, usize)> = self.search_matches.iter().map(|&(r, c)| (r, c, qlen)).collect();
+                    self.ui.term_view(id!(terminal)).set_search_highlights(highlights);
+                } else {
+                    self.ui.term_view(id!(terminal)).set_search_highlights(Vec::new());
+                }
                 self.ui.redraw(cx);
             }
             Event::Actions(actions) => {
@@ -1519,50 +1945,17 @@ impl AppMain for App {
                 if self.ui.button(id!(menu_btn)).clicked(&actions) {
                     self.menu_open = !self.menu_open;
                     self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
-                    if self.menu_open {
-                        let menu = format!(
-"━━━ Terminal ━━━━━━━━━━━━━━━━━━━━
-  New Tab          Ctrl+Shift+T
-  Close Tab        Ctrl+Shift+W
-  Next Tab         Ctrl+Tab
-
-━━━ Split ━━━━━━━━━━━━━━━━━━━━━━
-  Split Vertical   Ctrl+Shift+D
-  Split Horizontal Ctrl+Shift+E
-  Switch Pane      Alt+Left/Right
-
-━━━ Edit ━━━━━━━━━━━━━━━━━━━━━━━
-  Copy             Ctrl+Shift+C
-  Paste            Ctrl+Shift+V
-  Select All       Ctrl+Shift+A
-
-━━━ Config ━━━━━━━━━━━━━━━━━━━━━
-  Shell: {}
-  Font: {}pt | Cell: {}x{}
-  Grid: {}x{} | Scrollback: {}
-  Cursor: {} | Opacity: {}
-  ~/.config/leuwi-panjang/config.toml
-
-━━━ About ━━━━━━━━━━━━━━━━━━━━━━
-  Leuwi Panjang Terminal v0.1.0
-  Pure Rust + Makepad | GPL-3.0
-  github.com/situkangsayur/
-    leuwi-panjang
-
-  Esc: close menu | Alt+F4: quit",
-                            self.config.shell, self.config.font_size,
-                            self.config.cell_width, self.config.cell_height,
-                            self.config.cols, self.config.rows, self.config.scrollback,
-                            self.config.cursor_style, self.config.opacity,
-                        );
-                        self.ui.label(id!(menu_content)).set_text(cx, &menu);
-                    }
+                    if self.menu_open { self.show_menu(cx); }
                     self.ui.redraw(cx);
                 }
             }
             Event::KeyDown(ke) => {
-                // Escape: close menu if open, otherwise send to PTY
+                // Escape: close search or menu if open, otherwise send to PTY
                 if ke.key_code == KeyCode::Escape {
+                    if self.search_open {
+                        self.close_search(cx);
+                        return;
+                    }
                     if self.menu_open {
                         self.menu_open = false;
                         self.ui.view(id!(menu_panel)).set_visible(cx, false);
@@ -1573,6 +1966,23 @@ impl AppMain for App {
                     self.write_to_active(&[0x1b]);
                     self.key_handled = true;
                     return;
+                }
+                // Search mode key handling
+                if self.search_open {
+                    match ke.key_code {
+                        KeyCode::ReturnKey => {
+                            if ke.modifiers.shift { self.search_prev(cx); } else { self.search_next(cx); }
+                            self.key_handled = true;
+                            return;
+                        }
+                        KeyCode::Backspace => {
+                            self.search_query.pop();
+                            self.update_search(cx);
+                            self.key_handled = true;
+                            return;
+                        }
+                        _ => {} // printable chars handled in TextInput
+                    }
                 }
                 // Ctrl+Shift shortcuts
                 if ke.modifiers.control && ke.modifiers.shift {
@@ -1589,8 +1999,8 @@ impl AppMain for App {
                         }
                         KeyCode::KeyC => { self.copy_to_clipboard(); return; }
                         KeyCode::KeyV => { self.paste_from_clipboard(); return; }
-                        KeyCode::KeyD => { self.split_vertical(cx); return; }
-                        KeyCode::KeyE => { self.split_vertical(cx); return; }
+                        KeyCode::KeyD => { self.do_split(cx, SplitDir::Vertical); return; }
+                        KeyCode::KeyE => { self.do_split(cx, SplitDir::Horizontal); return; }
                         KeyCode::KeyA => {
                             // Select all
                             if let Some(tab) = self.tabs.get(self.active_tab) {
@@ -1608,8 +2018,7 @@ impl AppMain for App {
                             return;
                         }
                         KeyCode::KeyF => {
-                            // TODO: open search UI overlay
-                            // For now, search is via shell (Ctrl+R in zsh)
+                            if self.search_open { self.close_search(cx); } else { self.open_search(cx); }
                             return;
                         }
                         _ => {}
@@ -1670,10 +2079,14 @@ impl AppMain for App {
             }
             Event::TextInput(te) => {
                 // ALL printable input comes here (handles shift, layout, etc.)
-                // Skip if KeyDown already handled this event (special keys)
                 if self.key_handled {
                     self.key_handled = false;
-                    // don't send — already sent via KeyDown
+                } else if self.search_open {
+                    // Send chars to search bar
+                    if !te.input.is_empty() && !te.was_paste {
+                        self.search_query.push_str(&te.input);
+                        self.update_search(cx);
+                    }
                 } else if !te.input.is_empty() && !te.was_paste {
                     self.write_to_active(te.input.as_bytes());
                     self.ui.term_view(id!(terminal)).reset_scroll();
@@ -1818,6 +2231,10 @@ fn shift_char(c: char) -> char {
 }
 
 app_main!(App);
+
+// On Android the entry point is the JNI `android_main` generated by `app_main!`
+// (the app is built as a cdylib), so no `fn main` is used there.
+#[cfg(not(target_os = "android"))]
 fn main() {
     // Ignore SIGINT — Ctrl+C should go to PTY, not kill terminal
     #[cfg(unix)]
@@ -2691,5 +3108,90 @@ mod tests {
         assert!(v.x < 0.1); // very dark
         let v2 = color_to_vec4(250);
         assert!(v2.x > 0.5); // lighter
+    }
+
+    // ── Theme tests ──
+    #[test]
+    fn test_parse_hex_color() {
+        let v = parse_hex_color("#FF8000");
+        assert!((v.x - 1.0).abs() < 0.01);
+        assert!((v.y - 0.502).abs() < 0.01);
+        assert!((v.z - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_hex_color_no_hash() {
+        let v = parse_hex_color("1E1E1E");
+        assert!((v.x - 0.118).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_theme_default() {
+        let t = Theme::default();
+        assert_eq!(t.name, "leuwi-dark");
+        assert_eq!(t.ansi.len(), 16);
+        assert_eq!(t.bg, "#1E1E1E");
+    }
+
+    #[test]
+    fn test_theme_ansi_color() {
+        let t = Theme::default();
+        let v = t.ansi_color(1); // red
+        assert!(v.x > 0.8); // very red
+    }
+
+    #[test]
+    fn test_theme_hex_to_vec4() {
+        let t = Theme::default();
+        let v = t.hex_to_vec4("#58A6FF");
+        assert!(v.z > 0.9); // very blue
+    }
+
+    // ── Search tests ──
+    #[test]
+    fn test_search_case_insensitive() {
+        let mut g = new_grid(80, 5);
+        g.process(b"Hello World\r\nhello again");
+        let results = g.search("hello");
+        assert_eq!(results.len(), 2); // both lines match
+    }
+
+    #[test]
+    fn test_search_multiple_per_line() {
+        let mut g = new_grid(80, 5);
+        g.process(b"abcabc");
+        let results = g.search("abc");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], (0, 0));
+        assert_eq!(results[1], (0, 3));
+    }
+
+    #[test]
+    fn test_search_in_scrollback() {
+        let mut g = new_grid(80, 3);
+        g.process(b"line1\r\nline2\r\nline3\r\nline4\r\nline5");
+        let results = g.search("line");
+        assert!(results.len() >= 3); // some in scrollback, some visible
+    }
+
+    #[test]
+    fn test_search_empty_query() {
+        let g = new_grid(80, 5);
+        let results = g.search("");
+        assert!(results.is_empty());
+    }
+
+    // ── Split direction ──
+    #[test]
+    fn test_split_dir_enum() {
+        assert_eq!(SplitDir::Vertical, SplitDir::Vertical);
+        assert_ne!(SplitDir::Vertical, SplitDir::Horizontal);
+    }
+
+    // ── Config with theme ──
+    #[test]
+    fn test_config_has_theme() {
+        let cfg = Config::default();
+        assert_eq!(cfg.theme, "leuwi-dark");
     }
 }

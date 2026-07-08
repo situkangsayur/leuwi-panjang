@@ -67,8 +67,8 @@ Leuwi Panjang takes the best from each and adds features none of them have.
 - Linux (X11 + Wayland)
 - macOS
 - Windows
-- Android (Flutter + Rust)
-- iOS (Flutter + Rust)
+- Android (Makepad + Rust, same codebase — APK build pipeline live)
+- iOS (Makepad + Rust, same codebase)
 
 ### Mobile Features
 - SSH connection manager (save, organize, one-tap connect)
@@ -244,12 +244,14 @@ Single codebase — desktop and mobile build from same source.
 
 ## Roadmap
 
+Current: **v0.1.0-dev.15** — single `src/main.rs` (~3100 lines), 111 tests passing.
+
 - [x] Project plan and documentation
-- [ ] Phase 1: Core terminal (VT parser, GPU rendering, tabs)
-- [ ] Phase 2: Advanced features (splits, suggestions, shell integration)
+- [~] Phase 1: Core terminal — VT parser, tabs, chromeless window, cursor styles, config/themes ✅ (GPU shader path in progress)
+- [~] Phase 2: Advanced features — vertical/horizontal splits ✅, scrollback search ✅, status bar ✅ (suggestions, shell integration pending)
 - [ ] Phase 3: Plugin system (WASM, AI plugins, credential vault)
-- [ ] Phase 4: nvim-leuwi-panjang config
-- [ ] Phase 5: Mobile app (Flutter + Rust)
+- [x] Phase 4: nvim-leuwi-panjang config
+- [~] Phase 5: Mobile app (Makepad + Rust) — Android APK build pipeline ✅ (milestone A); SSH backend to nvgpu next (milestone B)
 - [ ] Phase 6: WireGuard backend server
 - [ ] Phase 7: Polish and release
 

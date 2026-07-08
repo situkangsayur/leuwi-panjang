@@ -15,7 +15,8 @@
 - [Configuration Reference](guides/03-configuration.md) - Full TOML config reference
 
 ## Mobile
-- [Mobile App](mobile/01-mobile-app.md) - Flutter+Rust mobile architecture, SSH manager, mobile AI
+- [Mobile App](mobile/01-mobile-app.md) - Makepad+Rust mobile architecture, SSH manager, mobile AI
+- [Android Build](mobile/02-android-build.md) - Android APK cross-compile pipeline, build decisions, nvgpu SSH profiles
 
 ## Nvim Config
 - [Nvim IDE Research](research/05-nvim-lightweight-ide.md) - Native LSP setup replacing CoC

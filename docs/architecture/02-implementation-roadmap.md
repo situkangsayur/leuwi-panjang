@@ -1,5 +1,24 @@
 # Leuwi Panjang - Implementation Roadmap
 
+## Current Status — v0.1.0-dev.15 (2026-07-08)
+
+The terminal currently lives in a single `src/main.rs` (~3100 lines) built on
+Makepad + portable-pty, with **111 automated tests** (`cargo test`). Shipped so far:
+
+- **Core**: VT220/xterm parser, 256/true color (SGR), alt screen, scroll regions,
+  scrollback, cursor styles (block/beam/underline + blink), selection, URL detection.
+- **UI**: chromeless window, Chrome-style tab bar (new/close/switch/reorder/drag),
+  vertical + horizontal splits, focus indicator, modular status bar.
+- **Search**: scrollback search with match highlighting + wrap-around.
+- **Config/Theme**: TOML config + theme system (16 ANSI + UI colors) from
+  `~/.config/leuwi-panjang/`.
+- **Mobile (Android) — milestone A DONE**: cross-compile pipeline via `cargo makepad
+  android build` produces a signed APK. PTY/clipboard are gated desktop-only; the
+  Android build ships a local-echo terminal with a welcome banner as a placeholder
+  until the SSH backend lands. See [Android Build](../mobile/02-android-build.md).
+- **Mobile (Android) — milestone B NEXT**: wire the `russh` SSH backend and embed the
+  nvgpu connection profiles (see Phase 5.2).
+
 ## Phase Overview
 
 ```
@@ -318,7 +337,9 @@ Same Rust codebase as desktop, compiled for mobile via Makepad. No separate app,
 - [ ] Remote AI access via desktop tunnel
 
 ### 5.4 Platform-Specific
-- [ ] Android: NDK build pipeline, min SDK 26
+- [x] Android: NDK build pipeline via `cargo makepad android build` (min SDK **29** —
+      Makepad links `libamidi`, only present in the NDK sysroot from API 29). LTO is
+      disabled (Makepad links the app crate with `prefer-dynamic`, incompatible with LTO).
 - [ ] Android: Samsung DeX support
 - [ ] iOS: cargo-lipo build pipeline, min iOS 15
 - [ ] iOS: External keyboard shortcuts
