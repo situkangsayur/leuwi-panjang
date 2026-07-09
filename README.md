@@ -244,14 +244,14 @@ Single codebase — desktop and mobile build from same source.
 
 ## Roadmap
 
-Current: **v0.1.0-dev.15** — single `src/main.rs` (~3100 lines), 111 tests passing.
+Current: **v0.1.0-dev.16** — `src/main.rs` (~3200 lines) + `src/ssh.rs` (russh SSH backend), 111 tests passing.
 
 - [x] Project plan and documentation
 - [~] Phase 1: Core terminal — VT parser, tabs, chromeless window, cursor styles, config/themes ✅ (GPU shader path in progress)
 - [~] Phase 2: Advanced features — vertical/horizontal splits ✅, scrollback search ✅, status bar ✅ (suggestions, shell integration pending)
 - [ ] Phase 3: Plugin system (WASM, AI plugins, credential vault)
 - [x] Phase 4: nvim-leuwi-panjang config
-- [~] Phase 5: Mobile app (Makepad + Rust) — Android APK build pipeline ✅ (milestone A); SSH backend to nvgpu next (milestone B)
+- [~] Phase 5: Mobile app (Makepad + Rust) — Android APK pipeline ✅ (A); russh SSH backend to nvgpu + tmux attach-or-create ✅ (B); embedded WireGuard/boringtun next (C)
 - [ ] Phase 6: WireGuard backend server
 - [ ] Phase 7: Polish and release
 

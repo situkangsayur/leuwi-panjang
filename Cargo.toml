@@ -1,7 +1,14 @@
 [package]
 name = "leuwi-panjang"
-version = "0.1.0-dev.15"
+version = "0.1.0-dev.16"
 edition = "2021"
+
+# The app lives in the library so both the desktop binary (src/main.rs) and the
+# Android build share it. cargo-makepad compiles this into the Android cdylib
+# (`.so`); `rlib` lets the desktop `leuwi-panjang` binary link against it.
+[lib]
+name = "leuwi_panjang"
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 makepad-widgets = { git = "https://github.com/makepad/makepad", branch = "main" }
@@ -10,6 +17,14 @@ toml = "0.8"
 dirs = "6"
 libc = "0.2"
 
+# SSH backend (milestone B): pure-Rust SSH so the terminal can reach nvgpu.
+# Shared by desktop and Android — on Android it replaces the local PTY (there is
+# no local shell); on desktop it powers SSH tabs and the `ssh-smoke` self-test.
+# russh's default crypto backend is aws-lc-rs (needs nasm/clang to build); we use
+# `ring` instead (only needs cc + perl) so it cross-compiles cleanly to Android.
+russh = { version = "0.62", default-features = false, features = ["ring", "rsa", "flate2"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "sync", "macros", "time"] }
+
 # Desktop-only backends: local PTY shell + system clipboard.
 # (portable-pty pulls in `termios`, which does not build for the android target;
 #  arboard has no android backend.)
@@ -17,17 +32,10 @@ libc = "0.2"
 portable-pty = "0.8"
 arboard = "3"
 
-# Android SSH backend: connect to remote hosts (nvgpu) over SSH.
-# (Enabled in milestone B — kept out of the baseline pipeline de-risk build.)
-# [target.'cfg(target_os = "android")'.dependencies]
-# russh = "0.45"
-# russh-keys = "0.45"
-# tokio = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "net", "sync", "macros", "time"] }
-
 # Metadata read by cargo-makepad for the Android build.
 [package.metadata.makepad.android]
-version_code = 1
-version_name = "0.1.0-dev.15"
+version_code = 2
+version_name = "0.1.0-dev.16"
 # 29 (Android 10): Makepad's platform links AMidi (libamidi), which only exists
 # in the NDK sysroot from API 29 onward — API 26 fails with `unable to find -lamidi`.
 min_sdk_version = 29
