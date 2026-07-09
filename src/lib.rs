@@ -1,4 +1,5 @@
 use makepad_widgets::*;
+use makepad_widgets::event::TouchState;
 use std::sync::{Arc, Mutex};
 use std::io::{Read, Write};
 use serde::{Deserialize, Serialize};
@@ -1136,6 +1137,9 @@ pub struct TermView {
     #[rust] cursor_block: bool,
     #[rust] search_highlights: Vec<(usize, usize, usize)>, // (abs_row, start_col, len)
     #[rust] is_focused: bool,
+    // Touch state (Android): (start_x, start_y, scroll_offset at touch start)
+    #[rust] touch_start: Option<(f64, f64, i64)>,
+    #[rust] touch_moved: bool,
 }
 
 impl Widget for TermView {
@@ -1145,6 +1149,39 @@ impl Widget for TermView {
                 let lines = (-se.scroll.y / 20.0) as i64;
                 self.scroll_offset = (self.scroll_offset + lines).max(0);
                 self.redraw(cx);
+            }
+            // Touch (Android): one-finger drag scrolls scrollback; a tap raises the
+            // soft keyboard. Desktop uses mouse events above; phones only get these.
+            Event::TouchUpdate(e) => {
+                if let Some(t) = e.touches.first() {
+                    match t.state {
+                        TouchState::Start => {
+                            self.touch_start = Some((t.abs.x, t.abs.y, self.scroll_offset));
+                            self.touch_moved = false;
+                            cx.set_key_focus(self.draw_bg.area());
+                        }
+                        TouchState::Move | TouchState::Stable => {
+                            if let Some((_sx, sy, s_off)) = self.touch_start {
+                                let ch = if self.ch > 0.0 { self.ch } else { 20.0 };
+                                let dy = t.abs.y - sy;
+                                if dy.abs() > 6.0 { self.touch_moved = true; }
+                                // Drag down (dy>0) reveals older output (scroll back).
+                                let lines = (dy / ch) as i64;
+                                self.scroll_offset = (s_off + lines).max(0);
+                                self.redraw(cx);
+                            }
+                        }
+                        TouchState::Stop => {
+                            if !self.touch_moved {
+                                // Tap: focus + show the on-screen keyboard.
+                                cx.set_key_focus(self.draw_bg.area());
+                                #[cfg(target_os = "android")]
+                                cx.show_text_ime(self.draw_bg.area(), dvec2(0.0, 0.0));
+                            }
+                            self.touch_start = None;
+                        }
+                    }
+                }
             }
             Event::MouseDown(me) => {
                 let cw = if self.cw > 0.0 { self.cw } else { 9.2 };
@@ -1574,6 +1611,10 @@ impl App {
         self.ui.term_view(id!(terminal2)).set_cell_size(self.config.cell_width, self.config.cell_height, block);
         self.update_tab_label(cx);
         cx.start_interval(0.033);
+        // Android: raise the on-screen keyboard on launch so the SSH/tmux session
+        // is typeable immediately (a tap on the terminal re-shows it if dismissed).
+        #[cfg(target_os = "android")]
+        cx.show_text_ime(Area::Empty, dvec2(0.0, 0.0));
     }
 
     fn new_tab(&mut self, cx: &mut Cx) {
@@ -1846,6 +1887,8 @@ impl App {
   Select All        Ctrl+Shift+A
 
  NAVIGATION
+  Scroll (phone)    drag 1 finger
+  Show keyboard     tap terminal
   Scroll Up/Down    Mouse Wheel
   Select Text       Mouse Drag
   Open URL          Ctrl+Click
@@ -1866,7 +1909,7 @@ impl App {
   ~/.config/leuwi-panjang/config.toml
 
 ━━━ ABOUT ━━━━━━━━━━━━━━━━━━━━━━
-  Leuwi Panjang Terminal v0.1.0-dev.17
+  Leuwi Panjang Terminal v0.1.0-dev.18
   Rust + Makepad | GPL-3.0
   github.com/situkangsayur/
     leuwi-panjang
