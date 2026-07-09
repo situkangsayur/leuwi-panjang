@@ -15,7 +15,8 @@ cargo test             # 111 automated tests
   - `TermGrid` — terminal grid with VT parser, alt screen, scroll regions, search
   - `TermTab` — tab with a backend (local PTY **or** SSH) + grid + split
   - `TermView` — Makepad custom widget for rendering (search highlights, focus indicator)
-  - `App` — Makepad application (tabs, splits, search, status bar, themes)
+  - `App` — Makepad application; touch multi-tab bar (tap tab/×/+), each Android tab is
+    its own nvgpu tmux session (`main`, `main-2`, …) via `Config::ssh_profile_for_tab`
 - `src/main.rs` — thin desktop entry: `ssh-smoke` subcommand + `leuwi_panjang::app_main()`
 - `src/ssh.rs` — russh SSH backend (Android default; desktop SSH tabs); tmux attach-or-create; TOFU host-key pinning
 - `src/bin/ssh-smoke.rs` — headless SSH self-test (compiles only ssh.rs, no makepad)

@@ -244,7 +244,7 @@ Single codebase — desktop and mobile build from same source.
 
 ## Roadmap
 
-Current: **v0.1.0-dev.16** — `src/main.rs` (~3200 lines) + `src/ssh.rs` (russh SSH backend), 111 tests passing.
+Current: **v0.1.0-dev.17** — `src/lib.rs` (~3300 lines) + `src/ssh.rs` (russh SSH backend); Android APK with touch multi-tab, each tab its own nvgpu tmux session (Termius-style); 111 tests passing.
 
 - [x] Project plan and documentation
 - [~] Phase 1: Core terminal — VT parser, tabs, chromeless window, cursor styles, config/themes ✅ (GPU shader path in progress)

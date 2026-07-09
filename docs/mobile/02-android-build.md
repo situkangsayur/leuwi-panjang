@@ -154,6 +154,16 @@ The app ships the `nvgpu` profile as `Config` defaults (override in
 | `ssh_session` | `main`           | `tmux new -A -s <session>` (attach-or-create) |
 | `ssh_startup` | *(empty)*        | full command override — see below        |
 
+### Multi-tab = multi-session (Termius-style, v0.1.0-dev.17)
+
+The tab bar is touch-driven: **tap `+`** to open a tab, **tap a tab** to switch, **tap `×`**
+to close (keyboard equivalents still work: Ctrl+Shift+T / Alt+1‑5 / Ctrl+Shift+W). Each tab
+is an **independent SSH connection with its own tmux session**: tab 1 attaches
+`<ssh_session>` (default `main`), tab 2 → `main-2`, tab 3 → `main-3`, … so tabs are real
+parallel sessions on nvgpu, not mirrors. Closing a tab tears its SSH connection down
+(the tmux session keeps running on the server, as tmux does). Setting `ssh_startup`
+(e.g. a `choose-tree` picker) overrides the per-tab naming — every tab then uses that command.
+
 ### tmux session management (matches `nvgpu-s` / `nvgpu-ls`)
 
 - **Attach existing or create new**: the default startup `tmux new -A -s <ssh_session>`

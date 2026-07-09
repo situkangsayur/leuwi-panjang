@@ -230,6 +230,18 @@ impl Config {
             rows: self.rows as u16,
         }
     }
+
+    /// Per-tab SSH profile for Termius-style multi-session: tab 1 attaches the
+    /// configured session; each additional tab gets its own `<session>-<n>` so the
+    /// tabs are independent tmux sessions on nvgpu (not mirrors of the same one).
+    /// Skipped when `ssh_startup` overrides the command (e.g. a choose-tree picker).
+    fn ssh_profile_for_tab(&self, tab_id: usize) -> ssh::SshProfile {
+        let mut p = self.ssh_profile();
+        if tab_id > 1 && self.ssh_startup.trim().is_empty() {
+            p.session = format!("{}-{}", p.session, tab_id);
+        }
+        p
+    }
 }
 
 impl Config {
@@ -279,7 +291,7 @@ impl TermTab {
     // configured host (nvgpu by default) and attach `tmux new -A -s <session>`.
     #[cfg(target_os = "android")]
     fn spawn(id: usize, cfg: &Config) -> Self {
-        Self::spawn_ssh(id, cfg, cfg.ssh_profile())
+        Self::spawn_ssh(id, cfg, cfg.ssh_profile_for_tab(id))
     }
 
     /// SSH-backed tab: connect in the background and stream remote bytes into this
@@ -307,7 +319,7 @@ impl TermTab {
         // Desktop opt-in: LEUWI_SSH=1 makes even desktop tabs SSH into the profile,
         // so the SSH backend can be exercised in the real GUI before shipping to phone.
         if std::env::var("LEUWI_SSH").is_ok() {
-            return Self::spawn_ssh(id, cfg, cfg.ssh_profile());
+            return Self::spawn_ssh(id, cfg, cfg.ssh_profile_for_tab(id));
         }
         let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
         let pty_system = portable_pty::native_pty_system();
@@ -1378,6 +1390,16 @@ live_design! {
         }
     }
 
+    // One touch-tappable tab button (Termius-style). Text + active marker are set
+    // at runtime in update_tab_label; unused slots are hidden.
+    TabBtn = <Button> {
+        text: ""
+        draw_text: { color: #xC5C8C6, text_style: { font_size: 9.5 } }
+        draw_bg: { color: #x1E1E1E, fn pixel(self) -> vec4 { return mix(self.color, #x30363D80, self.hover); } }
+        padding: { left: 12, right: 12, top: 4, bottom: 4 }
+        margin: { right: 2 }
+    }
+
     App = {{App}} {
         ui: <Window> {
             window: { title: "Leuwi Panjang", inner_size: vec2(1100, 700) }
@@ -1389,14 +1411,18 @@ live_design! {
                 draw_bg: { color: #x181818 }
                 caption_label = <View> { visible: false, width: 0, height: 0 }
                 tabs = <View> {
-                    width: Fill, height: Fill, flow: Right, align: { y: 0.5 }, padding: { left: 8 }
-                    tab1 = <Button> {
-                        text: " Terminal 1 "
-                        draw_text: { color: #xC5C8C6, text_style: { font_size: 9.5 } }
-                        draw_bg: { color: #x1E1E1E, fn pixel(self) -> vec4 { return self.color; } }
-                        padding: { left: 14, right: 14, top: 4, bottom: 4 }
-                    }
+                    width: Fill, height: Fill, flow: Right, align: { y: 0.5 }, padding: { left: 6 }
+                    tab0 = <TabBtn> {}
+                    tab1 = <TabBtn> {}
+                    tab2 = <TabBtn> {}
+                    tab3 = <TabBtn> {}
+                    tab4 = <TabBtn> {}
                     <View> { width: Fill, height: Fill }
+                    close_btn = <Button> {
+                        text: "×", width: 26
+                        draw_text: { color: #x6E7681, text_style: { font_size: 15.0 } }
+                        draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #xE0303060, self.hover); } }
+                    }
                     plus_btn = <Button> {
                         text: "+", width: 28
                         draw_text: { color: #x6E7681, text_style: { font_size: 13.0 } }
@@ -1577,17 +1603,37 @@ impl App {
     }
 
     fn update_tab_label(&mut self, cx: &mut Cx) {
-        let labels: Vec<String> = self.tabs.iter().enumerate().map(|(i, t)| {
-            let name = t.dynamic_title();
-            let split_indicator = if t.split.is_some() { "⫽" } else { "" };
-            if i == self.active_tab {
-                format!(" ▌{} {} ×", name, split_indicator)
-            } else {
-                format!("  {} {}  ", name, split_indicator)
-            }
-        }).collect();
-        let text = labels.join("│");
-        self.ui.button(id!(tab1)).set_text(cx, &text);
+        // One discrete, tappable button per tab (up to 5); hide the unused slots.
+        macro_rules! set_tab {
+            ($id:tt, $i:expr) => {{
+                if $i < self.tabs.len() {
+                    let name = self.tabs[$i].dynamic_title();
+                    let split = if self.tabs[$i].split.is_some() { " ⫽" } else { "" };
+                    let txt = if $i == self.active_tab {
+                        format!(" ▌ {}{} ", name, split)
+                    } else {
+                        format!("  {}{} ", name, split)
+                    };
+                    self.ui.button(id!($id)).set_text(cx, &txt);
+                    self.ui.widget(id!($id)).set_visible(cx, true);
+                } else {
+                    self.ui.widget(id!($id)).set_visible(cx, false);
+                }
+            }};
+        }
+        set_tab!(tab0, 0);
+        set_tab!(tab1, 1);
+        set_tab!(tab2, 2);
+        set_tab!(tab3, 3);
+        set_tab!(tab4, 4);
+    }
+
+    /// Switch to tab `i` by touch (or Alt+N). No-op if out of range.
+    fn goto_tab(&mut self, cx: &mut Cx, i: usize) {
+        if i < self.tabs.len() && i != self.active_tab {
+            self.active_tab = i;
+            self.switch_to_active(cx);
+        }
     }
 
     fn do_split(&mut self, cx: &mut Cx, dir: SplitDir) {
@@ -1776,11 +1822,11 @@ impl App {
         let menu = format!(
 "━━━ KEY MAP ━━━━━━━━━━━━━━━━━━━━
 
- TABS
-  New Tab           Ctrl+Shift+T
-  Close Tab/Pane    Ctrl+Shift+W
+ TABS  (each tab = its own nvgpu tmux session)
+  New Tab           tap +  /  Ctrl+Shift+T
+  Switch Tab        tap tab / Alt+1..5
+  Close Tab         tap ×  /  Ctrl+Shift+W
   Next Tab          Ctrl+Tab
-  Tab 1-5           Alt+1 .. Alt+5
 
  SPLIT SCREEN
   Split Vertical    Ctrl+Shift+D
@@ -1820,7 +1866,7 @@ impl App {
   ~/.config/leuwi-panjang/config.toml
 
 ━━━ ABOUT ━━━━━━━━━━━━━━━━━━━━━━
-  Leuwi Panjang Terminal v0.1.0-dev.15
+  Leuwi Panjang Terminal v0.1.0-dev.17
   Rust + Makepad | GPL-3.0
   github.com/situkangsayur/
     leuwi-panjang
@@ -1895,6 +1941,16 @@ impl App {
 
 impl MatchEvent for App {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
+        // Touch: tap a tab to switch (Termius-style tab bar).
+        if self.ui.button(id!(tab0)).clicked(&actions) { self.goto_tab(cx, 0); }
+        if self.ui.button(id!(tab1)).clicked(&actions) { self.goto_tab(cx, 1); }
+        if self.ui.button(id!(tab2)).clicked(&actions) { self.goto_tab(cx, 2); }
+        if self.ui.button(id!(tab3)).clicked(&actions) { self.goto_tab(cx, 3); }
+        if self.ui.button(id!(tab4)).clicked(&actions) { self.goto_tab(cx, 4); }
+        // Touch: × closes the active tab (keeps at least one open).
+        if self.ui.button(id!(close_btn)).clicked(&actions) {
+            if self.tabs.len() > 1 { self.close_active_tab(cx); }
+        }
         if self.ui.button(id!(plus_btn)).clicked(&actions) {
             self.new_tab(cx);
         }
@@ -1987,17 +2043,8 @@ impl AppMain for App {
                 }
                 self.ui.redraw(cx);
             }
-            Event::Actions(actions) => {
-                if self.ui.button(id!(plus_btn)).clicked(&actions) {
-                    self.new_tab(cx);
-                }
-                if self.ui.button(id!(menu_btn)).clicked(&actions) {
-                    self.menu_open = !self.menu_open;
-                    self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
-                    if self.menu_open { self.show_menu(cx); }
-                    self.ui.redraw(cx);
-                }
-            }
+            // Button actions are handled in MatchEvent::handle_actions (see above)
+            // via self.match_event(cx, event); no duplicate handling here.
             Event::KeyDown(ke) => {
                 // Escape: close search or menu if open, otherwise send to PTY
                 if ke.key_code == KeyCode::Escape {
