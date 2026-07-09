@@ -281,6 +281,10 @@ struct TermTab {
     // SSH backend handle (any target). Present when this tab is an SSH session;
     // resize is forwarded here, keystrokes go through `writer` (an SshWriter).
     ssh: Option<ssh::SshHandle>,
+    // Deferred SSH profile: the connection (heavy: tokio+ring) is started a few
+    // frames AFTER launch, off the startup/first-paint path, so the app window
+    // appears even if the network stack is slow — and never blocks/crashes launch.
+    pending_profile: Option<ssh::SshProfile>,
     title: String,
     split: Option<Box<TermTab>>,
     split_dir: SplitDir,
@@ -288,15 +292,45 @@ struct TermTab {
 }
 
 impl TermTab {
-    // Android build: the only backend is SSH (no local shell). Connect to the
-    // configured host (nvgpu by default) and attach `tmux new -A -s <session>`.
+    // Android build: the only backend is SSH (no local shell). The tab appears
+    // immediately with a banner; the actual connection (tokio+ring) starts a few
+    // frames later via start_pending_ssh() so launch never blocks or crashes.
     #[cfg(target_os = "android")]
     fn spawn(id: usize, cfg: &Config) -> Self {
-        Self::spawn_ssh(id, cfg, cfg.ssh_profile_for_tab(id))
+        let profile = cfg.ssh_profile_for_tab(id);
+        let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
+        {
+            let mut g = grid.lock().unwrap_or_else(|e| e.into_inner());
+            let banner = format!(
+                "\r\n  \x1b[1;38;5;39mLeuwi Panjang\x1b[0m \x1b[2mAndroid\x1b[0m\r\n  \x1b[2m—————————————————————————————\x1b[0m\r\n  menyambung ke \x1b[1m{}@{}:{}\x1b[0m ...\r\n  \x1b[2m(pastikan WireGuard aktif)\x1b[0m\r\n",
+                profile.user, profile.host, profile.port);
+            g.process(banner.as_bytes());
+        }
+        Self {
+            grid,
+            writer: None,
+            ssh: None,
+            pending_profile: Some(profile),
+            title: format!("nvgpu {}", id),
+            split: None, split_dir: SplitDir::Vertical, split_focused: false,
+        }
     }
 
-    /// SSH-backed tab: connect in the background and stream remote bytes into this
-    /// tab's grid. Shared by the Android default tab and desktop SSH tabs.
+    /// Start a deferred SSH connection into this tab's existing grid (Android).
+    /// No-op if there is nothing pending or a connection already exists.
+    fn start_pending_ssh(&mut self) {
+        if let Some(profile) = self.pending_profile.take() {
+            let sink_grid = self.grid.clone();
+            let handle = ssh::spawn(profile, move |bytes| {
+                if let Ok(mut g) = sink_grid.lock() { g.process(bytes); }
+            });
+            self.writer = Some(Box::new(handle.writer()));
+            self.ssh = Some(handle);
+        }
+    }
+
+    /// SSH-backed tab that connects immediately (desktop `LEUWI_SSH=1` path).
+    #[cfg(not(target_os = "android"))]
     fn spawn_ssh(id: usize, cfg: &Config, profile: ssh::SshProfile) -> Self {
         let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
         let sink_grid = grid.clone();
@@ -307,9 +341,9 @@ impl TermTab {
         Self {
             grid,
             writer: Some(writer),
-            #[cfg(not(target_os = "android"))]
             master: None,
             ssh: Some(handle),
+            pending_profile: None,
             title: format!("nvgpu {}", id),
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
         }
@@ -356,12 +390,12 @@ impl TermTab {
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => { g.lock().unwrap().process(&buf[..n]); }
+                    Ok(n) => { g.lock().unwrap_or_else(|e| e.into_inner()).process(&buf[..n]); }
                 }
             }
         });
 
-        Self { grid, writer: Some(writer), master: Some(master), ssh: None, title: format!("Terminal {}", id), split: None, split_dir: SplitDir::Vertical, split_focused: false }
+        Self { grid, writer: Some(writer), master: Some(master), ssh: None, pending_profile: None, title: format!("Terminal {}", id), split: None, split_dir: SplitDir::Vertical, split_focused: false }
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -373,12 +407,12 @@ impl TermTab {
 
     #[allow(dead_code)]
     fn get_selected_text(&self) -> String {
-        let grid = self.grid.lock().unwrap();
+        let grid = self.grid.lock().unwrap_or_else(|e| e.into_inner());
         grid.render()
     }
 
     fn resize(&mut self, cols: usize, rows: usize) {
-        let mut grid = self.grid.lock().unwrap();
+        let mut grid = self.grid.lock().unwrap_or_else(|e| e.into_inner());
         grid.resize(cols, rows);
         grid.scroll_bottom = rows.saturating_sub(1);
         drop(grid);
@@ -397,7 +431,7 @@ impl TermTab {
     }
 
     fn dynamic_title(&self) -> String {
-        let grid = self.grid.lock().unwrap();
+        let grid = self.grid.lock().unwrap_or_else(|e| e.into_inner());
         // Use OSC title if set
         if !grid.title.is_empty() {
             return grid.title.clone();
@@ -1190,7 +1224,7 @@ impl Widget for TermView {
                 let screen_row = ((me.abs.y - 8.0) / ch).max(0.0) as usize;
 
                 if let Some(grid) = &self.grid_ref {
-                    let mut g = grid.lock().unwrap();
+                    let mut g = grid.lock().unwrap_or_else(|e| e.into_inner());
                     let sb = g.scrollback.len();
                     let start = (sb + g.rows).saturating_sub(g.rows + self.scroll_offset as usize);
                     let abs_row = (start + screen_row).min(sb + g.rows - 1);
@@ -1220,7 +1254,7 @@ impl Widget for TermView {
                 let col = ((me.abs.x - 12.0) / cw).max(0.0) as usize;
                 let screen_row = ((me.abs.y - 8.0) / ch).max(0.0) as usize;
                 if let Some(grid) = &self.grid_ref {
-                    let mut g = grid.lock().unwrap();
+                    let mut g = grid.lock().unwrap_or_else(|e| e.into_inner());
                     let sb = g.scrollback.len();
                     let start = (sb + g.rows).saturating_sub(g.rows + self.scroll_offset as usize);
                     let abs_row = (start + screen_row).min(sb + g.rows - 1);
@@ -1238,7 +1272,7 @@ impl Widget for TermView {
         self.draw_bg.draw_abs(cx, rect);
 
         let grid = match &self.grid_ref {
-            Some(g) => g.lock().unwrap(),
+            Some(g) => g.lock().unwrap_or_else(|e| e.into_inner()),
             None => return DrawStep::done(),
         };
 
@@ -1577,6 +1611,7 @@ pub struct App {
     #[rust] tabs: Vec<TermTab>,
     #[rust] active_tab: usize,
     #[rust] started: bool,
+    #[rust] boot_frames: u32,
     #[rust] tab_counter: usize,
     #[rust] split_active: bool,
     #[rust] config: Config,
@@ -1611,10 +1646,9 @@ impl App {
         self.ui.term_view(id!(terminal2)).set_cell_size(self.config.cell_width, self.config.cell_height, block);
         self.update_tab_label(cx);
         cx.start_interval(0.033);
-        // Android: raise the on-screen keyboard on launch so the SSH/tmux session
-        // is typeable immediately (a tap on the terminal re-shows it if dismissed).
-        #[cfg(target_os = "android")]
-        cx.show_text_ime(Area::Empty, dvec2(0.0, 0.0));
+        // NOTE: do NOT call show_text_ime here — invoking the IME during Startup
+        // (before the view/area exists) can crash on Android. The keyboard is
+        // raised on the first tap of the terminal instead (see TermView touch).
     }
 
     fn new_tab(&mut self, cx: &mut Cx) {
@@ -1729,7 +1763,7 @@ impl App {
 
     fn copy_to_clipboard(&self) {
         if let Some(tab) = self.tabs.get(self.active_tab) {
-            let grid = tab.grid.lock().unwrap();
+            let grid = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
             // Try selection first, fallback to all visible text
             let text = grid.get_selection_text().unwrap_or_else(|| grid.render());
             drop(grid);
@@ -1784,7 +1818,7 @@ impl App {
             return;
         }
         if let Some(tab) = self.tabs.get(self.active_tab) {
-            let grid = tab.grid.lock().unwrap();
+            let grid = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
             self.search_matches = grid.search(&self.search_query);
         }
         let n = self.search_matches.len();
@@ -1822,7 +1856,7 @@ impl App {
         if let Some(&(abs_row, _col)) = self.search_matches.get(self.search_idx) {
             if let Some(inner) = self.ui.term_view(id!(terminal)).borrow_mut() {
                 let grid = match &inner.grid_ref {
-                    Some(g) => g.lock().unwrap(),
+                    Some(g) => g.lock().unwrap_or_else(|e| e.into_inner()),
                     None => return,
                 };
                 let sb = grid.scrollback.len();
@@ -1909,7 +1943,7 @@ impl App {
   ~/.config/leuwi-panjang/config.toml
 
 ━━━ ABOUT ━━━━━━━━━━━━━━━━━━━━━━
-  Leuwi Panjang Terminal v0.1.0-dev.18
+  Leuwi Panjang Terminal v0.1.0-dev.19
   Rust + Makepad | GPL-3.0
   github.com/situkangsayur/
     leuwi-panjang
@@ -1954,8 +1988,8 @@ impl App {
                 (true, SplitDir::Vertical) => {
                     let half = (full_cols.saturating_sub(1)) / 2;
                     // Resize main grid directly
-                    tab.grid.lock().unwrap().resize(half, full_rows);
-                    tab.grid.lock().unwrap().scroll_bottom = full_rows.saturating_sub(1);
+                    tab.grid.lock().unwrap_or_else(|e| e.into_inner()).resize(half, full_rows);
+                    tab.grid.lock().unwrap_or_else(|e| e.into_inner()).scroll_bottom = full_rows.saturating_sub(1);
                     if let Some(ssh) = &tab.ssh { ssh.resize(half as u16, full_rows as u16); }
                     #[cfg(not(target_os = "android"))]
                     if let Some(m) = &tab.master {
@@ -1965,8 +1999,8 @@ impl App {
                 }
                 (true, SplitDir::Horizontal) => {
                     let half = (full_rows.saturating_sub(1)) / 2;
-                    tab.grid.lock().unwrap().resize(full_cols, half);
-                    tab.grid.lock().unwrap().scroll_bottom = half.saturating_sub(1);
+                    tab.grid.lock().unwrap_or_else(|e| e.into_inner()).resize(full_cols, half);
+                    tab.grid.lock().unwrap_or_else(|e| e.into_inner()).scroll_bottom = half.saturating_sub(1);
                     if let Some(ssh) = &tab.ssh { ssh.resize(full_cols as u16, half as u16); }
                     #[cfg(not(target_os = "android"))]
                     if let Some(m) = &tab.master {
@@ -2013,9 +2047,17 @@ impl AppMain for App {
         match event {
             Event::Startup => { self.init(cx); }
             Event::Timer(_) => {
+                // Start deferred SSH connections ~0.5s after launch (off the
+                // startup/first-paint path). New tabs connect on the next tick.
+                self.boot_frames = self.boot_frames.saturating_add(1);
+                if self.boot_frames > 15 {
+                    for tab in &mut self.tabs {
+                        tab.start_pending_ssh();
+                    }
+                }
                 // Flush response buffer (DA, DSR replies to PTY)
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    let mut g = tab.grid.lock().unwrap();
+                    let mut g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
                     if !g.response_buf.is_empty() {
                         let resp = g.response_buf.drain(..).collect::<Vec<u8>>();
                         drop(g);
@@ -2024,7 +2066,7 @@ impl AppMain for App {
                 }
                 // Visual bell check
                 if let Some(tab) = self.tabs.get(self.active_tab) {
-                    let mut g = tab.grid.lock().unwrap();
+                    let mut g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
                     if g.bell {
                         g.bell = false;
                         // Flash effect — briefly change status bar
@@ -2143,7 +2185,7 @@ impl AppMain for App {
                         KeyCode::KeyA => {
                             // Select all
                             if let Some(tab) = self.tabs.get(self.active_tab) {
-                                tab.grid.lock().unwrap().select_all();
+                                tab.grid.lock().unwrap_or_else(|e| e.into_inner()).select_all();
                             }
                             self.ui.redraw(cx);
                             return;
@@ -2201,13 +2243,13 @@ impl AppMain for App {
                 // Clear selection AFTER processing Ctrl+Shift+C (copy needs selection)
                 self.key_handled = false;
                 let app_cur = self.tabs.get(self.active_tab)
-                    .map(|t| t.grid.lock().unwrap().app_cursor_keys).unwrap_or(false);
+                    .map(|t| t.grid.lock().unwrap_or_else(|e| e.into_inner()).app_cursor_keys).unwrap_or(false);
                 let b = key_to_special_bytes(ke, app_cur);
                 if !b.is_empty() {
                     self.key_handled = true;
                     // Clear selection when typing (not for Ctrl+Shift combos which are handled above)
                     if let Some(tab) = self.tabs.get(self.active_tab) {
-                        tab.grid.lock().unwrap().clear_select();
+                        tab.grid.lock().unwrap_or_else(|e| e.into_inner()).clear_select();
                     }
                     self.write_to_active(&b);
                     self.ui.term_view(id!(terminal)).reset_scroll();
@@ -2253,7 +2295,7 @@ impl AppMain for App {
                 } else {
                     // Send mouse click to PTY if mouse reporting enabled
                     if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                        let g = tab.grid.lock().unwrap();
+                        let g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
                         if g.mouse_reporting {
                             let cw = self.config.cell_width;
                             let ch = self.config.cell_height;
@@ -2271,7 +2313,7 @@ impl AppMain for App {
                 // Send mouse release to PTY if reporting
                 if me.abs.y > 32.0 {
                     if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                        let g = tab.grid.lock().unwrap();
+                        let g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
                         if g.mouse_reporting {
                             let cw = self.config.cell_width;
                             let ch = self.config.cell_height;

@@ -290,24 +290,31 @@ where
     S: FnMut(&[u8]) + Send + 'static,
 {
     let (tx, rx) = mpsc::unbounded_channel::<InMsg>();
-    std::thread::Builder::new()
+    // Spawn best-effort: never panic the caller (UI thread) if the OS refuses a
+    // thread. The whole worker body is caught so an SSH/tokio/ring panic can't
+    // escape and abort the process.
+    let spawned = std::thread::Builder::new()
         .name("ssh".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    sink(format!("\r\n\x1b[31mSSH runtime error: {}\x1b[0m\r\n", e).as_bytes());
-                    return;
-                }
-            };
-            rt.block_on(async move {
-                if let Err(e) = run_session(&profile, &mut sink, rx).await {
-                    sink(format!("\r\n\x1b[31m{}\x1b[0m\r\n", e).as_bytes());
-                    sink(b"\x1b[2mtekan tombol untuk mencoba ulang (tutup & buka tab)\x1b[0m\r\n");
-                }
-            });
-        })
-        .expect("spawn ssh thread");
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        sink(format!("\r\n\x1b[31mSSH runtime error: {}\x1b[0m\r\n", e).as_bytes());
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    if let Err(e) = run_session(&profile, &mut sink, rx).await {
+                        sink(format!("\r\n\x1b[31m{}\x1b[0m\r\n", e).as_bytes());
+                        sink(b"\x1b[2mtekan tombol untuk mencoba ulang (tutup & buka tab)\x1b[0m\r\n");
+                    }
+                });
+            }));
+        });
+    if spawned.is_err() {
+        // Extremely unlikely, but degrade gracefully instead of panicking.
+    }
     SshHandle { tx }
 }
 
