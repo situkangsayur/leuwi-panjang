@@ -1943,7 +1943,7 @@ impl App {
   ~/.config/leuwi-panjang/config.toml
 
 ━━━ ABOUT ━━━━━━━━━━━━━━━━━━━━━━
-  Leuwi Panjang Terminal v0.1.0-dev.19
+  Leuwi Panjang Terminal v0.1.0-dev.20
   Rust + Makepad | GPL-3.0
   github.com/situkangsayur/
     leuwi-panjang
