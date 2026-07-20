@@ -3403,7 +3403,10 @@ impl AppMain for App {
                 let app_cur = self.tabs.get(self.active_tab)
                     .map(|t| t.grid.lock().unwrap_or_else(|e| e.into_inner()).app_cursor_keys).unwrap_or(false);
                 let b = key_to_special_bytes(ke, app_cur);
-                if !b.is_empty() {
+                // Same reason as the TextInput guard below: Enter/Backspace/arrows
+                // belong to the focused form field, not the terminal, while the
+                // config page is up.
+                if !b.is_empty() && !self.menu_open {
                     self.key_handled = true;
                     // Clear selection when typing (not for Ctrl+Shift combos which are handled above)
                     if let Some(tab) = self.tabs.get(self.active_tab) {
@@ -3420,6 +3423,11 @@ impl AppMain for App {
                 // ALL printable input comes here (handles shift, layout, etc.)
                 if self.key_handled {
                     self.key_handled = false;
+                } else if self.menu_open {
+                    // The config form owns the keyboard while it is up. Without this
+                    // every character typed into a field was ALSO appended to the
+                    // terminal's REPL line, so closing the page left half a password
+                    // sitting at the prompt.
                 } else if self.search_open {
                     // Send chars to search bar
                     if !te.input.is_empty() && !te.was_paste {
