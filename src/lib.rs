@@ -177,6 +177,83 @@ struct Config {
     // Set to e.g. `tmux new -A -s main \; choose-tree -Zs` for a session picker.
     #[serde(default)]
     ssh_startup: String,
+    // ── Multi-profile (config form) ──
+    // The flat ssh_* fields above are the legacy single profile; these two lists are
+    // what the config form edits. `commands` is seeded from the flat fields on first
+    // load (see migrate_legacy) so existing installs keep working unchanged.
+    #[serde(default)]
+    identities: Vec<SshIdentity>,
+    #[serde(default)]
+    commands: Vec<CommandProfile>,
+}
+
+/// A named SSH key. The private half always lives in a file the app owns (Android
+/// gives no access to `~/.ssh`); `public_key` is cached inline so the form can show
+/// it for pasting into `authorized_keys` without re-reading the disk.
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct SshIdentity {
+    name: String,
+    /// Absolute path to the private key file.
+    key_path: String,
+    #[serde(default)]
+    public_key: String,
+}
+
+/// One connectable host, exposed to the REPL as `<name>-s <session>` (connect) and
+/// `<name>-ls` (list sessions). Each has its own host/port/user and picks either a
+/// password or one of the `identities` by name — so `nvgpu-s` and another terminal
+/// can point at completely different machines.
+#[derive(Clone, Serialize, Deserialize)]
+struct CommandProfile {
+    name: String,
+    host: String,
+    port: u16,
+    user: String,
+    /// Empty = key auth via `identity`.
+    #[serde(default)]
+    password: String,
+    /// Name of an entry in `identities`; empty = the default key path.
+    #[serde(default)]
+    identity: String,
+    /// Session used when the connect word is given no argument.
+    #[serde(default = "default_ssh_session")]
+    session: String,
+    /// The literal words typed at the prompt. Both are free-form — `nvgpu-s` and
+    /// `nvgpu_s` and `gpu` are all equally valid — because the shell helpers they
+    /// mirror are named by hand. Empty falls back to `<name>-s` / `<name>-ls`.
+    #[serde(default)]
+    cmd_connect: String,
+    #[serde(default)]
+    cmd_list: String,
+}
+
+impl Default for CommandProfile {
+    fn default() -> Self {
+        Self {
+            name: "nvgpu".into(),
+            host: default_ssh_host(),
+            port: default_ssh_port(),
+            user: default_ssh_user(),
+            password: String::new(),
+            identity: String::new(),
+            session: default_ssh_session(),
+            cmd_connect: String::new(),
+            cmd_list: String::new(),
+        }
+    }
+}
+
+impl CommandProfile {
+    /// The word that opens a session — as configured, else `<name>-s`.
+    fn cmd_connect(&self) -> String {
+        let w = self.cmd_connect.trim();
+        if w.is_empty() { format!("{}-s", self.name) } else { w.to_string() }
+    }
+    /// The word that lists sessions — as configured, else `<name>-ls`.
+    fn cmd_list(&self) -> String {
+        let w = self.cmd_list.trim();
+        if w.is_empty() { format!("{}-ls", self.name) } else { w.to_string() }
+    }
 }
 
 fn default_shell() -> String { std::env::var("SHELL").unwrap_or("/bin/zsh".into()) }
@@ -215,6 +292,7 @@ impl Default for Config {
             ssh_session: default_ssh_session(), ssh_startup: String::new(),
             ssh_password: String::new(),
             ssh_cmd_connect: default_cmd_connect(), ssh_cmd_list: default_cmd_list(),
+            identities: Vec::new(), commands: Vec::new(),
         }
     }
 }
@@ -268,6 +346,74 @@ impl Config {
         }
         p
     }
+
+    /// Give existing installs (and fresh defaults) one command profile built from the
+    /// flat `ssh_*` fields, so the config form always has something to show and
+    /// `nvgpu-s` keeps working after the upgrade to multi-profile.
+    fn migrate_legacy(&mut self) {
+        if !self.commands.is_empty() { return; }
+        // `ssh_cmd_connect` is stored as the full word (`nvgpu-s`); the profile name
+        // is that word without the `-s` suffix.
+        let name = self.ssh_cmd_connect
+            .strip_suffix("-s")
+            .unwrap_or(&self.ssh_cmd_connect)
+            .to_string();
+        self.commands.push(CommandProfile {
+            name: if name.is_empty() { "nvgpu".into() } else { name },
+            host: self.ssh_host.clone(),
+            port: self.ssh_port,
+            user: self.ssh_user.clone(),
+            password: self.ssh_password.clone(),
+            identity: String::new(),
+            session: self.ssh_session.clone(),
+            // Preserve the exact words the old flat config used, in case they were
+            // customised to something that is not `<name>-s`/`<name>-ls`.
+            cmd_connect: self.ssh_cmd_connect.clone(),
+            cmd_list: self.ssh_cmd_list.clone(),
+        });
+    }
+
+    /// Resolve a REPL word to a command profile. Returns the profile plus whether the
+    /// word was the list form (`<name>-ls`) rather than the connect form (`<name>-s`).
+    fn lookup_command(&self, word: &str) -> Option<(&CommandProfile, bool)> {
+        self.commands.iter().find_map(|c| {
+            if word == c.cmd_connect() { Some((c, false)) }
+            else if word == c.cmd_list() { Some((c, true)) }
+            else { None }
+        })
+    }
+
+    /// Where a named identity's private key lives, falling back to the default path
+    /// when the profile does not name one (or names a deleted one).
+    fn identity_key_path(&self, name: &str) -> std::path::PathBuf {
+        self.identities
+            .iter()
+            .find(|i| i.name == name)
+            .map(|i| std::path::PathBuf::from(&i.key_path))
+            .unwrap_or_else(ssh::default_key_path)
+    }
+
+    /// Build a connectable profile from a command entry. `session` empty = the
+    /// profile's own default; tab_id only suffixes when the caller did not name one,
+    /// preserving the "each tab is its own tmux session" behaviour.
+    fn profile_from_command(&self, c: &CommandProfile, session: &str, tab_id: usize) -> ssh::SshProfile {
+        let sess = if session.trim().is_empty() {
+            let base = if c.session.trim().is_empty() { "main" } else { c.session.trim() };
+            if tab_id > 1 { format!("{}-{}", base, tab_id) } else { base.to_string() }
+        } else {
+            session.trim().to_string()
+        };
+        let mut p = self.ssh_profile();
+        p.label = c.name.clone();
+        p.host = c.host.clone();
+        p.port = c.port;
+        p.user = c.user.clone();
+        p.password = c.password.clone();
+        p.key_path = self.identity_key_path(&c.identity);
+        p.session = sess;
+        p.startup = None;
+        p
+    }
 }
 
 impl Config {
@@ -300,13 +446,15 @@ impl Config {
         let path = Self::config_path();
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(cfg) = toml::from_str(&content) {
+                if let Ok(mut cfg) = toml::from_str::<Config>(&content) {
+                    cfg.migrate_legacy();
                     return cfg;
                 }
             }
         }
         // Write default config if not exists
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.migrate_legacy();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -354,16 +502,31 @@ struct Repl {
 #[cfg(target_os = "android")]
 impl Repl {
     const PROMPT: &'static str = "\x1b[1;38;5;39mleuwi\x1b[0m\x1b[2m>\x1b[0m ";
-    const HELP: &'static str = concat!(
-        "\x1b[2mperintah built-in:\x1b[0m\r\n",
-        "  nvgpu [sesi]   sambung ke server nvgpu (tmux attach-or-create)\r\n",
-        "  config         lihat/ubah host, port, user, session\r\n",
-        "  keygen         buat SSH key baru + tampilkan public key\r\n",
-        "  rename <nama>  ganti nama tab\r\n",
-        "  clear          bersihkan layar\r\n",
-        "  help           tampilkan bantuan ini\r\n",
-        "\x1b[2mperintah lain diteruskan ke /system/bin/sh (non-interaktif)\x1b[0m\r\n",
-    );
+    /// Built from the live config so the connect/list words shown are the ones the
+    /// user actually configured, not a hardcoded `nvgpu`.
+    fn help(cfg: &Config) -> String {
+        let mut s = String::from("\x1b[2mperintah koneksi (dari Konfigurasi):\x1b[0m\r\n");
+        if cfg.commands.is_empty() {
+            s.push_str("  \x1b[2m(belum ada — buka ≡ › Perintah untuk menambah)\x1b[0m\r\n");
+        }
+        for c in &cfg.commands {
+            s.push_str(&format!(
+                "  {:<14} sambung ke {}@{}:{} (tmux)\r\n",
+                format!("{} [sesi]", c.cmd_connect()), c.user, c.host, c.port));
+            s.push_str(&format!(
+                "  {:<14} daftar session di {}\r\n", c.cmd_list(), c.host));
+        }
+        s.push_str(concat!(
+            "\x1b[2mperintah built-in:\x1b[0m\r\n",
+            "  config         lihat/ubah host, port, user, session\r\n",
+            "  keygen         buat SSH key baru + tampilkan public key\r\n",
+            "  rename <nama>  ganti nama tab\r\n",
+            "  clear          bersihkan layar\r\n",
+            "  help           tampilkan bantuan ini\r\n",
+            "\x1b[2mperintah lain diteruskan ke /system/bin/sh (non-interaktif)\x1b[0m\r\n",
+        ));
+        s
+    }
 
     fn new() -> Self {
         Self { line: String::new() }
@@ -371,7 +534,7 @@ impl Repl {
 
     fn banner() -> String {
         format!(
-            "\r\n  \x1b[1;38;5;39mLeuwi Panjang\x1b[0m \x1b[2mAndroid\x1b[0m\r\n  \x1b[2m—————————————————————————————\x1b[0m\r\n  \x1b[2mketik \x1b[0mhelp\x1b[2m untuk daftar perintah, \x1b[0mnvgpu\x1b[2m untuk menyambung\x1b[0m\r\n\r\n"
+            "\r\n  \x1b[1;38;5;39mLeuwi Panjang\x1b[0m \x1b[2mAndroid\x1b[0m\r\n  \x1b[2m—————————————————————————————\x1b[0m\r\n  \x1b[2mketik \x1b[0mhelp\x1b[2m untuk daftar perintah, \x1b[0m<nama>-s <sesi>\x1b[2m untuk menyambung\x1b[0m\r\n\r\n"
         )
     }
 }
@@ -459,7 +622,10 @@ impl TermTab {
     #[cfg(target_os = "android")]
     fn repl_exec(&mut self, line: &str, cfg: &mut Config, tab_id: usize) {
         let mut out = String::new();
-        let mut connect = false;
+        // Which profile to attach once the line is done, if any. Carrying the resolved
+        // profile (rather than a bool) is what lets each command entry point at its own
+        // host/port/user instead of the single legacy profile.
+        let mut connect: Option<ssh::SshProfile> = None;
         let mut suppress_prompt = false;
         let mut argv = line.split_whitespace();
         let cmd = argv.next().unwrap_or("");
@@ -473,7 +639,7 @@ impl TermTab {
 
         match cmd {
             "" => {}
-            "help" | "?" => out.push_str(Repl::HELP),
+            "help" | "?" => out.push_str(&Repl::help(cfg)),
             "clear" => out.push_str("\x1b[2J\x1b[H"),
             "rename" | "title" => match args.first() {
                 Some(name) => {
@@ -515,29 +681,35 @@ impl TermTab {
                 }
                 _ => out.push_str("\x1b[2mpakai: config show | config set <host|port|user|session> <nilai>\x1b[0m\r\n"),
             },
-            other if other == cfg.ssh_cmd_connect => {
-                if let Some(sess) = args.first() {
-                    cfg.ssh_session = (*sess).to_string();
-                }
-                connect = true;
-            }
-            other if other == cfg.ssh_cmd_list => {
-                // `tmux ls` over SSH is blocking, so run it off the UI thread and let it
-                // print its own prompt when the answer arrives.
-                let profile = cfg.ssh_profile_for_tab(tab_id);
-                let grid = self.grid.clone();
-                suppress_prompt = true;
-                std::thread::spawn(move || {
-                    let text = match ssh::list_sessions(&profile) {
-                        Ok(s) if s.trim().is_empty() => "(tidak ada session)\r\n".to_string(),
-                        Ok(s) => s.replace(char::from(10), "\r\n"),
-                        Err(e) => format!("\x1b[31m{}\x1b[0m\r\n", e),
-                    };
-                    if let Ok(mut g) = grid.lock() {
-                        g.process(text.as_bytes());
-                        g.process(Repl::PROMPT.as_bytes());
+            // `<name>-s [sesi]` connects, `<name>-ls` lists — one pair per configured
+            // command profile, so different words reach different hosts.
+            other if cfg.lookup_command(other).is_some() => {
+                let (profile, is_list) = match cfg.lookup_command(other) {
+                    Some((c, is_list)) => {
+                        let session = if is_list { "" } else { args.first().copied().unwrap_or("") };
+                        (cfg.profile_from_command(c, session, tab_id), is_list)
                     }
-                });
+                    None => unreachable!("guarded by lookup_command above"),
+                };
+                if is_list {
+                    // `tmux ls` over SSH is blocking, so run it off the UI thread and let it
+                    // print its own prompt when the answer arrives.
+                    let grid = self.grid.clone();
+                    suppress_prompt = true;
+                    std::thread::spawn(move || {
+                        let text = match ssh::list_sessions(&profile) {
+                            Ok(s) if s.trim().is_empty() => "(tidak ada session)\r\n".to_string(),
+                            Ok(s) => s.replace(char::from(10), "\r\n"),
+                            Err(e) => format!("\x1b[31m{}\x1b[0m\r\n", e),
+                        };
+                        if let Ok(mut g) = grid.lock() {
+                            g.process(text.as_bytes());
+                            g.process(Repl::PROMPT.as_bytes());
+                        }
+                    });
+                } else {
+                    connect = Some(profile);
+                }
             }
             other => {
                 // Not a built-in: hand it to the OS shell. This is non-interactive
@@ -556,11 +728,12 @@ impl TermTab {
         {
             let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
             if !out.is_empty() { g.process(out.as_bytes()); }
-            if !connect && !suppress_prompt { g.process(Repl::PROMPT.as_bytes()); }
+            if connect.is_none() && !suppress_prompt { g.process(Repl::PROMPT.as_bytes()); }
         }
-        if connect {
-            let profile = cfg.ssh_profile_for_tab(tab_id);
-            self.title = format!("nvgpu {}", tab_id);
+        if let Some(profile) = connect {
+            // Tab title shows which session it holds, since tabs can now be on
+            // different hosts entirely.
+            self.title = format!("{} {}", profile.label, profile.session);
             self.pending_profile = Some(profile);
             self.start_pending_ssh();
         }
@@ -1753,6 +1926,56 @@ live_design! {
         margin: { top: 6 }
     }
 
+    // Destructive action — red so it is not tapped by reflex next to Simpan.
+    DangerBtn = <Button> {
+        text: ""
+        width: Fill, height: 32
+        draw_text: { color: #xF85149, text_style: { font_size: 10.0 } }
+        draw_bg: { color: #x21262D, fn pixel(self) -> vec4 { return mix(self.color, #x49222260, self.hover); } }
+        margin: { top: 6 }
+    }
+
+    // Taller input for pasted key material, which is many lines long.
+    MultiInput = <TextInput> {
+        width: Fill, height: 90
+        draw_text: { color: #xE6EDF3, text_style: { font_size: 8.0 } }
+        draw_bg: { color: #x0D1117 }
+    }
+
+    // A top tab in the config page. `selected` is driven from Rust by restyling the
+    // button, since makepad has no built-in toggle state to bind here.
+    CfgTab = <Button> {
+        text: ""
+        width: Fill, height: 34
+        draw_text: { color: #x8B949E, text_style: { font_size: 10.5 } }
+        draw_bg: { color: #x161B22, fn pixel(self) -> vec4 { return mix(self.color, #x30363D, self.hover); } }
+        padding: { left: 6, right: 6 }
+    }
+
+    SecTitle = <Label> {
+        width: Fill
+        text: ""
+        draw_text: { color: #x58A6FF, text_style: { font_size: 10.0 } }
+        margin: { top: 10, bottom: 2 }
+    }
+
+    FormHint = <Label> {
+        width: Fill
+        text: ""
+        draw_text: { color: #x6E7681, text_style: { font_size: 8.0 } }
+        margin: { bottom: 2 }
+    }
+
+    // One selectable entry in a config list (a command profile or an SSH key).
+    ListRow = <Button> {
+        text: ""
+        width: Fill, height: 40
+        align: { x: 0.0, y: 0.5 }
+        draw_text: { color: #xC5C8C6, text_style: { font_size: 9.5 } }
+        draw_bg: { color: #x21262D, fn pixel(self) -> vec4 { return mix(self.color, #x30363D, self.hover); } }
+        padding: { left: 10, right: 8 }
+    }
+
     // Vertical tab entry (Zen-browser style sidebar). Full-width and tall enough to
     // stay comfortably tappable when many tabs are open, instead of cramming them
     // into a horizontal strip.
@@ -1853,94 +2076,6 @@ live_design! {
                             width: 0, height: 0
                         }
                     }
-                // Takes over the whole screen while open so the forms have room, and
-                // scrolls because they are taller than a phone. Closing restores the terminal.
-                // Full-screen settings page: vertical nav on the left picks the
-                // config type, the right column holds that section's form and scrolls.
-                menu_panel = <View> {
-                    visible: false
-                    width: Fill, height: Fill
-                    flow: Right
-                    show_bg: true
-                    draw_bg: { color: #x161B22 }
-
-                    cfg_nav = <View> {
-                        width: 132, height: Fill, flow: Down
-                        show_bg: true
-                        draw_bg: { color: #x0D1117 }
-                        padding: { top: 10, left: 6, right: 6 }
-                        spacing: 4
-                        menu_title = <Label> {
-                            text: "Konfigurasi"
-                            draw_text: { color: #x58A6FF, text_style: { font_size: 11.0 } }
-                        }
-                        menu_ver = <Label> {
-                            text: "v0.1.0-dev"
-                            draw_text: { color: #x6E7681, text_style: { font_size: 8.5 } }
-                            margin: { bottom: 8 }
-                        }
-                        m_profile = <MenuRow> { text: "Profil" }
-                        m_sshkey  = <MenuRow> { text: "SSH key" }
-                        m_keymap  = <MenuRow> { text: "Keymap" }
-                        <View> { width: Fill, height: Fill }
-                        btn_close = <MenuRow> { text: "< Tutup" }
-                    }
-
-                    cfg_body = <ScrollYView> {
-                        width: Fill, height: Fill, flow: Down
-                        padding: { top: 10, left: 12, right: 12 }
-                        spacing: 4
-
-                        sec_profile = <View> {
-                            visible: false
-                            width: Fill, height: Fit, flow: Down, spacing: 3
-                            <FormLabel> { text: "Nama perintah" }
-                            in_name = <FormInput> { empty_text: "nvgpu" }
-                            <FormLabel> { text: "Host / IP" }
-                            in_host = <FormInput> { empty_text: "10.0.0.1" }
-                            <FormLabel> { text: "Port" }
-                            in_port = <FormInput> { empty_text: "22" }
-                            <FormLabel> { text: "Username" }
-                            in_user = <FormInput> { empty_text: "user" }
-                            <FormLabel> { text: "Tmux session" }
-                            in_session = <FormInput> { empty_text: "main" }
-                            <FormLabel> { text: "Password (kosong = pakai SSH key)" }
-                            in_pass = <FormInput> { is_password: true, empty_text: "" }
-                            btn_save = <FormBtn> { text: "Simpan" }
-                            form_msg = <Label> {
-                                width: Fill
-                                text: ""
-                                draw_text: { color: #x6E7681, text_style: { font_size: 9.0 } }
-                            }
-                        }
-
-                        sec_sshkey = <View> {
-                            visible: false
-                            width: Fill, height: Fit, flow: Down, spacing: 4
-                            key_info = <Label> {
-                                width: Fill
-                                text: ""
-                                draw_text: { color: #xC5C8C6, text_style: { font_size: 9.0 } }
-                            }
-                            btn_keygen = <FormBtn> { text: "Generate key baru" }
-                            btn_showpub = <FormBtn> { text: "Tampilkan public key" }
-                            key_pub = <Label> {
-                                width: Fill
-                                text: ""
-                                draw_text: { color: #x7EE787, text_style: { font_size: 8.0 } }
-                            }
-                        }
-
-                        sec_keymap = <View> {
-                            visible: false
-                            width: Fill, height: Fit, flow: Down
-                            menu_content = <Label> {
-                                width: Fill
-                                text: ""
-                                draw_text: { color: #xC5C8C6, text_style: { font_size: 9.5 } }
-                            }
-                        }
-                    }
                 }
 
                 // Search bar (hidden by default)
@@ -2005,6 +2140,141 @@ live_design! {
                     }
                 }
 
+                // Full-screen settings page. A sibling of `panes` inside the Down-flow
+                // body (NOT a child of it — nesting it inside the Right-flow `panes` is
+                // what previously squeezed it into half the screen), so with `panes`
+                // hidden it is the only Fill child and owns the whole area.
+                // Tabs across the top pick which feature's config is being edited.
+                menu_panel = <View> {
+                    visible: false
+                    width: Fill, height: Fill
+                    flow: Down
+                    show_bg: true
+                    draw_bg: { color: #x161B22 }
+
+                    cfg_tabbar = <View> {
+                        width: Fill, height: 46, flow: Right
+                        show_bg: true
+                        draw_bg: { color: #x0D1117 }
+                        align: { y: 0.5 }
+                        padding: { left: 6, right: 6 }
+                        spacing: 4
+                        tab_cmd = <CfgTab> { text: "Perintah" }
+                        tab_key = <CfgTab> { text: "SSH Key" }
+                        tab_map = <CfgTab> { text: "Keymap" }
+                        btn_close = <Button> {
+                            text: "×", width: 40, height: 34
+                            draw_text: { color: #xC5C8C6, text_style: { font_size: 15.0 } }
+                            draw_bg: { color: #x21262D, fn pixel(self) -> vec4 { return mix(self.color, #xE0303060, self.hover); } }
+                        }
+                    }
+
+                    cfg_body = <ScrollYView> {
+                        width: Fill, height: Fill, flow: Down
+                        padding: { top: 10, left: 12, right: 12, bottom: 24 }
+                        spacing: 4
+
+                        // ── Tab 1: connection commands ──
+                        sec_cmd = <View> {
+                            visible: false
+                            width: Fill, height: Fit, flow: Down, spacing: 3
+                            <SecTitle> { text: "Daftar perintah" }
+                            <FormHint> { text: "Pilih untuk mengubah, atau tambah yang baru." }
+                            cmd_list = <View> {
+                                width: Fill, height: Fit, flow: Down, spacing: 3
+                                margin: { bottom: 4 }
+                                cmd0 = <ListRow> {}
+                                cmd1 = <ListRow> {}
+                                cmd2 = <ListRow> {}
+                                cmd3 = <ListRow> {}
+                                cmd4 = <ListRow> {}
+                                cmd5 = <ListRow> {}
+                                cmd6 = <ListRow> {}
+                                cmd7 = <ListRow> {}
+                            }
+                            btn_cmd_new = <FormBtn> { text: "+ Perintah baru" }
+
+                            <SecTitle> { text: "Detail perintah" }
+                            <FormLabel> { text: "Nama profil" }
+                            in_name = <FormInput> { empty_text: "nvgpu" }
+                            <FormLabel> { text: "Perintah sambung (kosong = <nama>-s)" }
+                            in_cmd_connect = <FormInput> { empty_text: "nvgpu-s" }
+                            <FormLabel> { text: "Perintah list session (kosong = <nama>-ls)" }
+                            in_cmd_list = <FormInput> { empty_text: "nvgpu-ls" }
+                            <FormLabel> { text: "Host / IP" }
+                            in_host = <FormInput> { empty_text: "10.0.0.1" }
+                            <FormLabel> { text: "Port" }
+                            in_port = <FormInput> { empty_text: "22" }
+                            <FormLabel> { text: "Username" }
+                            in_user = <FormInput> { empty_text: "user" }
+                            <FormLabel> { text: "Tmux session default" }
+                            in_session = <FormInput> { empty_text: "main" }
+                            <FormLabel> { text: "SSH key (nama dari tab SSH Key, kosong = default)" }
+                            in_identity = <FormInput> { empty_text: "" }
+                            id_hint = <FormHint> { text: "" }
+                            <FormLabel> { text: "Password (kosong = pakai SSH key)" }
+                            in_pass = <FormInput> { is_password: true, empty_text: "" }
+                            btn_save = <FormBtn> { text: "Simpan" }
+                            btn_cmd_del = <DangerBtn> { text: "Hapus perintah ini" }
+                            form_msg = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #x6E7681, text_style: { font_size: 9.0 } }
+                            }
+                        }
+
+                        // ── Tab 2: SSH identities ──
+                        sec_key = <View> {
+                            visible: false
+                            width: Fill, height: Fit, flow: Down, spacing: 3
+                            <SecTitle> { text: "SSH key tersimpan" }
+                            key_list = <View> {
+                                width: Fill, height: Fit, flow: Down, spacing: 3
+                                margin: { bottom: 4 }
+                                key0 = <ListRow> {}
+                                key1 = <ListRow> {}
+                                key2 = <ListRow> {}
+                                key3 = <ListRow> {}
+                                key4 = <ListRow> {}
+                                key5 = <ListRow> {}
+                            }
+
+                            <SecTitle> { text: "Buat key baru" }
+                            <FormLabel> { text: "Nama key" }
+                            in_key_name = <FormInput> { empty_text: "poco-x6" }
+                            btn_keygen = <FormBtn> { text: "Generate keypair ed25519" }
+
+                            <SecTitle> { text: "Atau tempel key yang sudah ada" }
+                            <FormLabel> { text: "Private key (OPENSSH PEM lengkap)" }
+                            in_key_priv = <MultiInput> { empty_text: "-----BEGIN OPENSSH PRIVATE KEY-----" }
+                            <FormLabel> { text: "Public key (opsional — diturunkan bila kosong)" }
+                            in_key_pub = <MultiInput> { empty_text: "ssh-ed25519 AAAA..." }
+                            btn_key_import = <FormBtn> { text: "Simpan key ini" }
+
+                            btn_key_del = <DangerBtn> { text: "Hapus key terpilih" }
+                            key_info = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #xC5C8C6, text_style: { font_size: 9.0 } }
+                            }
+                            key_pub = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #x7EE787, text_style: { font_size: 8.0 } }
+                            }
+                        }
+
+                        // ── Tab 3: keymap reference ──
+                        sec_keymap = <View> {
+                            visible: false
+                            width: Fill, height: Fit, flow: Down
+                            menu_content = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #xC5C8C6, text_style: { font_size: 9.5 } }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2036,7 +2306,27 @@ pub struct App {
     #[rust] sidebar_hidden: bool,
     #[rust] ctrl_pending: bool,
     #[rust] alt_pending: bool,
+    // Config page state: which top tab is showing, and which list entry is being
+    // edited. `None` means the form holds a new, not-yet-saved entry.
+    #[rust] cfg_tab: CfgTab,
+    #[rust] sel_cmd: Option<usize>,
+    #[rust] sel_key: Option<usize>,
 }
+
+/// Which config tab is on screen. One variant per feature area.
+#[derive(Clone, Copy, PartialEq, Default)]
+enum CfgTab {
+    #[default]
+    Cmd,
+    Key,
+    Keymap,
+}
+
+/// Fixed widget pools for the config lists: makepad needs the rows declared in the
+/// DSL, so the lists are capped and surplus entries are reported rather than dropped
+/// silently.
+const MAX_CMD_ROWS: usize = 8;
+const MAX_KEY_ROWS: usize = 6;
 
 impl LiveRegister for App {
     fn live_register(cx: &mut Cx) {
@@ -2351,120 +2641,345 @@ impl App {
         self.ui.view(id!(key_bar)).set_visible(cx, !open && cfg!(target_os = "android"));
         self.ui.widget(id!(tab_sidebar)).set_visible(cx, !open && !self.sidebar_hidden);
         if open {
-            self.show_menu_section(cx, "profile");
+            let tab = self.cfg_tab;
+            self.show_cfg_tab(cx, tab);
         }
         self.ui.redraw(cx);
     }
 
-    /// Swap which burger-menu section is on screen and fill it with current values.
-    fn show_menu_section(&mut self, cx: &mut Cx, which: &str) {
-        self.ui.view(id!(sec_profile)).set_visible(cx, which == "profile");
-        self.ui.view(id!(sec_sshkey)).set_visible(cx, which == "sshkey");
-        self.ui.view(id!(sec_keymap)).set_visible(cx, which == "keymap");
+    /// Swap which config tab is on screen and refill it from the current config.
+    fn show_cfg_tab(&mut self, cx: &mut Cx, which: CfgTab) {
+        self.cfg_tab = which;
+        self.ui.view(id!(sec_cmd)).set_visible(cx, which == CfgTab::Cmd);
+        self.ui.view(id!(sec_key)).set_visible(cx, which == CfgTab::Key);
+        self.ui.view(id!(sec_keymap)).set_visible(cx, which == CfgTab::Keymap);
+
+        // Highlight the active tab. makepad has no toggle state on Button, so the
+        // selected one is marked in its label instead of by restyling.
+        for (id, tab) in [
+            (id!(tab_cmd), CfgTab::Cmd),
+            (id!(tab_key), CfgTab::Key),
+            (id!(tab_map), CfgTab::Keymap),
+        ] {
+            let base = match tab {
+                CfgTab::Cmd => "Perintah",
+                CfgTab::Key => "SSH Key",
+                CfgTab::Keymap => "Keymap",
+            };
+            let label = if tab == which { format!("▌{}", base) } else { format!(" {}", base) };
+            self.ui.button(id).set_text(cx, &label);
+        }
 
         match which {
-            "profile" => {
-                let host = self.config.ssh_host.clone();
-                let port = self.config.ssh_port.to_string();
-                let user = self.config.ssh_user.clone();
-                let session = self.config.ssh_session.clone();
-                let pass = self.config.ssh_password.clone();
-                self.ui.widget(id!(in_name)).set_text(cx, "nvgpu");
-                self.ui.widget(id!(in_host)).set_text(cx, &host);
-                self.ui.widget(id!(in_port)).set_text(cx, &port);
-                self.ui.widget(id!(in_user)).set_text(cx, &user);
-                self.ui.widget(id!(in_session)).set_text(cx, &session);
-                self.ui.widget(id!(in_pass)).set_text(cx, &pass);
-                self.ui.widget(id!(form_msg)).set_text(cx, "");
+            CfgTab::Cmd => {
+                self.refresh_cmd_list(cx);
+                let sel = self.sel_cmd;
+                self.load_cmd_form(cx, sel);
             }
-            "sshkey" => {
-                let path = Self::ssh_key_path_display();
-                let exists = std::path::Path::new(&path).is_file();
-                let info = format!(
-                    "key: {}\nstatus: {}",
-                    path,
-                    if exists { "ada" } else { "belum ada — tekan Generate" }
-                );
-                self.ui.widget(id!(key_info)).set_text(cx, &info);
+            CfgTab::Key => {
+                self.refresh_key_list(cx);
                 self.ui.widget(id!(key_pub)).set_text(cx, "");
             }
-            _ => self.show_menu(cx),
+            CfgTab::Keymap => self.show_menu(cx),
         }
         self.ui.redraw(cx);
     }
 
-    /// Where the SSH key lives, as text for the key section.
-    fn ssh_key_path_display() -> String {
-        #[cfg(target_os = "android")]
-        {
-            ssh::default_key_path().display().to_string()
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            "~/.ssh/id_rsa".to_string()
+    /// Repaint the command list rows from config; unused slots are hidden.
+    fn refresh_cmd_list(&mut self, cx: &mut Cx) {
+        let rows = [id!(cmd0), id!(cmd1), id!(cmd2), id!(cmd3),
+                    id!(cmd4), id!(cmd5), id!(cmd6), id!(cmd7)];
+        for (i, row) in rows.iter().enumerate() {
+            let visible = i < self.config.commands.len().min(MAX_CMD_ROWS);
+            self.ui.widget(*row).set_visible(cx, visible);
+            if visible {
+                let c = &self.config.commands[i];
+                let marker = if self.sel_cmd == Some(i) { "▌" } else { " " };
+                let text = format!("{}{}  ·  {}@{}:{}", marker, c.cmd_connect(), c.user, c.host, c.port);
+                self.ui.button(*row).set_text(cx, &text);
+            }
         }
     }
 
-    /// Persist what the user typed in the connection form.
-    fn save_profile_form(&mut self, cx: &mut Cx) {
-        let host = self.ui.widget(id!(in_host)).text();
-        let port = self.ui.widget(id!(in_port)).text();
-        let user = self.ui.widget(id!(in_user)).text();
-        let session = self.ui.widget(id!(in_session)).text();
-        let pass = self.ui.widget(id!(in_pass)).text();
-
-        if !port.trim().is_empty() {
-            match port.trim().parse::<u16>() {
-                Ok(p) => self.config.ssh_port = p,
-                Err(_) => {
-                    self.ui.widget(id!(form_msg)).set_text(cx, "port harus angka 1-65535");
-                    self.ui.redraw(cx);
-                    return;
-                }
+    /// Repaint the SSH key list rows from config.
+    fn refresh_key_list(&mut self, cx: &mut Cx) {
+        let rows = [id!(key0), id!(key1), id!(key2), id!(key3), id!(key4), id!(key5)];
+        for (i, row) in rows.iter().enumerate() {
+            let visible = i < self.config.identities.len().min(MAX_KEY_ROWS);
+            self.ui.widget(*row).set_visible(cx, visible);
+            if visible {
+                let k = &self.config.identities[i];
+                let marker = if self.sel_key == Some(i) { "▌" } else { " " };
+                let has = std::path::Path::new(&k.key_path).is_file();
+                self.ui.button(*row).set_text(
+                    cx, &format!("{}{}  ·  {}", marker, k.name, if has { "ok" } else { "file hilang" }));
             }
         }
-        if !host.trim().is_empty() { self.config.ssh_host = host.trim().to_string(); }
-        if !user.trim().is_empty() { self.config.ssh_user = user.trim().to_string(); }
-        if !session.trim().is_empty() { self.config.ssh_session = session.trim().to_string(); }
-        self.config.ssh_password = pass;
+        let info = if self.config.identities.is_empty() {
+            "belum ada key — generate atau tempel di bawah".to_string()
+        } else {
+            match self.sel_key.and_then(|i| self.config.identities.get(i)) {
+                Some(k) => format!("terpilih: {}\n{}", k.name, k.key_path),
+                None => "pilih satu key untuk melihat detailnya".to_string(),
+            }
+        };
+        self.ui.widget(id!(key_info)).set_text(cx, &info);
+    }
 
+    /// Load a command profile into the detail form. `None` = blank form for a new entry.
+    fn load_cmd_form(&mut self, cx: &mut Cx, idx: Option<usize>) {
+        self.sel_cmd = idx.filter(|i| *i < self.config.commands.len());
+        let c = match self.sel_cmd {
+            Some(i) => self.config.commands[i].clone(),
+            None => CommandProfile { name: String::new(), ..CommandProfile::default() },
+        };
+        self.ui.widget(id!(in_name)).set_text(cx, &c.name);
+        self.ui.widget(id!(in_cmd_connect)).set_text(cx, &c.cmd_connect);
+        self.ui.widget(id!(in_cmd_list)).set_text(cx, &c.cmd_list);
+        self.ui.widget(id!(in_host)).set_text(cx, &c.host);
+        self.ui.widget(id!(in_port)).set_text(cx, &c.port.to_string());
+        self.ui.widget(id!(in_user)).set_text(cx, &c.user);
+        self.ui.widget(id!(in_session)).set_text(cx, &c.session);
+        self.ui.widget(id!(in_identity)).set_text(cx, &c.identity);
+        self.ui.widget(id!(in_pass)).set_text(cx, &c.password);
+        // Spell out which key this entry will actually use, including the fallback,
+        // so the link between the two tabs is visible without switching back.
+        let hint = if c.identity.trim().is_empty() {
+            format!("pakai key default: {}", ssh::default_key_path().display())
+        } else if self.config.identities.iter().any(|i| i.name == c.identity) {
+            format!("pakai key: {}", self.config.identity_key_path(&c.identity).display())
+        } else {
+            format!("key '{}' tidak ada — akan jatuh ke default", c.identity)
+        };
+        self.ui.widget(id!(id_hint)).set_text(cx, &hint);
+        self.ui.widget(id!(form_msg)).set_text(cx, "");
+        self.refresh_cmd_list(cx);
+        self.ui.redraw(cx);
+    }
+
+    /// Persist the command detail form over the selected entry, or append a new one.
+    fn save_cmd_form(&mut self, cx: &mut Cx) {
+        let name = self.ui.widget(id!(in_name)).text().trim().to_string();
+        let cmd_connect = self.ui.widget(id!(in_cmd_connect)).text().trim().to_string();
+        let cmd_list = self.ui.widget(id!(in_cmd_list)).text().trim().to_string();
+        let host = self.ui.widget(id!(in_host)).text().trim().to_string();
+        let port_s = self.ui.widget(id!(in_port)).text();
+        let user = self.ui.widget(id!(in_user)).text().trim().to_string();
+        let session = self.ui.widget(id!(in_session)).text().trim().to_string();
+        let identity = self.ui.widget(id!(in_identity)).text().trim().to_string();
+        let password = self.ui.widget(id!(in_pass)).text();
+
+        if name.is_empty() {
+            return self.form_err(cx, "nama profil wajib diisi");
+        }
+        if host.is_empty() {
+            return self.form_err(cx, "host wajib diisi");
+        }
+        let port = match port_s.trim().parse::<u16>() {
+            Ok(p) if p > 0 => p,
+            _ => return self.form_err(cx, "port harus angka 1-65535"),
+        };
+        if !identity.is_empty() && !self.config.identities.iter().any(|i| i.name == identity) {
+            return self.form_err(cx, "nama SSH key tidak ada di tab SSH Key");
+        }
+
+        let entry = CommandProfile {
+            name, host, port, user,
+            password, identity, session,
+            cmd_connect, cmd_list,
+        };
+        // Two profiles answering to the same word would make dispatch order-dependent,
+        // so reject the collision rather than silently shadowing one.
+        let (connect_word, list_word) = (entry.cmd_connect(), entry.cmd_list());
+        if connect_word == list_word {
+            return self.form_err(cx, "perintah sambung dan list tidak boleh sama");
+        }
+        let clash = self.config.commands.iter().enumerate().any(|(i, c)| {
+            Some(i) != self.sel_cmd
+                && [c.cmd_connect(), c.cmd_list()].iter().any(|w| *w == connect_word || *w == list_word)
+        });
+        if clash {
+            return self.form_err(cx, "perintah itu sudah dipakai profil lain");
+        }
+
+        match self.sel_cmd {
+            Some(i) => self.config.commands[i] = entry,
+            None => {
+                if self.config.commands.len() >= MAX_CMD_ROWS {
+                    return self.form_err(cx, "maksimum 8 perintah");
+                }
+                self.config.commands.push(entry);
+                self.sel_cmd = Some(self.config.commands.len() - 1);
+            }
+        }
         let msg = match self.config.save() {
-            Ok(()) => "tersimpan — berlaku untuk tab baru".to_string(),
+            Ok(()) => format!("tersimpan — pakai `{} <sesi>` di prompt", connect_word),
             Err(e) => format!("gagal: {e}"),
         };
         self.ui.widget(id!(form_msg)).set_text(cx, &msg);
+        self.refresh_cmd_list(cx);
         self.ui.redraw(cx);
     }
 
-    /// Generate a fresh keypair and show the public half to paste into the server.
-    fn run_keygen(&mut self, cx: &mut Cx) {
-        #[cfg(target_os = "android")]
-        {
-            let path = ssh::default_key_path();
-            let text = match ssh::generate_key(&path, "leuwi-panjang-android") {
-                Ok(pubkey) => format!("{}\n\nsalin ke ~/.ssh/authorized_keys di server", pubkey),
-                Err(e) => format!("gagal: {e}"),
-            };
-            self.ui.widget(id!(key_pub)).set_text(cx, &text);
-            self.show_menu_section(cx, "sshkey");
-            self.ui.widget(id!(key_pub)).set_text(cx, &text);
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            self.ui.widget(id!(key_pub)).set_text(cx, "keygen hanya di Android");
-        }
-        self.ui.redraw(cx);
-    }
-
-    /// Show the existing public key without regenerating anything.
-    fn show_public_key(&mut self, cx: &mut Cx) {
-        let path = Self::ssh_key_path_display();
-        let pub_path = format!("{}.pub", path);
-        let text = match std::fs::read_to_string(&pub_path) {
-            Ok(k) => k.trim().to_string(),
-            Err(e) => format!("tidak bisa baca {}: {}", pub_path, e),
+    /// Drop the selected command profile and clear the form.
+    fn delete_cmd(&mut self, cx: &mut Cx) {
+        let Some(i) = self.sel_cmd else {
+            return self.form_err(cx, "tidak ada perintah terpilih");
         };
+        if i >= self.config.commands.len() { return; }
+        let removed = self.config.commands.remove(i);
+        let _ = self.config.save();
+        self.load_cmd_form(cx, None);
+        self.ui.widget(id!(form_msg)).set_text(cx, &format!("'{}' dihapus", removed.name));
+        self.ui.redraw(cx);
+    }
+
+    fn form_err(&mut self, cx: &mut Cx, msg: &str) {
+        self.ui.widget(id!(form_msg)).set_text(cx, msg);
+        self.ui.redraw(cx);
+    }
+
+    /// Where a newly created key file should live (app-private on Android).
+    fn key_file_for(name: &str) -> std::path::PathBuf {
+        // Keep the filename tame: it becomes a real path, and the name comes from a
+        // free-text field.
+        let safe: String = name.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let dir = ssh::default_key_path()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        dir.join(format!("id_{safe}"))
+    }
+
+    /// Generate a named keypair and show the public half to paste into the server.
+    fn run_keygen(&mut self, cx: &mut Cx) {
+        let name = self.ui.widget(id!(in_key_name)).text().trim().to_string();
+        if name.is_empty() {
+            self.ui.widget(id!(key_pub)).set_text(cx, "isi nama key dulu");
+            self.ui.redraw(cx);
+            return;
+        }
+        if self.config.identities.iter().any(|i| i.name == name) {
+            self.ui.widget(id!(key_pub)).set_text(cx, "nama key itu sudah dipakai");
+            self.ui.redraw(cx);
+            return;
+        }
+        if self.config.identities.len() >= MAX_KEY_ROWS {
+            self.ui.widget(id!(key_pub)).set_text(cx, "maksimum 6 key");
+            self.ui.redraw(cx);
+            return;
+        }
+        let path = Self::key_file_for(&name);
+        let text = match ssh::generate_key(&path, &format!("leuwi-panjang-{name}")) {
+            Ok(pubkey) => {
+                self.config.identities.push(SshIdentity {
+                    name: name.clone(),
+                    key_path: path.display().to_string(),
+                    public_key: pubkey.clone(),
+                });
+                self.sel_key = Some(self.config.identities.len() - 1);
+                let _ = self.config.save();
+                format!("{pubkey}\n\nsalin baris di atas ke ~/.ssh/authorized_keys di server")
+            }
+            Err(e) => format!("gagal: {e}"),
+        };
+        self.refresh_key_list(cx);
         self.ui.widget(id!(key_pub)).set_text(cx, &text);
+        self.ui.redraw(cx);
+    }
+
+    /// Store a keypair pasted into the form under the given name.
+    fn import_key_form(&mut self, cx: &mut Cx) {
+        let name = self.ui.widget(id!(in_key_name)).text().trim().to_string();
+        let priv_pem = self.ui.widget(id!(in_key_priv)).text();
+        let pub_line = self.ui.widget(id!(in_key_pub)).text();
+        if name.is_empty() {
+            self.ui.widget(id!(key_pub)).set_text(cx, "isi nama key dulu");
+            self.ui.redraw(cx);
+            return;
+        }
+        let existing = self.config.identities.iter().position(|i| i.name == name);
+        if existing.is_none() && self.config.identities.len() >= MAX_KEY_ROWS {
+            self.ui.widget(id!(key_pub)).set_text(cx, "maksimum 6 key");
+            self.ui.redraw(cx);
+            return;
+        }
+        let path = Self::key_file_for(&name);
+        let text = match ssh::import_key(&path, &priv_pem, &pub_line) {
+            Ok(pubkey) => {
+                let entry = SshIdentity {
+                    name: name.clone(),
+                    key_path: path.display().to_string(),
+                    public_key: pubkey.clone(),
+                };
+                match existing {
+                    // Re-importing under an existing name replaces it, which is what
+                    // "fix the key I pasted wrong" needs to do.
+                    Some(i) => { self.config.identities[i] = entry; self.sel_key = Some(i); }
+                    None => {
+                        self.config.identities.push(entry);
+                        self.sel_key = Some(self.config.identities.len() - 1);
+                    }
+                }
+                let _ = self.config.save();
+                self.ui.widget(id!(in_key_priv)).set_text(cx, "");
+                format!("tersimpan sebagai '{name}'\n{pubkey}")
+            }
+            Err(e) => format!("gagal: {e}"),
+        };
+        self.refresh_key_list(cx);
+        self.ui.widget(id!(key_pub)).set_text(cx, &text);
+        self.ui.redraw(cx);
+    }
+
+    /// Forget the selected key. The private file is removed too, so a lost phone
+    /// cannot be mined for it afterwards.
+    fn delete_key(&mut self, cx: &mut Cx) {
+        let Some(i) = self.sel_key else {
+            self.ui.widget(id!(key_pub)).set_text(cx, "pilih key yang mau dihapus");
+            self.ui.redraw(cx);
+            return;
+        };
+        if i >= self.config.identities.len() { return; }
+        // A command still pointing at it would silently fall back to the default key,
+        // which is a confusing way to find out — say so instead.
+        let name = self.config.identities[i].name.clone();
+        let used_by: Vec<String> = self.config.commands.iter()
+            .filter(|c| c.identity == name)
+            .map(|c| c.name.clone())
+            .collect();
+        if !used_by.is_empty() {
+            let msg = format!("masih dipakai perintah: {} — ubah dulu", used_by.join(", "));
+            self.ui.widget(id!(key_pub)).set_text(cx, &msg);
+            self.ui.redraw(cx);
+            return;
+        }
+        let removed = self.config.identities.remove(i);
+        let p = std::path::PathBuf::from(&removed.key_path);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("pub"));
+        self.sel_key = None;
+        let _ = self.config.save();
+        self.refresh_key_list(cx);
+        self.ui.widget(id!(key_pub)).set_text(cx, &format!("'{}' dihapus", removed.name));
+        self.ui.redraw(cx);
+    }
+
+    /// Show a stored key's public half so it can be copied to the server.
+    fn select_key(&mut self, cx: &mut Cx, idx: usize) {
+        if idx >= self.config.identities.len() { return; }
+        self.sel_key = Some(idx);
+        let k = self.config.identities[idx].clone();
+        // Prefer the file on disk: it is the source of truth if the key was replaced
+        // outside the app, and the cached copy can be stale.
+        let text = std::fs::read_to_string(std::path::PathBuf::from(&k.key_path).with_extension("pub"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or(k.public_key);
+        self.ui.widget(id!(in_key_name)).set_text(cx, &k.name);
+        self.ui.widget(id!(key_pub)).set_text(cx, &text);
+        self.refresh_key_list(cx);
         self.ui.redraw(cx);
     }
 
@@ -2624,12 +3139,24 @@ impl MatchEvent for App {
         // sticky modifier that is applied to the next character typed.
         // Burger menu is a real navigator now: each row swaps the section below it.
         if self.ui.button(id!(btn_close)).clicked(&actions) { self.set_menu_open(cx, false); }
-        if self.ui.button(id!(m_profile)).clicked(&actions) { self.show_menu_section(cx, "profile"); }
-        if self.ui.button(id!(m_sshkey)).clicked(&actions) { self.show_menu_section(cx, "sshkey"); }
-        if self.ui.button(id!(m_keymap)).clicked(&actions) { self.show_menu_section(cx, "keymap"); }
-        if self.ui.button(id!(btn_save)).clicked(&actions) { self.save_profile_form(cx); }
+        // Config page: top tabs pick the feature, the lists pick the entry.
+        if self.ui.button(id!(tab_cmd)).clicked(&actions) { self.show_cfg_tab(cx, CfgTab::Cmd); }
+        if self.ui.button(id!(tab_key)).clicked(&actions) { self.show_cfg_tab(cx, CfgTab::Key); }
+        if self.ui.button(id!(tab_map)).clicked(&actions) { self.show_cfg_tab(cx, CfgTab::Keymap); }
+        for (i, row) in [id!(cmd0), id!(cmd1), id!(cmd2), id!(cmd3),
+                         id!(cmd4), id!(cmd5), id!(cmd6), id!(cmd7)].iter().enumerate() {
+            if self.ui.button(*row).clicked(&actions) { self.load_cmd_form(cx, Some(i)); }
+        }
+        for (i, row) in [id!(key0), id!(key1), id!(key2),
+                         id!(key3), id!(key4), id!(key5)].iter().enumerate() {
+            if self.ui.button(*row).clicked(&actions) { self.select_key(cx, i); }
+        }
+        if self.ui.button(id!(btn_cmd_new)).clicked(&actions) { self.load_cmd_form(cx, None); }
+        if self.ui.button(id!(btn_save)).clicked(&actions) { self.save_cmd_form(cx); }
+        if self.ui.button(id!(btn_cmd_del)).clicked(&actions) { self.delete_cmd(cx); }
         if self.ui.button(id!(btn_keygen)).clicked(&actions) { self.run_keygen(cx); }
-        if self.ui.button(id!(btn_showpub)).clicked(&actions) { self.show_public_key(cx); }
+        if self.ui.button(id!(btn_key_import)).clicked(&actions) { self.import_key_form(cx); }
+        if self.ui.button(id!(btn_key_del)).clicked(&actions) { self.delete_key(cx); }
         if self.ui.button(id!(sidebar_btn)).clicked(&actions) {
             self.sidebar_hidden = !self.sidebar_hidden;
             self.ui.widget(id!(tab_sidebar)).set_visible(cx, !self.sidebar_hidden);

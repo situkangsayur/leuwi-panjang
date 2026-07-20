@@ -116,7 +116,7 @@ pub(crate) fn default_key_path() -> PathBuf {
 }
 
 #[cfg(not(target_os = "android"))]
-fn default_key_path() -> PathBuf {
+pub(crate) fn default_key_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/home/hendri"))
         .join(".ssh/id_rsa")
@@ -129,7 +129,6 @@ fn default_key_path() -> PathBuf {
 /// The seed is read straight from `/dev/urandom` rather than going through a rand_core
 /// `OsRng`: ssh-key and russh pull in different rand_core majors, so the trait bounds
 /// don't line up, and a 32-byte seed needs no RNG plumbing at all.
-#[cfg(target_os = "android")]
 pub(crate) fn generate_key(path: &Path, comment: &str) -> Result<String, String> {
     use russh::keys::ssh_key::private::Ed25519Keypair;
     use russh::keys::ssh_key::LineEnding;
@@ -165,6 +164,45 @@ pub(crate) fn generate_key(path: &Path, comment: &str) -> Result<String, String>
         .public_key()
         .to_openssh()
         .map_err(|e| format!("encode public key: {e}"))?;
+    let _ = std::fs::write(path.with_extension("pub"), format!("{pubkey}\n"));
+    Ok(pubkey)
+}
+
+/// Store a keypair the user pasted into the config form. The private half is parsed
+/// before it is written so a truncated paste fails here, with a message, rather than
+/// at connect time as an opaque auth failure. Returns the public key line: the pasted
+/// one if given, otherwise derived from the private key.
+pub(crate) fn import_key(path: &Path, private_pem: &str, public_line: &str) -> Result<String, String> {
+    use russh::keys::PrivateKey;
+
+    let pem = private_pem.trim();
+    if pem.is_empty() {
+        return Err("private key kosong".into());
+    }
+    // Parsing validates the whole PEM; an encrypted key has no passphrase prompt here,
+    // so reject it now instead of failing later inside the SSH handshake.
+    let key = PrivateKey::from_openssh(pem)
+        .map_err(|e| format!("private key tidak valid: {e}"))?;
+    if key.is_encrypted() {
+        return Err("private key terenkripsi (passphrase) belum didukung".into());
+    }
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    // OpenSSH refuses keys without a trailing newline.
+    std::fs::write(path, format!("{pem}\n")).map_err(|e| format!("write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let pubkey = if public_line.trim().is_empty() {
+        key.public_key().to_openssh().map_err(|e| format!("encode public key: {e}"))?
+    } else {
+        public_line.trim().to_string()
+    };
     let _ = std::fs::write(path.with_extension("pub"), format!("{pubkey}\n"));
     Ok(pubkey)
 }
