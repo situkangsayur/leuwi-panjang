@@ -162,6 +162,15 @@ struct Config {
     ssh_user: String,
     #[serde(default = "default_ssh_key")]
     ssh_key: String,
+    // Empty means key auth. Stored in the app-private config, not the APK.
+    #[serde(default)]
+    ssh_password: String,
+    // The command words themselves are configurable, so the profile can be renamed
+    // without touching code (mirrors the nvgpu-s / nvgpu-ls shell functions).
+    #[serde(default = "default_cmd_connect")]
+    ssh_cmd_connect: String,
+    #[serde(default = "default_cmd_list")]
+    ssh_cmd_list: String,
     #[serde(default = "default_ssh_session")]
     ssh_session: String,
     // Optional full startup command; empty = `tmux new -A -s <ssh_session>`.
@@ -176,6 +185,8 @@ fn default_ssh_port() -> u16 { 1313 }
 fn default_ssh_user() -> String { "hendri".into() }
 fn default_ssh_key() -> String { "~/.ssh/id_rsa".into() }
 fn default_ssh_session() -> String { "main".into() }
+fn default_cmd_connect() -> String { "nvgpu-s".into() }
+fn default_cmd_list() -> String { "nvgpu-ls".into() }
 fn default_font_size() -> f64 { 12.0 }
 fn default_cols() -> usize { 115 }
 fn default_rows() -> usize { 33 }
@@ -202,6 +213,8 @@ impl Default for Config {
             ssh_host: default_ssh_host(), ssh_port: default_ssh_port(),
             ssh_user: default_ssh_user(), ssh_key: default_ssh_key(),
             ssh_session: default_ssh_session(), ssh_startup: String::new(),
+            ssh_password: String::new(),
+            ssh_cmd_connect: default_cmd_connect(), ssh_cmd_list: default_cmd_list(),
         }
     }
 }
@@ -211,7 +224,13 @@ impl Config {
     /// desktop SSH tabs). `~` in the key path is expanded to the home dir.
     fn ssh_profile(&self) -> ssh::SshProfile {
         let key_path = if let Some(rest) = self.ssh_key.strip_prefix("~/") {
-            dirs::home_dir().unwrap_or_default().join(rest)
+            // Android has no home directory, so `~/.ssh/id_rsa` would collapse to a
+            // relative path resolved against `/` — unreadable and unwritable. Fall back
+            // to the app`s own key locations there.
+            #[cfg(target_os = "android")]
+            { let _ = rest; ssh::default_key_path() }
+            #[cfg(not(target_os = "android"))]
+            { dirs::home_dir().unwrap_or_default().join(rest) }
         } else {
             std::path::PathBuf::from(&self.ssh_key)
         };
@@ -221,12 +240,18 @@ impl Config {
             port: self.ssh_port,
             user: self.ssh_user.clone(),
             key_path,
+            password: self.ssh_password.clone(),
             session: self.ssh_session.clone(),
             startup: if self.ssh_startup.trim().is_empty() { None } else { Some(self.ssh_startup.clone()) },
-            known_hosts: dirs::config_dir()
-                .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-                .unwrap_or_default()
-                .join("leuwi-panjang/known_hosts"),
+            known_hosts: {
+                #[cfg(target_os = "android")]
+                { ssh::default_known_hosts() }
+                #[cfg(not(target_os = "android"))]
+                { dirs::config_dir()
+                    .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+                    .unwrap_or_default()
+                    .join("leuwi-panjang/known_hosts") }
+            },
             cols: self.cols as u16,
             rows: self.rows as u16,
         }
@@ -246,10 +271,33 @@ impl Config {
 }
 
 impl Config {
+    /// Where the config lives. Android has no XDG config dir (`dirs::config_dir()` is
+    /// empty and the CWD is `/`), so anchor it in the app`s own data directory.
+    fn config_path() -> std::path::PathBuf {
+        #[cfg(target_os = "android")]
+        {
+            std::path::PathBuf::from("/data/user/0/com.situkangsayur.leuwipanjang/config.toml")
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+                .join("leuwi-panjang/config.toml")
+        }
+    }
+
+    /// Persist the current settings so edits made in the config form survive a restart.
+    fn save(&self) -> Result<(), String> {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        let toml = toml::to_string_pretty(self).map_err(|e| format!("encode config: {e}"))?;
+        std::fs::write(&path, toml).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
     fn load() -> Self {
-        let path = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
-            .join("leuwi-panjang/config.toml");
+        let path = Self::config_path();
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(cfg) = toml::from_str(&content) {
@@ -285,10 +333,47 @@ struct TermTab {
     // frames AFTER launch, off the startup/first-paint path, so the app window
     // appears even if the network stack is slow — and never blocks/crashes launch.
     pending_profile: Option<ssh::SshProfile>,
+    // Built-in CLI. On Android a tab opens at a local prompt instead of dialing
+    // SSH; keystrokes go here until a session starts, and come back when it ends.
+    #[cfg(target_os = "android")]
+    repl: Option<Repl>,
     title: String,
     split: Option<Box<TermTab>>,
     split_dir: SplitDir,
     split_focused: bool,
+}
+
+/// The built-in prompt shown in every Android tab. Leuwi Panjang is a terminal
+/// first: a new tab lands here, not in an SSH session. `nvgpu` starts the session,
+/// and unknown commands fall through to the OS shell.
+#[cfg(target_os = "android")]
+struct Repl {
+    line: String,
+}
+
+#[cfg(target_os = "android")]
+impl Repl {
+    const PROMPT: &'static str = "\x1b[1;38;5;39mleuwi\x1b[0m\x1b[2m>\x1b[0m ";
+    const HELP: &'static str = concat!(
+        "\x1b[2mperintah built-in:\x1b[0m\r\n",
+        "  nvgpu [sesi]   sambung ke server nvgpu (tmux attach-or-create)\r\n",
+        "  config         lihat/ubah host, port, user, session\r\n",
+        "  keygen         buat SSH key baru + tampilkan public key\r\n",
+        "  rename <nama>  ganti nama tab\r\n",
+        "  clear          bersihkan layar\r\n",
+        "  help           tampilkan bantuan ini\r\n",
+        "\x1b[2mperintah lain diteruskan ke /system/bin/sh (non-interaktif)\x1b[0m\r\n",
+    );
+
+    fn new() -> Self {
+        Self { line: String::new() }
+    }
+
+    fn banner() -> String {
+        format!(
+            "\r\n  \x1b[1;38;5;39mLeuwi Panjang\x1b[0m \x1b[2mAndroid\x1b[0m\r\n  \x1b[2m—————————————————————————————\x1b[0m\r\n  \x1b[2mketik \x1b[0mhelp\x1b[2m untuk daftar perintah, \x1b[0mnvgpu\x1b[2m untuk menyambung\x1b[0m\r\n\r\n"
+        )
+    }
 }
 
 impl TermTab {
@@ -297,22 +382,187 @@ impl TermTab {
     // frames later via start_pending_ssh() so launch never blocks or crashes.
     #[cfg(target_os = "android")]
     fn spawn(id: usize, cfg: &Config) -> Self {
-        let profile = cfg.ssh_profile_for_tab(id);
         let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
         {
             let mut g = grid.lock().unwrap_or_else(|e| e.into_inner());
-            let banner = format!(
-                "\r\n  \x1b[1;38;5;39mLeuwi Panjang\x1b[0m \x1b[2mAndroid\x1b[0m\r\n  \x1b[2m—————————————————————————————\x1b[0m\r\n  menyambung ke \x1b[1m{}@{}:{}\x1b[0m ...\r\n  \x1b[2m(pastikan WireGuard aktif)\x1b[0m\r\n",
-                profile.user, profile.host, profile.port);
-            g.process(banner.as_bytes());
+            g.process(Repl::banner().as_bytes());
+            g.process(Repl::PROMPT.as_bytes());
         }
         Self {
             grid,
             writer: None,
             ssh: None,
-            pending_profile: Some(profile),
-            title: format!("nvgpu {}", id),
+            pending_profile: None,
+            repl: Some(Repl::new()),
+            title: format!("leuwi {}", id),
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
+        }
+    }
+
+    /// Keystrokes belong to the built-in prompt whenever no session is attached.
+    #[cfg(target_os = "android")]
+    fn repl_active(&self) -> bool {
+        self.ssh.is_none() && self.repl.is_some()
+    }
+
+    /// Drop a finished SSH session and hand control back to the prompt.
+    #[cfg(target_os = "android")]
+    fn reap_finished_ssh(&mut self) {
+        let finished = self.ssh.as_ref().map(|h| h.is_done()).unwrap_or(false);
+        if finished {
+            self.ssh = None;
+            self.writer = None;
+            self.title = "leuwi".into();
+            let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
+            g.process(b"\r\n\x1b[2msesi berakhir\x1b[0m\r\n");
+            g.process(Repl::PROMPT.as_bytes());
+        }
+    }
+
+    /// Feed keystrokes to the built-in prompt: echo, edit, and run on Enter.
+    #[cfg(target_os = "android")]
+    fn repl_feed(&mut self, data: &[u8], cfg: &mut Config, tab_id: usize) {
+        let mut lines: Vec<String> = Vec::new();
+        {
+            let repl = match self.repl.as_mut() { Some(r) => r, None => return };
+            let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
+            for &b in data {
+                match b {
+                    b'\r' | b'\n' => {
+                        g.process(b"\r\n");
+                        lines.push(std::mem::take(&mut repl.line));
+                    }
+                    0x7f | 0x08 => {
+                        if repl.line.pop().is_some() {
+                            g.process(b"\x08 \x08");
+                        }
+                    }
+                    0x03 => {
+                        repl.line.clear();
+                        g.process(b"^C\r\n");
+                        g.process(Repl::PROMPT.as_bytes());
+                    }
+                    b if b >= 0x20 => {
+                        repl.line.push(b as char);
+                        g.process(&[b]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for line in lines {
+            self.repl_exec(line.trim(), cfg, tab_id);
+        }
+    }
+
+    /// Run one prompt line: built-ins first, anything else goes to the OS shell.
+    #[cfg(target_os = "android")]
+    fn repl_exec(&mut self, line: &str, cfg: &mut Config, tab_id: usize) {
+        let mut out = String::new();
+        let mut connect = false;
+        let mut suppress_prompt = false;
+        let mut argv = line.split_whitespace();
+        let cmd = argv.next().unwrap_or("");
+        let args: Vec<&str> = argv.collect();
+
+        // Name the tab after its first real command, unless it was renamed by hand.
+        // `nvgpu` overrides this below with the session name.
+        if !cmd.is_empty() && cmd != "rename" && self.title.starts_with("leuwi") {
+            self.title = cmd.to_string();
+        }
+
+        match cmd {
+            "" => {}
+            "help" | "?" => out.push_str(Repl::HELP),
+            "clear" => out.push_str("\x1b[2J\x1b[H"),
+            "rename" | "title" => match args.first() {
+                Some(name) => {
+                    self.title = (*name).to_string();
+                    out.push_str(&format!("\x1b[2mtab: {}\x1b[0m\r\n", name));
+                }
+                None => out.push_str("\x1b[2mpakai: rename <nama-tab>\x1b[0m\r\n"),
+            },
+            "exit" | "quit" => out.push_str("\x1b[2mtutup tab dengan tombol × di atas\x1b[0m\r\n"),
+            "keygen" => {
+                let path = ssh::default_key_path();
+                match ssh::generate_key(&path, "leuwi-panjang-android") {
+                    Ok(pubkey) => out.push_str(&format!(
+                        "\x1b[2mkey baru: {}\x1b[0m\r\n\r\n{}\r\n\r\n\x1b[2msalin baris di atas ke ~/.ssh/authorized_keys di server\x1b[0m\r\n",
+                        path.display(), pubkey)),
+                    Err(e) => out.push_str(&format!("\x1b[31m{}\x1b[0m\r\n", e)),
+                }
+            }
+            "config" => match args.split_first() {
+                None | Some((&"show", _)) => out.push_str(&format!(
+                    "\x1b[2mhost\x1b[0m    {}\r\n\x1b[2mport\x1b[0m    {}\r\n\x1b[2muser\x1b[0m    {}\r\n\x1b[2msession\x1b[0m {}\r\n\x1b[2mkey\x1b[0m     {}\r\n",
+                    cfg.ssh_host, cfg.ssh_port, cfg.ssh_user, cfg.ssh_session,
+                    ssh::default_key_path().display())),
+                Some((&"set", rest)) if rest.len() == 2 => {
+                    let (k, v) = (rest[0], rest[1]);
+                    match k {
+                        "host" => { cfg.ssh_host = v.into(); }
+                        "user" => { cfg.ssh_user = v.into(); }
+                        "session" => { cfg.ssh_session = v.into(); }
+                        "port" => match v.parse::<u16>() {
+                            Ok(p) => { cfg.ssh_port = p; }
+                            Err(_) => out.push_str("\x1b[31mport harus angka\x1b[0m\r\n"),
+                        },
+                        _ => out.push_str("\x1b[31mkunci: host | port | user | session\x1b[0m\r\n"),
+                    }
+                    if out.is_empty() {
+                        out.push_str(&format!("\x1b[2m{} = {}\x1b[0m\r\n", k, v));
+                    }
+                }
+                _ => out.push_str("\x1b[2mpakai: config show | config set <host|port|user|session> <nilai>\x1b[0m\r\n"),
+            },
+            other if other == cfg.ssh_cmd_connect => {
+                if let Some(sess) = args.first() {
+                    cfg.ssh_session = (*sess).to_string();
+                }
+                connect = true;
+            }
+            other if other == cfg.ssh_cmd_list => {
+                // `tmux ls` over SSH is blocking, so run it off the UI thread and let it
+                // print its own prompt when the answer arrives.
+                let profile = cfg.ssh_profile_for_tab(tab_id);
+                let grid = self.grid.clone();
+                suppress_prompt = true;
+                std::thread::spawn(move || {
+                    let text = match ssh::list_sessions(&profile) {
+                        Ok(s) if s.trim().is_empty() => "(tidak ada session)\r\n".to_string(),
+                        Ok(s) => s.replace(char::from(10), "\r\n"),
+                        Err(e) => format!("\x1b[31m{}\x1b[0m\r\n", e),
+                    };
+                    if let Ok(mut g) = grid.lock() {
+                        g.process(text.as_bytes());
+                        g.process(Repl::PROMPT.as_bytes());
+                    }
+                });
+            }
+            other => {
+                // Not a built-in: hand it to the OS shell. This is non-interactive
+                // (output is captured, no PTY), so `ls`/`cat`/`ps` work but `vim` does not.
+                match std::process::Command::new("/system/bin/sh").arg("-c").arg(line).output() {
+                    Ok(o) => {
+                        for chunk in [&o.stdout[..], &o.stderr[..]] {
+                            out.push_str(&String::from_utf8_lossy(chunk).replace(char::from(10), "\r\n"));
+                        }
+                    }
+                    Err(e) => out.push_str(&format!("\x1b[31m{}: {}\x1b[0m\r\n", other, e)),
+                }
+            }
+        }
+
+        {
+            let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
+            if !out.is_empty() { g.process(out.as_bytes()); }
+            if !connect && !suppress_prompt { g.process(Repl::PROMPT.as_bytes()); }
+        }
+        if connect {
+            let profile = cfg.ssh_profile_for_tab(tab_id);
+            self.title = format!("nvgpu {}", tab_id);
+            self.pending_profile = Some(profile);
+            self.start_pending_ssh();
         }
     }
 
@@ -1455,10 +1705,64 @@ live_design! {
                 font_size: 12.0
                 line_spacing: 1.3
                 font_family: {
-                    latin = font("crate://makepad-widgets/resources/LiberationMono-Regular.ttf", 0.0, 0.0)
+                    // JetBrains Mono Nerd Font: powerline/devicon glyphs live in the
+                    // Private Use Area, which LiberationMono lacks — p10k prompts and the
+                    // tmux status bar render as boxes without it.
+                    latin = font("makepad/leuwi_panjang/resources/JetBrainsMonoNerdFont-Regular.ttf", 0.0, 0.0)
                 }
             }
         }
+    }
+
+    // One key on the modifier bar. Sized to stay tappable across 8 keys on a phone.
+    KeyBtn = <Button> {
+        text: ""
+        width: Fill, height: 36
+        draw_text: { color: #xC5C8C6, text_style: { font_size: 10.5 } }
+        draw_bg: { color: #x30363D, fn pixel(self) -> vec4 { return mix(self.color, #x484F58, self.hover); } }
+        padding: { left: 2, right: 2, top: 4, bottom: 4 }
+    }
+
+    // A tappable row in the burger menu. Wide and tall enough for a thumb.
+    MenuRow = <Button> {
+        text: ""
+        width: Fill, height: 34
+        align: { x: 0.0, y: 0.5 }
+        draw_text: { color: #xC5C8C6, text_style: { font_size: 10.5 } }
+        draw_bg: { color: #x21262D, fn pixel(self) -> vec4 { return mix(self.color, #x30363D, self.hover); } }
+        padding: { left: 10, right: 8 }
+    }
+
+    FormLabel = <Label> {
+        width: Fill
+        text: ""
+        draw_text: { color: #x6E7681, text_style: { font_size: 8.5 } }
+    }
+
+    FormInput = <TextInput> {
+        width: Fill, height: 30
+        draw_text: { color: #xE6EDF3, text_style: { font_size: 10.0 } }
+        draw_bg: { color: #x0D1117 }
+    }
+
+    FormBtn = <Button> {
+        text: ""
+        width: Fill, height: 34
+        draw_text: { color: #xE6EDF3, text_style: { font_size: 10.5 } }
+        draw_bg: { color: #x238636, fn pixel(self) -> vec4 { return mix(self.color, #x2EA043, self.hover); } }
+        margin: { top: 6 }
+    }
+
+    // Vertical tab entry (Zen-browser style sidebar). Full-width and tall enough to
+    // stay comfortably tappable when many tabs are open, instead of cramming them
+    // into a horizontal strip.
+    VTabBtn = <Button> {
+        text: ""
+        width: Fill, height: 38
+        align: { x: 0.0, y: 0.5 }
+        draw_text: { color: #xC5C8C6, text_style: { font_size: 10.0 } }
+        draw_bg: { color: #x1E1E1E, fn pixel(self) -> vec4 { return mix(self.color, #x30363D80, self.hover); } }
+        padding: { left: 8, right: 6, top: 4, bottom: 4 }
     }
 
     // One touch-tappable tab button (Termius-style). Text + active marker are set
@@ -1483,12 +1787,13 @@ live_design! {
                 caption_label = <View> { visible: false, width: 0, height: 0 }
                 tabs = <View> {
                     width: Fill, height: Fill, flow: Right, align: { y: 0.5 }, padding: { left: 6 }
-                    tab0 = <TabBtn> {}
-                    tab1 = <TabBtn> {}
-                    tab2 = <TabBtn> {}
-                    tab3 = <TabBtn> {}
-                    tab4 = <TabBtn> {}
                     <View> { width: Fill, height: Fill }
+                    sidebar_btn = <Button> {
+                        // U+258C: the UI font lacks U+25A4, which rendered as blank.
+                        text: "▌", width: 30
+                        draw_text: { color: #x6E7681, text_style: { font_size: 13.0 } }
+                        draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #x30363D60, self.hover); } }
+                    }
                     close_btn = <Button> {
                         text: "×", width: 26
                         draw_text: { color: #x6E7681, text_style: { font_size: 15.0 } }
@@ -1521,15 +1826,120 @@ live_design! {
                     width: Fill, height: Fill, flow: Right
                     show_bg: true
                     draw_bg: { color: #x1E1E1E }
-                    terminal = <TermView> {}
-                    split_bar = <View> {
-                        visible: false
-                        width: 2, height: Fill
+                    tab_sidebar = <View> {
+                        width: 150, height: Fill, flow: Down
                         show_bg: true
-                        draw_bg: { color: #x444444 }
+                        draw_bg: { color: #x181818 }
+                        padding: { left: 5, right: 5, top: 6 }
+                        spacing: 4
+                        tab0 = <VTabBtn> {}
+                        tab1 = <VTabBtn> {}
+                        tab2 = <VTabBtn> {}
+                        tab3 = <VTabBtn> {}
+                        tab4 = <VTabBtn> {}
                     }
-                    terminal2 = <TermView> {
-                        width: 0, height: 0
+                    // Wrapped so the config panel can hide the whole terminal area at
+                    // once: set_visible has no effect on the TermView widget itself.
+                    term_area = <View> {
+                        width: Fill, height: Fill, flow: Right
+                        terminal = <TermView> {}
+                        split_bar = <View> {
+                            visible: false
+                            width: 2, height: Fill
+                            show_bg: true
+                            draw_bg: { color: #x444444 }
+                        }
+                        terminal2 = <TermView> {
+                            width: 0, height: 0
+                        }
+                    }
+                // Takes over the whole screen while open so the forms have room, and
+                // scrolls because they are taller than a phone. Closing restores the terminal.
+                // Full-screen settings page: vertical nav on the left picks the
+                // config type, the right column holds that section's form and scrolls.
+                menu_panel = <View> {
+                    visible: false
+                    width: Fill, height: Fill
+                    flow: Right
+                    show_bg: true
+                    draw_bg: { color: #x161B22 }
+
+                    cfg_nav = <View> {
+                        width: 132, height: Fill, flow: Down
+                        show_bg: true
+                        draw_bg: { color: #x0D1117 }
+                        padding: { top: 10, left: 6, right: 6 }
+                        spacing: 4
+                        menu_title = <Label> {
+                            text: "Konfigurasi"
+                            draw_text: { color: #x58A6FF, text_style: { font_size: 11.0 } }
+                        }
+                        menu_ver = <Label> {
+                            text: "v0.1.0-dev"
+                            draw_text: { color: #x6E7681, text_style: { font_size: 8.5 } }
+                            margin: { bottom: 8 }
+                        }
+                        m_profile = <MenuRow> { text: "Profil" }
+                        m_sshkey  = <MenuRow> { text: "SSH key" }
+                        m_keymap  = <MenuRow> { text: "Keymap" }
+                        <View> { width: Fill, height: Fill }
+                        btn_close = <MenuRow> { text: "< Tutup" }
+                    }
+
+                    cfg_body = <ScrollYView> {
+                        width: Fill, height: Fill, flow: Down
+                        padding: { top: 10, left: 12, right: 12 }
+                        spacing: 4
+
+                        sec_profile = <View> {
+                            visible: false
+                            width: Fill, height: Fit, flow: Down, spacing: 3
+                            <FormLabel> { text: "Nama perintah" }
+                            in_name = <FormInput> { empty_text: "nvgpu" }
+                            <FormLabel> { text: "Host / IP" }
+                            in_host = <FormInput> { empty_text: "10.0.0.1" }
+                            <FormLabel> { text: "Port" }
+                            in_port = <FormInput> { empty_text: "22" }
+                            <FormLabel> { text: "Username" }
+                            in_user = <FormInput> { empty_text: "user" }
+                            <FormLabel> { text: "Tmux session" }
+                            in_session = <FormInput> { empty_text: "main" }
+                            <FormLabel> { text: "Password (kosong = pakai SSH key)" }
+                            in_pass = <FormInput> { is_password: true, empty_text: "" }
+                            btn_save = <FormBtn> { text: "Simpan" }
+                            form_msg = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #x6E7681, text_style: { font_size: 9.0 } }
+                            }
+                        }
+
+                        sec_sshkey = <View> {
+                            visible: false
+                            width: Fill, height: Fit, flow: Down, spacing: 4
+                            key_info = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #xC5C8C6, text_style: { font_size: 9.0 } }
+                            }
+                            btn_keygen = <FormBtn> { text: "Generate key baru" }
+                            btn_showpub = <FormBtn> { text: "Tampilkan public key" }
+                            key_pub = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #x7EE787, text_style: { font_size: 8.0 } }
+                            }
+                        }
+
+                        sec_keymap = <View> {
+                            visible: false
+                            width: Fill, height: Fit, flow: Down
+                            menu_content = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #xC5C8C6, text_style: { font_size: 9.5 } }
+                            }
+                        }
                     }
                 }
 
@@ -1556,6 +1966,27 @@ live_design! {
                     }
                 }
 
+                // Modifier/navigation key bar. The Android soft keyboard has no Esc,
+                // Tab, Ctrl or arrows, which makes tmux and vim unusable; this supplies
+                // them. Ctrl/Alt are sticky: tap to arm, then the next character is sent
+                // with the modifier applied. Hidden on desktop, which has a real keyboard.
+                key_bar = <View> {
+                    width: Fill, height: 44, flow: Right
+                    show_bg: true
+                    draw_bg: { color: #x252526 }
+                    align: { y: 0.5 }
+                    padding: { left: 3, right: 3 }
+                    spacing: 3
+                    k_esc = <KeyBtn> { text: "Esc" }
+                    k_tab = <KeyBtn> { text: "Tab" }
+                    k_ctrl = <KeyBtn> { text: "Ctrl" }
+                    k_alt = <KeyBtn> { text: "Alt" }
+                    k_left = <KeyBtn> { text: "←" }
+                    k_down = <KeyBtn> { text: "↓" }
+                    k_up = <KeyBtn> { text: "↑" }
+                    k_right = <KeyBtn> { text: "→" }
+                }
+
                 // Status bar
                 status = <View> {
                     width: Fill, height: 22, flow: Right
@@ -1574,29 +2005,6 @@ live_design! {
                     }
                 }
 
-                // Menu panel (hidden, shown on ≡ click)
-                menu_panel = <View> {
-                    visible: false
-                    width: 260, height: Fill
-                    show_bg: true
-                    draw_bg: { color: #x181818 }
-                    flow: Down
-                    padding: { top: 10, left: 14, right: 14 }
-
-                    menu_title = <Label> {
-                        text: "Leuwi Panjang"
-                        draw_text: { color: #x58A6FF, text_style: { font_size: 12.0 } }
-                    }
-                    menu_ver = <Label> {
-                        text: "v0.1.0-dev"
-                        draw_text: { color: #x6E7681, text_style: { font_size: 9.0 } }
-                        margin: { bottom: 10 }
-                    }
-                    menu_content = <Label> {
-                        width: Fill
-                        text: ""
-                        draw_text: { color: #xC5C8C6, text_style: { font_size: 10.0 } }
-                    }
                 }
             }
         }
@@ -1623,6 +2031,11 @@ pub struct App {
     #[rust] search_query: String,
     #[rust] search_matches: Vec<(usize, usize)>,  // (abs_row, col)
     #[rust] search_idx: usize,
+    // Sticky modifiers armed from the on-screen key bar (Android).
+    // Vertical tab sidebar can be collapsed so it does not eat phone screen.
+    #[rust] sidebar_hidden: bool,
+    #[rust] ctrl_pending: bool,
+    #[rust] alt_pending: bool,
 }
 
 impl LiveRegister for App {
@@ -1701,6 +2114,40 @@ impl App {
         set_tab!(tab2, 2);
         set_tab!(tab3, 3);
         set_tab!(tab4, 4);
+    }
+
+    /// Show which sticky modifiers are armed, so the bar reflects real state.
+    fn update_modifier_labels(&mut self, cx: &mut Cx) {
+        let ctrl = if self.ctrl_pending { "Ctrl*" } else { "Ctrl" };
+        let alt = if self.alt_pending { "Alt*" } else { "Alt" };
+        self.ui.button(id!(k_ctrl)).set_text(cx, ctrl);
+        self.ui.button(id!(k_alt)).set_text(cx, alt);
+        self.ui.redraw(cx);
+    }
+
+    /// Fold any armed sticky modifier into freshly typed text, then disarm it.
+    fn apply_sticky_modifiers(&mut self, cx: &mut Cx, input: &str) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        if self.ctrl_pending {
+            // Ctrl-<key> is the character with the upper bits cleared (a -> 0x01).
+            let mut chars = input.chars();
+            if let Some(c) = chars.next() {
+                out.push((c.to_ascii_uppercase() as u8) & 0x1f);
+            }
+            out.extend_from_slice(chars.as_str().as_bytes());
+        } else {
+            out.extend_from_slice(input.as_bytes());
+        }
+        if self.alt_pending {
+            // Alt-<key> is conventionally sent as ESC followed by the key.
+            out.insert(0, 0x1b);
+        }
+        if self.ctrl_pending || self.alt_pending {
+            self.ctrl_pending = false;
+            self.alt_pending = false;
+            self.update_modifier_labels(cx);
+        }
+        out
     }
 
     /// Switch to tab `i` by touch (or Alt+N). No-op if out of range.
@@ -1893,6 +2340,134 @@ impl App {
         String::new()
     }
 
+    /// Open or close the config panel. It covers the terminal so the forms are
+    /// readable on a phone; closing brings the terminal back exactly as it was.
+    fn set_menu_open(&mut self, cx: &mut Cx, open: bool) {
+        self.menu_open = open;
+        self.ui.view(id!(menu_panel)).set_visible(cx, open);
+        // Hiding the whole panes row (terminal + tab sidebar) lets the settings
+        // page own the screen; the key bar goes too since there is nothing to type into.
+        self.ui.view(id!(panes)).set_visible(cx, !open);
+        self.ui.view(id!(key_bar)).set_visible(cx, !open && cfg!(target_os = "android"));
+        self.ui.widget(id!(tab_sidebar)).set_visible(cx, !open && !self.sidebar_hidden);
+        if open {
+            self.show_menu_section(cx, "profile");
+        }
+        self.ui.redraw(cx);
+    }
+
+    /// Swap which burger-menu section is on screen and fill it with current values.
+    fn show_menu_section(&mut self, cx: &mut Cx, which: &str) {
+        self.ui.view(id!(sec_profile)).set_visible(cx, which == "profile");
+        self.ui.view(id!(sec_sshkey)).set_visible(cx, which == "sshkey");
+        self.ui.view(id!(sec_keymap)).set_visible(cx, which == "keymap");
+
+        match which {
+            "profile" => {
+                let host = self.config.ssh_host.clone();
+                let port = self.config.ssh_port.to_string();
+                let user = self.config.ssh_user.clone();
+                let session = self.config.ssh_session.clone();
+                let pass = self.config.ssh_password.clone();
+                self.ui.widget(id!(in_name)).set_text(cx, "nvgpu");
+                self.ui.widget(id!(in_host)).set_text(cx, &host);
+                self.ui.widget(id!(in_port)).set_text(cx, &port);
+                self.ui.widget(id!(in_user)).set_text(cx, &user);
+                self.ui.widget(id!(in_session)).set_text(cx, &session);
+                self.ui.widget(id!(in_pass)).set_text(cx, &pass);
+                self.ui.widget(id!(form_msg)).set_text(cx, "");
+            }
+            "sshkey" => {
+                let path = Self::ssh_key_path_display();
+                let exists = std::path::Path::new(&path).is_file();
+                let info = format!(
+                    "key: {}\nstatus: {}",
+                    path,
+                    if exists { "ada" } else { "belum ada — tekan Generate" }
+                );
+                self.ui.widget(id!(key_info)).set_text(cx, &info);
+                self.ui.widget(id!(key_pub)).set_text(cx, "");
+            }
+            _ => self.show_menu(cx),
+        }
+        self.ui.redraw(cx);
+    }
+
+    /// Where the SSH key lives, as text for the key section.
+    fn ssh_key_path_display() -> String {
+        #[cfg(target_os = "android")]
+        {
+            ssh::default_key_path().display().to_string()
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            "~/.ssh/id_rsa".to_string()
+        }
+    }
+
+    /// Persist what the user typed in the connection form.
+    fn save_profile_form(&mut self, cx: &mut Cx) {
+        let host = self.ui.widget(id!(in_host)).text();
+        let port = self.ui.widget(id!(in_port)).text();
+        let user = self.ui.widget(id!(in_user)).text();
+        let session = self.ui.widget(id!(in_session)).text();
+        let pass = self.ui.widget(id!(in_pass)).text();
+
+        if !port.trim().is_empty() {
+            match port.trim().parse::<u16>() {
+                Ok(p) => self.config.ssh_port = p,
+                Err(_) => {
+                    self.ui.widget(id!(form_msg)).set_text(cx, "port harus angka 1-65535");
+                    self.ui.redraw(cx);
+                    return;
+                }
+            }
+        }
+        if !host.trim().is_empty() { self.config.ssh_host = host.trim().to_string(); }
+        if !user.trim().is_empty() { self.config.ssh_user = user.trim().to_string(); }
+        if !session.trim().is_empty() { self.config.ssh_session = session.trim().to_string(); }
+        self.config.ssh_password = pass;
+
+        let msg = match self.config.save() {
+            Ok(()) => "tersimpan — berlaku untuk tab baru".to_string(),
+            Err(e) => format!("gagal: {e}"),
+        };
+        self.ui.widget(id!(form_msg)).set_text(cx, &msg);
+        self.ui.redraw(cx);
+    }
+
+    /// Generate a fresh keypair and show the public half to paste into the server.
+    fn run_keygen(&mut self, cx: &mut Cx) {
+        #[cfg(target_os = "android")]
+        {
+            let path = ssh::default_key_path();
+            let text = match ssh::generate_key(&path, "leuwi-panjang-android") {
+                Ok(pubkey) => format!("{}\n\nsalin ke ~/.ssh/authorized_keys di server", pubkey),
+                Err(e) => format!("gagal: {e}"),
+            };
+            self.ui.widget(id!(key_pub)).set_text(cx, &text);
+            self.show_menu_section(cx, "sshkey");
+            self.ui.widget(id!(key_pub)).set_text(cx, &text);
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            self.ui.widget(id!(key_pub)).set_text(cx, "keygen hanya di Android");
+        }
+        self.ui.redraw(cx);
+    }
+
+    /// Show the existing public key without regenerating anything.
+    fn show_public_key(&mut self, cx: &mut Cx) {
+        let path = Self::ssh_key_path_display();
+        let pub_path = format!("{}.pub", path);
+        let text = match std::fs::read_to_string(&pub_path) {
+            Ok(k) => k.trim().to_string(),
+            Err(e) => format!("tidak bisa baca {}: {}", pub_path, e),
+        };
+        self.ui.widget(id!(key_pub)).set_text(cx, &text);
+        self.ui.redraw(cx);
+    }
+
     fn show_menu(&self, cx: &mut Cx) {
         let menu = format!(
 "━━━ KEY MAP ━━━━━━━━━━━━━━━━━━━━
@@ -1962,18 +2537,38 @@ impl App {
             if let Some(split) = &mut self.tabs[self.active_tab].split {
                 split.write(data);
             }
-        } else if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.write(data);
+        } else {
+            let active = self.active_tab;
+            // On Android a tab sits at the built-in prompt until a session starts,
+            // so route keystrokes there first.
+            #[cfg(target_os = "android")]
+            {
+                let cfg = &mut self.config;
+                if let Some(tab) = self.tabs.get_mut(active) {
+                    if tab.repl_active() {
+                        tab.repl_feed(data, cfg, active);
+                        return;
+                    }
+                }
+            }
+            if let Some(tab) = self.tabs.get_mut(active) {
+                tab.write(data);
+            }
         }
     }
 
     fn handle_resize(&mut self, width: f64, height: f64) {
         let chrome_h = 32.0 + 22.0; // caption + status bar
         let search_h = if self.search_open { 28.0 } else { 0.0 };
+        // The vertical tab sidebar and (on Android) the modifier key bar take space away
+        // from the grid. Without accounting for them the terminal reflows wider/taller
+        // than its pane and the text runs off the edge.
+        let sidebar_w = if self.sidebar_hidden { 0.0 } else { 150.0 };
+        let key_bar_h = if cfg!(target_os = "android") { 44.0 } else { 0.0 };
         let cw = self.config.cell_width;
         let ch = self.config.cell_height;
-        let avail_w = width - 24.0;
-        let avail_h = height - chrome_h - search_h;
+        let avail_w = width - 24.0 - sidebar_w;
+        let avail_h = height - chrome_h - search_h - key_bar_h;
         let full_cols = (avail_w / cw).max(20.0) as usize;
         let full_rows = (avail_h / ch).max(5.0) as usize;
 
@@ -2024,6 +2619,36 @@ impl MatchEvent for App {
         if self.ui.button(id!(tab2)).clicked(&actions) { self.goto_tab(cx, 2); }
         if self.ui.button(id!(tab3)).clicked(&actions) { self.goto_tab(cx, 3); }
         if self.ui.button(id!(tab4)).clicked(&actions) { self.goto_tab(cx, 4); }
+
+        // On-screen modifier bar: Esc/Tab/arrows send immediately; Ctrl and Alt arm a
+        // sticky modifier that is applied to the next character typed.
+        // Burger menu is a real navigator now: each row swaps the section below it.
+        if self.ui.button(id!(btn_close)).clicked(&actions) { self.set_menu_open(cx, false); }
+        if self.ui.button(id!(m_profile)).clicked(&actions) { self.show_menu_section(cx, "profile"); }
+        if self.ui.button(id!(m_sshkey)).clicked(&actions) { self.show_menu_section(cx, "sshkey"); }
+        if self.ui.button(id!(m_keymap)).clicked(&actions) { self.show_menu_section(cx, "keymap"); }
+        if self.ui.button(id!(btn_save)).clicked(&actions) { self.save_profile_form(cx); }
+        if self.ui.button(id!(btn_keygen)).clicked(&actions) { self.run_keygen(cx); }
+        if self.ui.button(id!(btn_showpub)).clicked(&actions) { self.show_public_key(cx); }
+        if self.ui.button(id!(sidebar_btn)).clicked(&actions) {
+            self.sidebar_hidden = !self.sidebar_hidden;
+            self.ui.widget(id!(tab_sidebar)).set_visible(cx, !self.sidebar_hidden);
+            self.ui.redraw(cx);
+        }
+        if self.ui.button(id!(k_esc)).clicked(&actions) { self.write_to_active(b"\x1b"); }
+        if self.ui.button(id!(k_tab)).clicked(&actions) { self.write_to_active(b"\t"); }
+        if self.ui.button(id!(k_left)).clicked(&actions) { self.write_to_active(b"\x1b[D"); }
+        if self.ui.button(id!(k_down)).clicked(&actions) { self.write_to_active(b"\x1b[B"); }
+        if self.ui.button(id!(k_up)).clicked(&actions) { self.write_to_active(b"\x1b[A"); }
+        if self.ui.button(id!(k_right)).clicked(&actions) { self.write_to_active(b"\x1b[C"); }
+        if self.ui.button(id!(k_ctrl)).clicked(&actions) {
+            self.ctrl_pending = !self.ctrl_pending;
+            self.update_modifier_labels(cx);
+        }
+        if self.ui.button(id!(k_alt)).clicked(&actions) {
+            self.alt_pending = !self.alt_pending;
+            self.update_modifier_labels(cx);
+        }
         // Touch: × closes the active tab (keeps at least one open).
         if self.ui.button(id!(close_btn)).clicked(&actions) {
             if self.tabs.len() > 1 { self.close_active_tab(cx); }
@@ -2032,9 +2657,8 @@ impl MatchEvent for App {
             self.new_tab(cx);
         }
         if self.ui.button(id!(menu_btn)).clicked(&actions) {
-            self.menu_open = !self.menu_open;
-            self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
-            if self.menu_open { self.show_menu(cx); }
+            let open = !self.menu_open;
+            self.set_menu_open(cx, open);
             self.ui.redraw(cx);
         }
     }
@@ -2050,10 +2674,19 @@ impl AppMain for App {
                 // Start deferred SSH connections ~0.5s after launch (off the
                 // startup/first-paint path). New tabs connect on the next tick.
                 self.boot_frames = self.boot_frames.saturating_add(1);
+                #[cfg(not(target_os = "android"))]
+                if self.boot_frames == 1 {
+                    self.ui.widget(id!(key_bar)).set_visible(cx, false);
+                }
                 if self.boot_frames > 15 {
                     for tab in &mut self.tabs {
                         tab.start_pending_ssh();
                     }
+                }
+                // A finished SSH session hands the tab back to the built-in prompt.
+                #[cfg(target_os = "android")]
+                for tab in &mut self.tabs {
+                    tab.reap_finished_ssh();
                 }
                 // Flush response buffer (DA, DSR replies to PTY)
                 if let Some(tab) = self.tabs.get_mut(self.active_tab) {
@@ -2138,8 +2771,7 @@ impl AppMain for App {
                         return;
                     }
                     if self.menu_open {
-                        self.menu_open = false;
-                        self.ui.view(id!(menu_panel)).set_visible(cx, false);
+                        self.set_menu_open(cx, false);
                         self.ui.redraw(cx);
                         return;
                     }
@@ -2192,9 +2824,8 @@ impl AppMain for App {
                         }
                         KeyCode::KeyM => {
                             // Toggle menu
-                            self.menu_open = !self.menu_open;
-                            self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
-                            if self.menu_open { self.show_menu(cx); }
+                            let open = !self.menu_open;
+                            self.set_menu_open(cx, open);
                             self.ui.redraw(cx);
                             return;
                         }
@@ -2269,7 +2900,9 @@ impl AppMain for App {
                         self.update_search(cx);
                     }
                 } else if !te.input.is_empty() && !te.was_paste {
-                    self.write_to_active(te.input.as_bytes());
+                    let input = te.input.clone();
+                    let bytes = self.apply_sticky_modifiers(cx, &input);
+                    self.write_to_active(&bytes);
                     self.ui.term_view(id!(terminal)).reset_scroll();
                 }
             }
@@ -2279,9 +2912,8 @@ impl AppMain for App {
                     let win_w = 1100.0; // approximate, TODO: get actual
                     // ≡ button area: right side before window controls (~120px from right)
                     if me.abs.x > win_w - 180.0 && me.abs.x < win_w - 140.0 {
-                        self.menu_open = !self.menu_open;
-                        self.ui.view(id!(menu_panel)).set_visible(cx, self.menu_open);
-                        if self.menu_open { self.show_menu(cx); }
+                        let open = !self.menu_open;
+                        self.set_menu_open(cx, open);
                         self.ui.redraw(cx);
                     }
                     // + button area
@@ -2289,8 +2921,7 @@ impl AppMain for App {
                         self.new_tab(cx);
                     }
                 } else if self.menu_open {
-                    self.menu_open = false;
-                    self.ui.view(id!(menu_panel)).set_visible(cx, false);
+                    self.set_menu_open(cx, false);
                     self.ui.redraw(cx);
                 } else {
                     // Send mouse click to PTY if mouse reporting enabled

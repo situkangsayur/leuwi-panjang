@@ -12,6 +12,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +29,8 @@ pub struct SshProfile {
     pub port: u16,
     pub user: String,
     pub key_path: PathBuf,
+    /// Password auth. Empty means use `key_path` instead.
+    pub password: String,
     /// tmux session name for `tmux new -A -s <session>` (attach-or-create).
     pub session: String,
     /// Full remote startup command. When `None`, defaults to
@@ -49,6 +52,7 @@ impl SshProfile {
             port: 1313,
             user: "hendri".into(),
             key_path: default_key_path(),
+            password: String::new(),
             session: if session.is_empty() { "main".into() } else { session.into() },
             startup: None,
             known_hosts: default_known_hosts(),
@@ -81,12 +85,96 @@ impl SshProfile {
     }
 }
 
+// Android has no home directory: `dirs::home_dir()` comes back empty and the process CWD
+// is `/`, so the desktop defaults below would resolve to an unwritable `/.ssh/id_rsa` and
+// `/leuwi-panjang/known_hosts`. Anchor both on the app`s own directories instead.
+#[cfg(target_os = "android")]
+const ANDROID_FILES_DIR: &str = "/sdcard/Android/data/com.situkangsayur.leuwipanjang/files";
+#[cfg(target_os = "android")]
+const ANDROID_DATA_DIR: &str = "/data/user/0/com.situkangsayur.leuwipanjang";
+
+/// Where to look for the private key on Android, in order. The external files dir comes
+/// first because the user can drop a key there with a file manager or `adb push` without
+/// root; the private data dir is the more secure spot for a key we provision ourselves.
+#[cfg(target_os = "android")]
+pub(crate) fn default_key_path() -> PathBuf {
+    let candidates = [
+        format!("{ANDROID_FILES_DIR}/id_ed25519"),
+        format!("{ANDROID_FILES_DIR}/id_rsa"),
+        format!("{ANDROID_DATA_DIR}/ssh/id_ed25519"),
+        format!("{ANDROID_DATA_DIR}/ssh/id_rsa"),
+    ];
+    for c in &candidates {
+        let p = PathBuf::from(c);
+        if p.is_file() {
+            return p;
+        }
+    }
+    // None present yet: return the preferred location so the "load key <path>" error tells
+    // the user exactly where to put it.
+    PathBuf::from(format!("{ANDROID_FILES_DIR}/id_ed25519"))
+}
+
+#[cfg(not(target_os = "android"))]
 fn default_key_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/home/hendri"))
         .join(".ssh/id_rsa")
 }
 
+/// Generate a fresh ed25519 keypair at `path` (replacing any existing one) and return
+/// the public key line to install in the server's `authorized_keys`. Used by the built-in
+/// `keygen` command so a phone can be enrolled without going through a laptop.
+///
+/// The seed is read straight from `/dev/urandom` rather than going through a rand_core
+/// `OsRng`: ssh-key and russh pull in different rand_core majors, so the trait bounds
+/// don't line up, and a 32-byte seed needs no RNG plumbing at all.
+#[cfg(target_os = "android")]
+pub(crate) fn generate_key(path: &Path, comment: &str) -> Result<String, String> {
+    use russh::keys::ssh_key::private::Ed25519Keypair;
+    use russh::keys::ssh_key::LineEnding;
+    use russh::keys::PrivateKey;
+
+    let mut seed = [0u8; 32];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open("/dev/urandom")
+            .map_err(|e| format!("open /dev/urandom: {e}"))?;
+        f.read_exact(&mut seed)
+            .map_err(|e| format!("read /dev/urandom: {e}"))?;
+    }
+
+    let mut key = PrivateKey::from(Ed25519Keypair::from_seed(&seed));
+    key.set_comment(comment);
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let pem = key
+        .to_openssh(LineEnding::LF)
+        .map_err(|e| format!("encode key: {e}"))?;
+    std::fs::write(path, pem.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    // Best effort: keep the private key unreadable by other apps.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let pubkey = key
+        .public_key()
+        .to_openssh()
+        .map_err(|e| format!("encode public key: {e}"))?;
+    let _ = std::fs::write(path.with_extension("pub"), format!("{pubkey}\n"));
+    Ok(pubkey)
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn default_known_hosts() -> PathBuf {
+    PathBuf::from(format!("{ANDROID_DATA_DIR}/known_hosts"))
+}
+
+#[cfg(not(target_os = "android"))]
 fn default_known_hosts() -> PathBuf {
     dirs::config_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
@@ -193,19 +281,26 @@ async fn connect_auth(p: &SshProfile) -> Result<client::Handle<Client>, String> 
                 .unwrap_or_else(|| format!("connect {}:{} failed: {}", p.host, p.port, e))
         })?;
 
-    let key = load_secret_key(&p.key_path, None)
-        .map_err(|e| format!("load key {}: {}", p.key_path.display(), e))?;
-    let hash = handle
-        .best_supported_rsa_hash()
-        .await
-        .map_err(|e| format!("rsa hash negotiation: {}", e))?
-        .flatten();
-    let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
-
-    let auth = handle
-        .authenticate_publickey(&p.user, key)
-        .await
-        .map_err(|e| format!("auth error: {}", e))?;
+    // A password in the profile wins; otherwise authenticate with the key.
+    let auth = if !p.password.is_empty() {
+        handle
+            .authenticate_password(&p.user, &p.password)
+            .await
+            .map_err(|e| format!("auth error: {}", e))?
+    } else {
+        let key = load_secret_key(&p.key_path, None)
+            .map_err(|e| format!("load key {}: {}", p.key_path.display(), e))?;
+        let hash = handle
+            .best_supported_rsa_hash()
+            .await
+            .map_err(|e| format!("rsa hash negotiation: {}", e))?
+            .flatten();
+        let key = PrivateKeyWithHashAlg::new(Arc::new(key), hash);
+        handle
+            .authenticate_publickey(&p.user, key)
+            .await
+            .map_err(|e| format!("auth error: {}", e))?
+    };
     if !auth.success() {
         return Err(format!("authentication failed for {}@{}", p.user, p.host));
     }
@@ -252,9 +347,16 @@ enum InMsg {
 /// the remote; `resize` forwards SIGWINCH; dropping/close tears the channel down.
 pub struct SshHandle {
     tx: mpsc::UnboundedSender<InMsg>,
+    /// Set by the worker when the session ends (clean exit or error), so the tab
+    /// can drop this handle and return to the built-in prompt.
+    done: Arc<AtomicBool>,
 }
 
 impl SshHandle {
+    /// True once the SSH worker has finished — the tab should fall back to the prompt.
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Relaxed)
+    }
     pub fn writer(&self) -> SshWriter {
         SshWriter { tx: self.tx.clone() }
     }
@@ -290,6 +392,8 @@ where
     S: FnMut(&[u8]) + Send + 'static,
 {
     let (tx, rx) = mpsc::unbounded_channel::<InMsg>();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_worker = done.clone();
     // Spawn best-effort: never panic the caller (UI thread) if the OS refuses a
     // thread. The whole worker body is caught so an SSH/tokio/ring panic can't
     // escape and abort the process.
@@ -307,15 +411,17 @@ where
                 rt.block_on(async move {
                     if let Err(e) = run_session(&profile, &mut sink, rx).await {
                         sink(format!("\r\n\x1b[31m{}\x1b[0m\r\n", e).as_bytes());
-                        sink(b"\x1b[2mtekan tombol untuk mencoba ulang (tutup & buka tab)\x1b[0m\r\n");
                     }
                 });
             }));
+            // Whatever happened (ok, error, or caught panic), the session is over.
+            done_worker.store(true, Ordering::Relaxed);
         });
     if spawned.is_err() {
+        done.store(true, Ordering::Relaxed);
         // Extremely unlikely, but degrade gracefully instead of panicking.
     }
-    SshHandle { tx }
+    SshHandle { tx, done }
 }
 
 async fn run_session<S>(
