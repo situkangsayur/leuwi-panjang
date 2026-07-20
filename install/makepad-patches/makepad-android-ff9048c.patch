@@ -1,0 +1,104 @@
+diff --git a/platform/src/os/linux/android/android_jni.rs b/platform/src/os/linux/android/android_jni.rs
+index 10305bf..0bd6f18 100644
+--- a/platform/src/os/linux/android/android_jni.rs
++++ b/platform/src/os/linux/android/android_jni.rs
+@@ -687,8 +687,16 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_onWebSocketError(
+ }
+ 
+ unsafe fn jstring_to_string(env: *mut jni_sys::JNIEnv, java_string: jni_sys::jstring) -> String {
++    // A null jstring (some Build.* fields can be null on emulators / certain ROMs)
++    // must not reach GetStringUTFChars — with CheckJNI (debug builds) that aborts.
++    if java_string.is_null() {
++        return String::new();
++    }
+     let chars = (**env).GetStringUTFChars.unwrap()(env, java_string, std::ptr::null_mut());
+-    let rust_string = std::ffi::CStr::from_ptr(chars).to_str().unwrap().to_string();
++    if chars.is_null() {
++        return String::new();
++    }
++    let rust_string = std::ffi::CStr::from_ptr(chars).to_str().unwrap_or("").to_string();
+     (**env).ReleaseStringUTFChars.unwrap()(env, java_string, chars);
+     rust_string
+ }
+diff --git a/platform/src/os/linux/libc_sys.rs b/platform/src/os/linux/libc_sys.rs
+index 16fa9bd..dd6dc5a 100644
+--- a/platform/src/os/linux/libc_sys.rs
++++ b/platform/src/os/linux/libc_sys.rs
+@@ -39,6 +39,11 @@ pub struct fd_set {
+ 
+ pub const RTLD_LAZY: c_int = 1;
+ pub const RTLD_LOCAL: c_int = 0;
++// gettid syscall number is arch-specific: 178 on the generic table (aarch64/arm),
++// but 186 on x86_64 (where 178 is the obsolete query_module → seccomp SIGSYS).
++#[cfg(target_arch = "x86_64")]
++pub const SYS_GETTID: c_long = 186;
++#[cfg(not(target_arch = "x86_64"))]
+ pub const SYS_GETTID: c_long = 178;
+     
+ extern "C"{
+diff --git a/platform/src/os/linux/opengl.rs b/platform/src/os/linux/opengl.rs
+index e2acc71..15217fd 100644
+--- a/platform/src/os/linux/opengl.rs
++++ b/platform/src/os/linux/opengl.rs
+@@ -1025,8 +1025,9 @@ pub fn new(gl:&LibGl, vertex: &str, pixel: &str, os_type: &OsType) -> Self {
+         mat2 transpose(mat2 m){{return mat2(m[0][0],m[1][0],m[0][1],m[1][1]);}}
+         ";
+         */
+-        let vertex = format!("
+-            {version}
++        // NOTE: `#version` MUST be the very first token of the shader — strict GLES
++        // drivers (Android emulator, many Adreno/Mali) reject it on any later line.
++        let vertex = format!("{version}
+             {vertex_exts}
+             {tex_ext_import}
+             precision highp float;
+@@ -1037,8 +1038,7 @@ pub fn new(gl:&LibGl, vertex: &str, pixel: &str, os_type: &OsType) -> Self {
+             {vertex}\0",
+         );
+         //crate::log!("{}", vertex.replace("int mvo = 0;","int mvo = gl_ViewID_OVR==0?0:16;"));
+-        let pixel = format!("
+-            {version}
++        let pixel = format!("{version}
+             {pixel_exts}
+             {tex_ext_import}
+             #extension GL_OES_standard_derivatives : enable
+diff --git a/platform/src/os/linux/openxr_sys.rs b/platform/src/os/linux/openxr_sys.rs
+index 2fd9886..cea6daf 100644
+--- a/platform/src/os/linux/openxr_sys.rs
++++ b/platform/src/os/linux/openxr_sys.rs
+@@ -2720,12 +2720,12 @@ fn default()->Self{
+ 
+ pub fn xr_string(slc:&[c_char])->&str{
+     let slc_end = slc.iter().position(|v| *v == 0).unwrap();
+-    std::str::from_utf8(&slc[0..slc_end]).unwrap_or("")
++    std::str::from_utf8(unsafe{&*(&slc[0..slc_end] as *const [c_char] as *const [u8])}).unwrap_or("")
+ }
+ 
+ pub fn xr_string_zero_terminated(slc:&[c_char])->&str{
+     let slc_end = slc.iter().position(|v| *v == 0).unwrap();
+-    std::str::from_utf8(&slc[0..slc_end+1]).unwrap_or("")
++    std::str::from_utf8(unsafe{&*(&slc[0..slc_end+1] as *const [c_char] as *const [u8])}).unwrap_or("")
+ }
+ 
+ pub fn xr_array_fetch<T, F>(default:T, f:F)->Result<Vec<T>, String> where
+@@ -2741,9 +2741,9 @@ pub fn xr_array_fetch<T, F>(default:T, f:F)->Result<Vec<T>, String> where
+ }
+ 
+ pub fn xr_to_string<const N:usize>(v: &str)->[c_char;N]{
+-    let mut ret = [0u8;N];
++    let mut ret = [0 as c_char;N];
+     for (i,c) in v.bytes().enumerate(){
+-        ret[i] = c;
++        ret[i] = c as c_char;
+     }
+     ret
+ }
+@@ -2751,7 +2751,7 @@ pub fn xr_array_fetch<T, F>(default:T, f:F)->Result<Vec<T>, String> where
+ pub fn xr_static_str_array<const N:usize>(v: &[&'static str;N])->[*const c_char;N]{
+     let mut ret = [0 as *const c_char;N];
+     for (i,c) in v.iter().enumerate(){
+-        ret[i] = c.as_ptr();
++        ret[i] = c.as_ptr() as *const c_char;
+     }
+     ret
+ }
