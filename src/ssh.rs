@@ -110,9 +110,11 @@ pub(crate) fn default_key_path() -> PathBuf {
             return p;
         }
     }
-    // None present yet: return the preferred location so the "load key <path>" error tells
-    // the user exactly where to put it.
-    PathBuf::from(format!("{ANDROID_FILES_DIR}/id_ed25519"))
+    // None present yet. Point at the app-private dir, not the external one: this path is
+    // also where the config form writes keys it generates, and a private key on
+    // /sdcard is readable by anything holding storage access. (dev.21 dropped the
+    // storage permissions entirely, so we cannot rely on that dir being ours anyway.)
+    PathBuf::from(format!("{ANDROID_DATA_DIR}/ssh/id_ed25519"))
 }
 
 #[cfg(not(target_os = "android"))]

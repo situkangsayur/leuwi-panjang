@@ -497,6 +497,14 @@ struct TermTab {
 #[cfg(target_os = "android")]
 struct Repl {
     line: String,
+    /// Previously run lines, oldest first. Walked with the arrow keys.
+    history: Vec<String>,
+    /// Where we are in `history` while browsing; `None` = editing a fresh line.
+    hist_pos: Option<usize>,
+    /// Escape-sequence parser state: 0 = none, 1 = saw ESC, 2 = saw ESC `[`.
+    /// Without this the `[` and `A` of an arrow key fall through to the printable
+    /// branch and get typed into the line.
+    esc: u8,
 }
 
 #[cfg(target_os = "android")]
@@ -529,7 +537,15 @@ impl Repl {
     }
 
     fn new() -> Self {
-        Self { line: String::new() }
+        Self { line: String::new(), history: Vec::new(), hist_pos: None, esc: 0 }
+    }
+
+    /// Redraw the prompt and the current line in place, after history replaced it.
+    fn redraw_line(&self, g: &mut TermGrid) {
+        g.process(b"\r");
+        g.process(Repl::PROMPT.as_bytes());
+        g.process(self.line.as_bytes());
+        g.process(b"\x1b[K");
     }
 
     fn banner() -> String {
@@ -590,10 +606,54 @@ impl TermTab {
             let repl = match self.repl.as_mut() { Some(r) => r, None => return };
             let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
             for &b in data {
+                // Arrow keys arrive as ESC [ A / ESC [ B. Consume them here, before the
+                // printable branch below would echo their bytes as text.
+                if repl.esc == 1 {
+                    repl.esc = if b == b'[' { 2 } else { 0 };
+                    continue;
+                }
+                if repl.esc == 2 {
+                    repl.esc = 0;
+                    match b {
+                        b'A' if !repl.history.is_empty() => {
+                            let idx = match repl.hist_pos {
+                                None => repl.history.len() - 1,
+                                Some(0) => 0,
+                                Some(i) => i - 1,
+                            };
+                            repl.hist_pos = Some(idx);
+                            repl.line = repl.history[idx].clone();
+                            repl.redraw_line(&mut g);
+                        }
+                        b'B' => match repl.hist_pos {
+                            Some(i) if i + 1 < repl.history.len() => {
+                                repl.hist_pos = Some(i + 1);
+                                repl.line = repl.history[i + 1].clone();
+                                repl.redraw_line(&mut g);
+                            }
+                            // Past the newest entry: back to an empty fresh line.
+                            Some(_) => {
+                                repl.hist_pos = None;
+                                repl.line.clear();
+                                repl.redraw_line(&mut g);
+                            }
+                            None => {}
+                        },
+                        _ => {}
+                    }
+                    continue;
+                }
                 match b {
+                    0x1b => { repl.esc = 1; }
                     b'\r' | b'\n' => {
                         g.process(b"\r\n");
-                        lines.push(std::mem::take(&mut repl.line));
+                        let line = std::mem::take(&mut repl.line);
+                        // Skip blanks and immediate repeats, the way a shell does.
+                        if !line.trim().is_empty() && repl.history.last() != Some(&line) {
+                            repl.history.push(line.clone());
+                        }
+                        repl.hist_pos = None;
+                        lines.push(line);
                     }
                     0x7f | 0x08 => {
                         if repl.line.pop().is_some() {
@@ -602,6 +662,7 @@ impl TermTab {
                     }
                     0x03 => {
                         repl.line.clear();
+                        repl.hist_pos = None;
                         g.process(b"^C\r\n");
                         g.process(Repl::PROMPT.as_bytes());
                     }
