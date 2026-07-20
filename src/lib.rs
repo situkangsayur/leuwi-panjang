@@ -566,6 +566,9 @@ struct TermTab {
     #[cfg(target_os = "android")]
     repl: Option<Repl>,
     title: String,
+    /// Set when this tab rang the bell while it was not the one on screen — an AI CLI
+    /// asking a question, a long build finishing. Cleared by opening the tab.
+    attention: bool,
     split: Option<Box<TermTab>>,
     split_dir: SplitDir,
     split_focused: bool,
@@ -654,6 +657,7 @@ impl TermTab {
             pending_profile: None,
             repl: Some(Repl::new()),
             title: format!("leuwi {}", id),
+            attention: false,
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
         }
     }
@@ -909,6 +913,7 @@ impl TermTab {
             ssh: Some(handle),
             pending_profile: None,
             title: format!("nvgpu {}", id),
+            attention: false,
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
         }
     }
@@ -959,7 +964,7 @@ impl TermTab {
             }
         });
 
-        Self { grid, writer: Some(writer), master: Some(master), ssh: None, pending_profile: None, title: format!("Terminal {}", id), split: None, split_dir: SplitDir::Vertical, split_focused: false }
+        Self { grid, writer: Some(writer), master: Some(master), ssh: None, pending_profile: None, title: format!("Terminal {}", id), attention: false, split: None, split_dir: SplitDir::Vertical, split_focused: false }
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -2471,6 +2476,12 @@ pub struct App {
     #[rust] cfg_tab: CfgTab,
     #[rust] sel_cmd: Option<usize>,
     #[rust] sel_key: Option<usize>,
+    /// Ticks the tab blink for tabs waiting on a response.
+    #[rust] blink_phase: u32,
+    /// Last window size seen, so anything that changes the space available to the grid
+    /// (collapsing the tab sidebar) can re-run the size calculation without waiting for
+    /// the OS to send another geometry change.
+    #[rust] last_size: (f64, f64),
     /// Config page scroll, driven by touch: makepad's scroll bars ignore touch.
     #[rust] cfg_scroll: f64,
     /// (touch start y, scroll offset when the drag began)
@@ -2551,8 +2562,15 @@ impl App {
                 if $i < self.tabs.len() {
                     let name = self.tabs[$i].dynamic_title();
                     let split = if self.tabs[$i].split.is_some() { " ⫽" } else { "" };
+                    // ~0.5 s on, ~0.5 s off at the 33 ms tick. The dot only ever shows
+                    // on a background tab, so the active tab never flickers.
+                    let blink = self.tabs[$i].attention && (self.blink_phase / 15) % 2 == 0;
                     let txt = if $i == self.active_tab {
                         format!(" ▌ {}{} ", name, split)
+                    } else if blink {
+                        format!(" * {}{} ", name, split)
+                    } else if self.tabs[$i].attention {
+                        format!("   {}{} ", name, split)
                     } else {
                         format!("  {}{} ", name, split)
                     };
@@ -2607,6 +2625,11 @@ impl App {
     /// Switch to tab `i` by touch (or Alt+N). No-op if out of range.
     fn goto_tab(&mut self, cx: &mut Cx, i: usize) {
         if i < self.tabs.len() && i != self.active_tab {
+            // Opening the tab is the acknowledgement: stop blinking and drop its notification.
+            if self.tabs[i].attention {
+                self.tabs[i].attention = false;
+                self.clear_attention_notification(i);
+            }
             self.active_tab = i;
             self.switch_to_active(cx);
         }
@@ -2792,6 +2815,54 @@ impl App {
             if !dir.pop() { break; }
         }
         String::new()
+    }
+
+    /// A background tab wants attention. Surfaces it in the status bar; the blinking
+    /// tab marker is driven separately from `attention` in `update_tab_label`.
+    fn notify_attention(&mut self, cx: &mut Cx, tab: usize, title: &str) {
+        let msg = format!("[!] {} menunggu respons - tab {}", title, tab + 1);
+        self.ui.label(id!(status_left)).set_text(cx, &msg);
+        self.ui.redraw(cx);
+        // Also raise a system notification, so it is seen with the app in the
+        // background — the case that matters for an AI CLI waiting on an answer.
+        #[cfg(target_os = "android")]
+        unsafe {
+            makepad_widgets::makepad_platform::os::linux::android::android_jni::to_java_show_notification(
+                tab as i32,
+                format!("{} menunggu respons", title),
+                "Ketuk untuk membuka tab ini".to_string(),
+            );
+        }
+    }
+
+    /// Drop any pending notification for a tab once it has been read.
+    fn clear_attention_notification(&mut self, tab: usize) {
+        #[cfg(target_os = "android")]
+        unsafe {
+            makepad_widgets::makepad_platform::os::linux::android::android_jni::to_java_cancel_notification(tab as i32);
+        }
+        let _ = tab;
+    }
+
+    /// Switch to whichever tab a tapped notification named. Java records the index and
+    /// this drains it on the frame tick; polling one integer is far less plumbing than
+    /// registering a native callback.
+    #[cfg(target_os = "android")]
+    fn poll_notification_tap(&mut self, cx: &mut Cx) {
+        let pending = unsafe {
+            makepad_widgets::makepad_platform::os::linux::android::android_jni::to_java_take_pending_tab()
+        };
+        if pending >= 0 {
+            let i = pending as usize;
+            if i < self.tabs.len() {
+                self.goto_tab(cx, i);
+                // goto_tab is a no-op when the tab is already active, but the
+                // notification must still go away.
+                self.tabs[i].attention = false;
+                self.clear_attention_notification(i);
+                self.update_tab_label(cx);
+            }
+        }
     }
 
     /// Open or close the config panel. It covers the terminal so the forms are
@@ -3424,6 +3495,14 @@ impl MatchEvent for App {
         if self.ui.button(id!(sidebar_btn)).clicked(&actions) {
             self.sidebar_hidden = !self.sidebar_hidden;
             self.ui.widget(id!(tab_sidebar)).set_visible(cx, !self.sidebar_hidden);
+            // The sidebar's 150 px come straight out of the grid's width, so the grid has
+            // to be re-measured now. Without this the text kept the old column count until
+            // something else forced a resize — an SSH session sending its own PTY size,
+            // which is why the width only looked right once a session was attached.
+            let (w, h) = self.last_size;
+            if w > 0.0 && h > 0.0 {
+                self.handle_resize(w, h);
+            }
             self.ui.redraw(cx);
         }
         if self.ui.button(id!(k_esc)).clicked(&actions) { self.write_to_active(b"\x1b"); }
@@ -3510,15 +3589,34 @@ impl AppMain for App {
                         tab.write(&resp);
                     }
                 }
-                // Visual bell check
-                if let Some(tab) = self.tabs.get(self.active_tab) {
-                    let mut g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
-                    if g.bell {
+                // Bell → attention. Every tab is scanned, not just the visible one:
+                // the whole point is noticing the tab you are NOT looking at, which is
+                // where an AI CLI ends up waiting for an answer.
+                let active = self.active_tab;
+                let mut rang: Option<usize> = None;
+                for (i, tab) in self.tabs.iter_mut().enumerate() {
+                    let bell = {
+                        let mut g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
+                        let b = g.bell;
                         g.bell = false;
-                        // Flash effect — briefly change status bar
-                        self.ui.label(id!(status_left)).set_text(cx, "🔔 BELL");
+                        b
+                    };
+                    if bell {
+                        if i == active {
+                            self.ui.label(id!(status_left)).set_text(cx, "[!] BELL");
+                        } else if !tab.attention {
+                            tab.attention = true;
+                            rang = Some(i);
+                        }
                     }
                 }
+                if let Some(i) = rang {
+                    let title = self.tabs[i].dynamic_title();
+                    self.notify_attention(cx, i, &title);
+                }
+                self.blink_phase = self.blink_phase.wrapping_add(1);
+                #[cfg(target_os = "android")]
+                self.poll_notification_tap(cx);
                 self.update_tab_label(cx);
                 // Status bar — left: git + CWD + split info
                 let git = App::detect_git_branch();
@@ -3536,10 +3634,21 @@ impl AppMain for App {
                     _ => "",
                 };
                 let focus = if self.split_active { "→2" } else if self.tabs.get(self.active_tab).map(|t| t.split.is_some()).unwrap_or(false) { "→1" } else { "" };
-                let left = format!("{} {}  Tab {}/{}{}  {}",
+                // Tabs still waiting on a reply, listed here because this line is
+                // rebuilt every tick and would otherwise overwrite a one-shot message.
+                let waiting: Vec<String> = self.tabs.iter().enumerate()
+                    .filter(|(_, t)| t.attention)
+                    .map(|(i, _)| (i + 1).to_string())
+                    .collect();
+                let bell = if waiting.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [!] tab {}", waiting.join(","))
+                };
+                let left = format!("{} {}  Tab {}/{}{}  {}{}",
                     git, cwd_short,
                     self.active_tab + 1, self.tabs.len(),
-                    split_info, focus,
+                    split_info, focus, bell,
                 );
                 self.ui.label(id!(status_left)).set_text(cx, left.trim());
                 // Status bar — right: cols x rows + clock
@@ -3780,6 +3889,7 @@ impl AppMain for App {
             }
             Event::WindowGeomChange(ev) => {
                 let size = ev.new_geom.inner_size;
+                self.last_size = (size.x, size.y);
                 self.handle_resize(size.x, size.y);
             }
             _ => {}
