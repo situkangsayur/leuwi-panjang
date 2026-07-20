@@ -416,6 +416,86 @@ impl Config {
     }
 }
 
+/// Wrapper matching the `[[commands]]` section of config.toml, so a commands file can
+/// be produced by copying that part of an existing config verbatim.
+#[derive(Serialize, Deserialize)]
+struct CommandsFile {
+    #[serde(default)]
+    commands: Vec<CommandProfile>,
+}
+
+impl Config {
+    /// Drop-box for hand-prepared config. This is the app`s own external directory:
+    /// it needs no storage permission (which dev.21 removed), and a file manager or
+    /// `adb push` can reach it. **The app must create it**, otherwise it ends up owned
+    /// by `shell` and the app cannot read what lands inside.
+    fn import_dir() -> std::path::PathBuf {
+        #[cfg(target_os = "android")]
+        {
+            // Try in order of how reachable each is from outside the app:
+            //   1. Android/media/<pkg> — apps may create it with no permission, and
+            //      unlike Android/data it is still browsable by file managers on 11+.
+            //   2. Android/data/<pkg>/files — only exists if the framework made it
+            //      (we never call getExternalFilesDir, so usually it does not).
+            //   3. app-private — always works, but only the app can put files there.
+            // Whichever succeeds is reported in the UI so the path is never a guess.
+            const CANDIDATES: [&str; 3] = [
+                "/sdcard/Android/media/com.situkangsayur.leuwipanjang/import",
+                "/sdcard/Android/data/com.situkangsayur.leuwipanjang/files/import",
+                "/data/user/0/com.situkangsayur.leuwipanjang/import",
+            ];
+            for c in CANDIDATES {
+                let p = std::path::PathBuf::from(c);
+                if p.is_dir() || std::fs::create_dir_all(&p).is_ok() {
+                    return p;
+                }
+            }
+            std::path::PathBuf::from(CANDIDATES[2])
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            dirs::config_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+                .join("leuwi-panjang/import")
+        }
+    }
+
+    /// Read `commands.toml` from the import dir. Entries replace same-named ones and
+    /// are otherwise appended, so re-importing an edited file updates in place.
+    fn import_commands(&mut self) -> Result<usize, String> {
+        let path = Self::import_dir().join("commands.toml");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("baca {}: {e}", path.display()))?;
+        let file: CommandsFile = toml::from_str(&text)
+            .map_err(|e| format!("commands.toml tidak valid: {e}"))?;
+        if file.commands.is_empty() {
+            return Err("commands.toml tidak berisi [[commands]]".into());
+        }
+        let mut n = 0;
+        for c in file.commands {
+            match self.commands.iter_mut().find(|x| x.name == c.name) {
+                Some(slot) => *slot = c,
+                None => self.commands.push(c),
+            }
+            n += 1;
+        }
+        self.save()?;
+        Ok(n)
+    }
+
+    /// Write the current commands out as a template the user can edit and re-import.
+    /// Also creates the import dir under the app`s own uid.
+    fn export_commands(&self) -> Result<std::path::PathBuf, String> {
+        let dir = Self::import_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("buat {}: {e}", dir.display()))?;
+        let path = dir.join("commands.toml");
+        let text = toml::to_string_pretty(&CommandsFile { commands: self.commands.clone() })
+            .map_err(|e| format!("encode: {e}"))?;
+        std::fs::write(&path, text).map_err(|e| format!("tulis {}: {e}", path.display()))?;
+        Ok(path)
+    }
+}
+
 impl Config {
     /// Where the config lives. Android has no XDG config dir (`dirs::config_dir()` is
     /// empty and the CWD is `/`), so anchor it in the app`s own data directory.
@@ -1987,6 +2067,15 @@ live_design! {
         margin: { top: 6 }
     }
 
+    // Secondary action — muted so it does not compete with the green primary one.
+    AltBtn = <Button> {
+        text: ""
+        width: Fill, height: 32
+        draw_text: { color: #xC5C8C6, text_style: { font_size: 10.0 } }
+        draw_bg: { color: #x30363D, fn pixel(self) -> vec4 { return mix(self.color, #x484F58, self.hover); } }
+        margin: { top: 4 }
+    }
+
     // Destructive action — red so it is not tapped by reflex next to Simpan.
     DangerBtn = <Button> {
         text: ""
@@ -2277,6 +2366,11 @@ live_design! {
                             in_pass = <FormInput> { is_password: true, empty_text: "" }
                             btn_save = <FormBtn> { text: "Simpan" }
                             btn_cmd_del = <DangerBtn> { text: "Hapus perintah ini" }
+
+                            <SecTitle> { text: "Muat dari file" }
+                            <FormHint> { text: "commands.toml di folder import (lihat pesan di bawah untuk path lengkap)." }
+                            btn_cmd_import = <FormBtn> { text: "Muat commands.toml" }
+                            btn_cmd_export = <AltBtn> { text: "Ekspor commands.toml" }
                             form_msg = <Label> {
                                 width: Fill
                                 text: ""
@@ -2311,6 +2405,11 @@ live_design! {
                             <FormLabel> { text: "Public key (opsional — diturunkan bila kosong)" }
                             in_key_pub = <MultiInput> { empty_text: "ssh-ed25519 AAAA..." }
                             btn_key_import = <FormBtn> { text: "Simpan key ini" }
+
+                            <SecTitle> { text: "Atau muat dari file" }
+                            <FormHint> { text: "Taruh id_ed25519 dan id_ed25519.pub di folder import, isi Nama key di atas, lalu Muat. Tekan Ekspor dulu kalau foldernya belum ada." }
+                            btn_key_load = <FormBtn> { text: "Muat key dari file" }
+                            btn_key_export = <AltBtn> { text: "Ekspor key + buat folder" }
 
                             btn_key_del = <DangerBtn> { text: "Hapus key terpilih" }
                             key_info = <Label> {
@@ -2372,6 +2471,10 @@ pub struct App {
     #[rust] cfg_tab: CfgTab,
     #[rust] sel_cmd: Option<usize>,
     #[rust] sel_key: Option<usize>,
+    /// Config page scroll, driven by touch: makepad's scroll bars ignore touch.
+    #[rust] cfg_scroll: f64,
+    /// (touch start y, scroll offset when the drag began)
+    #[rust] cfg_touch: Option<(f64, f64)>,
 }
 
 /// Which config tab is on screen. One variant per feature area.
@@ -2995,6 +3098,101 @@ impl App {
         self.ui.redraw(cx);
     }
 
+    /// Load a keypair the user dropped into the import dir as plain files
+    /// (`id_ed25519` + optional `id_ed25519.pub`), so a phone can be provisioned
+    /// without retyping a PEM into a text field.
+    fn import_key_files(&mut self, cx: &mut Cx) {
+        let dir = Config::import_dir();
+        let name = {
+            let typed = self.ui.widget(id!(in_key_name)).text().trim().to_string();
+            if typed.is_empty() { "imported".to_string() } else { typed }
+        };
+        // Accept either name so a key copied straight from ~/.ssh works as-is.
+        let priv_path = ["id_ed25519", "id_rsa", "key"]
+            .iter()
+            .map(|f| dir.join(f))
+            .find(|p| p.is_file());
+        let text = match priv_path {
+            None => format!(
+                "tidak ada file key di:\n{}\n\ntaruh id_ed25519 (+ .pub) di sana, atau tekan Ekspor dulu supaya foldernya dibuat",
+                dir.display()
+            ),
+            Some(pp) => {
+                let priv_pem = std::fs::read_to_string(&pp).unwrap_or_default();
+                let pub_line = std::fs::read_to_string(pp.with_extension("pub")).unwrap_or_default();
+                let dest = Self::key_file_for(&name);
+                match ssh::import_key(&dest, &priv_pem, &pub_line) {
+                    Ok(pubkey) => {
+                        let entry = SshIdentity {
+                            name: name.clone(),
+                            key_path: dest.display().to_string(),
+                            public_key: pubkey.clone(),
+                        };
+                        match self.config.identities.iter().position(|i| i.name == name) {
+                            Some(i) => { self.config.identities[i] = entry; self.sel_key = Some(i); }
+                            None => {
+                                self.config.identities.push(entry);
+                                self.sel_key = Some(self.config.identities.len() - 1);
+                            }
+                        }
+                        let _ = self.config.save();
+                        format!("dimuat dari {} sebagai '{}'\n{}", pp.display(), name, pubkey)
+                    }
+                    Err(e) => format!("gagal: {e}"),
+                }
+            }
+        };
+        self.refresh_key_list(cx);
+        self.ui.widget(id!(key_pub)).set_text(cx, &text);
+        self.ui.redraw(cx);
+    }
+
+    /// Copy the selected key out to the import dir, and create that dir under the
+    /// app`s uid so hand-placed files land readable.
+    fn export_key_files(&mut self, cx: &mut Cx) {
+        let dir = Config::import_dir();
+        let text = match std::fs::create_dir_all(&dir) {
+            Err(e) => format!("buat {}: {e}", dir.display()),
+            Ok(()) => match self.sel_key.and_then(|i| self.config.identities.get(i)) {
+                None => format!("folder siap:\n{}\n\npilih satu key kalau mau ikut diekspor", dir.display()),
+                Some(k) => {
+                    let src = std::path::PathBuf::from(&k.key_path);
+                    let e1 = std::fs::copy(&src, dir.join("id_ed25519")).err();
+                    let e2 = std::fs::copy(src.with_extension("pub"), dir.join("id_ed25519.pub")).err();
+                    match (e1, e2) {
+                        (None, _) => format!(
+                            "key '{}' diekspor ke:\n{}\n\nsalin keluar dari HP sebelum uninstall — folder ini ikut terhapus",
+                            k.name, dir.display()),
+                        (Some(e), _) => format!("gagal salin: {e}"),
+                    }
+                }
+            },
+        };
+        self.ui.widget(id!(key_pub)).set_text(cx, &text);
+        self.ui.redraw(cx);
+    }
+
+    /// Load `commands.toml` from the import dir into the command list.
+    fn import_commands_file(&mut self, cx: &mut Cx) {
+        let msg = match self.config.import_commands() {
+            Ok(n) => format!("{n} perintah dimuat dari {}", Config::import_dir().display()),
+            Err(e) => e,
+        };
+        self.load_cmd_form(cx, None);
+        self.ui.widget(id!(form_msg)).set_text(cx, &msg);
+        self.ui.redraw(cx);
+    }
+
+    /// Write the command list out as an editable template.
+    fn export_commands_file(&mut self, cx: &mut Cx) {
+        let msg = match self.config.export_commands() {
+            Ok(p) => format!("ditulis ke {}\nedit lalu tekan Muat untuk memuat kembali", p.display()),
+            Err(e) => e,
+        };
+        self.ui.widget(id!(form_msg)).set_text(cx, &msg);
+        self.ui.redraw(cx);
+    }
+
     /// Forget the selected key. The private file is removed too, so a lost phone
     /// cannot be mined for it afterwards.
     fn delete_key(&mut self, cx: &mut Cx) {
@@ -3218,6 +3416,11 @@ impl MatchEvent for App {
         if self.ui.button(id!(btn_keygen)).clicked(&actions) { self.run_keygen(cx); }
         if self.ui.button(id!(btn_key_import)).clicked(&actions) { self.import_key_form(cx); }
         if self.ui.button(id!(btn_key_del)).clicked(&actions) { self.delete_key(cx); }
+        // Provision from files dropped into the app's external import dir.
+        if self.ui.button(id!(btn_key_load)).clicked(&actions) { self.import_key_files(cx); }
+        if self.ui.button(id!(btn_key_export)).clicked(&actions) { self.export_key_files(cx); }
+        if self.ui.button(id!(btn_cmd_import)).clicked(&actions) { self.import_commands_file(cx); }
+        if self.ui.button(id!(btn_cmd_export)).clicked(&actions) { self.export_commands_file(cx); }
         if self.ui.button(id!(sidebar_btn)).clicked(&actions) {
             self.sidebar_hidden = !self.sidebar_hidden;
             self.ui.widget(id!(tab_sidebar)).set_visible(cx, !self.sidebar_hidden);
@@ -3257,6 +3460,28 @@ impl AppMain for App {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
         match event {
+            // Drag-to-scroll for the config page. makepad's ScrollBars only act on
+            // Event::Scroll (mouse wheel), so on a phone a ScrollYView cannot be
+            // scrolled at all — the lower half of the form was unreachable.
+            Event::TouchUpdate(e) if self.menu_open => {
+                if let Some(t) = e.touches.first() {
+                    match t.state {
+                        TouchState::Start => {
+                            self.cfg_touch = Some((t.abs.y, self.cfg_scroll));
+                        }
+                        TouchState::Move | TouchState::Stable => {
+                            if let Some((start_y, start_scroll)) = self.cfg_touch {
+                                // Drag up (dy < 0) moves the content up, i.e. scrolls down.
+                                let pos = (start_scroll - (t.abs.y - start_y)).max(0.0);
+                                self.cfg_scroll = pos;
+                                self.ui.view(id!(cfg_body)).set_scroll_pos(cx, dvec2(0.0, pos));
+                                self.ui.redraw(cx);
+                            }
+                        }
+                        TouchState::Stop => { self.cfg_touch = None; }
+                    }
+                }
+            }
             Event::Startup => { self.init(cx); }
             Event::Timer(_) => {
                 // Start deferred SSH connections ~0.5s after launch (off the
