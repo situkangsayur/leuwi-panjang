@@ -102,6 +102,29 @@ cargo-makepad now completes packaging itself ("Compile APK completed"); finish w
    The icon files are untracked binaries, so they are archived under
    `install/makepad-patches/res/` and copied rather than diffed.
 
+8. **Foreground service** (`android_jni.rs`, `MakepadActivity.java`, `cargo_makepad/src/android/mod.rs`,
+   `compile.rs`) — Android freezes a backgrounded app and its sockets die with it, which
+   is why SSH sessions vanished when the phone was put down. A foreground service is the
+   only supported way to keep the process (and its threads) running. Adds
+   `MakepadActivity$SessionService` plus `startSessionService(String)` /
+   `stopSessionService()`, the `<service>` element and FOREGROUND_SERVICE(+_DATA_SYNC)
+   permissions, and `to_java_start/stop_session_service()` on the Rust side.
+
+   Two build-system traps came with it:
+   - **d8 rejects a nest with a missing member.** `build_dex` listed `.class` files by
+     hand (including `MakepadActivity$1`, `$2`), so a new nested class failed with
+     "requires its nest mates … to be on program or class path". `build_dex` now globs
+     every `.class` in the output directory, which also means anonymous classes added
+     later cannot break it.
+   - **Cargo will not rebuild cargo-makepad from a git checkout** after you edit it —
+     sources under `~/.cargo` are treated as immutable, so `cargo install --path` /
+     `cargo build` finish in 0.2 s and keep the old binary. Force it:
+     ```bash
+     cd ~/.cargo/git/checkouts/makepad-*/ff9048c/tools/cargo_makepad
+     cargo clean -p cargo-makepad --release && cargo build --release
+     cp ../../target/release/cargo-makepad ~/.cargo/bin/
+     ```
+
 ## Still TODO
 Vendor makepad as a local `[patch]` fork carrying all of the above and pin cargo-makepad,
 so the patches are a dependency rather than a script that edits `~/.cargo` in place.

@@ -2090,7 +2090,7 @@ impl TermGrid {
                                     // re-asking on every redraw; naming ourselves ends it.
                                     b'q' if intermediate == b'>' => {
                                         self.response_buf.extend_from_slice(
-                                            b"\x1bP>|leuwi-panjang(0.1.4)\x1b\\");
+                                            b"\x1bP>|leuwi-panjang(0.1.5)\x1b\\");
                                     }
                                     b'q' => {
                                         // DECSCUSR — Set Cursor Style
@@ -3153,6 +3153,13 @@ pub struct App {
     #[rust] cfg_scroll: f64,
     /// (touch start y, scroll offset when the drag began)
     #[rust] cfg_touch: Option<(f64, f64)>,
+    /// True between Pause and Resume. While it holds, the foreground service is what
+    /// keeps the process alive, so the number of attached sessions it advertises has to
+    /// be kept honest as sessions end on their own.
+    #[rust] paused: bool,
+    /// Sessions the running service was last told about, so it is only re-notified when
+    /// that number actually changes.
+    #[rust] service_live: usize,
     /// Fingerprint of the last saved session list. Tabs get attached from inside the
     /// REPL, far from any obvious save point, so the tick compares this instead of
     /// threading a "dirty" flag through every path that can change a session.
@@ -3292,6 +3299,33 @@ impl App {
         self.write_to_active(&out);
         let n = text.chars().count();
         self.ui.label(id!(status_left)).set_text(cx, &format!("ditempel {} karakter", n));
+    }
+
+    /// Ask Android to keep this process running while it is in the background, but only
+    /// while there is something to keep alive.
+    ///
+    /// Android freezes a backgrounded app and its sockets die with it — that is why
+    /// sessions "disappeared when you put the phone down", and no amount of reconnect
+    /// logic makes a frozen process hold a TCP connection. A foreground service is the
+    /// supported way out, and it is not free: it puts a permanent notification on the
+    /// user's screen. So it runs only when sessions are actually attached, and the
+    /// notification says how many, which is exactly the information that justifies it.
+    #[cfg(target_os = "android")]
+    fn update_background_service(&self) {
+        let live = self.tabs.iter().filter(|t| t.ssh.is_some()).count();
+        unsafe {
+            use makepad_widgets::makepad_platform::os::linux::android::android_jni as jni;
+            if live == 0 {
+                jni::to_java_stop_session_service();
+            } else {
+                let names: Vec<&str> = self.tabs.iter()
+                    .filter(|t| t.ssh.is_some())
+                    .map(|t| t.title.as_str())
+                    .collect();
+                jni::to_java_start_session_service(format!(
+                    "{} sesi tersambung: {}", live, names.join(", ")));
+            }
+        }
     }
 
     /// What `save_sessions` would write, condensed. Cheap enough to build every tick.
@@ -4450,17 +4484,31 @@ impl AppMain for App {
             // Going to the background is the last moment we are guaranteed to run:
             // Android kills the process from here without further notice.
             Event::Pause => {
+                self.paused = true;
+                self.service_live = self.tabs.iter().filter(|t| t.ssh.is_some()).count();
                 self.save_sessions();
+                #[cfg(target_os = "android")]
+                self.update_background_service();
             }
             // Back on screen. Anything the OS froze or the network dropped while we
             // were away gets dialled again, so the tabs are live by the time the user
             // has finished looking at them.
             Event::Resume => {
+                self.paused = false;
+                self.service_live = 0;
                 #[cfg(target_os = "android")]
-                for tab in &mut self.tabs {
-                    // Only sessions that were still meant to be live: a tab the user
-                    // exited stays at its prompt.
-                    tab.reconnect(false);
+                {
+                    // The window is back, so the process is no longer at risk of being
+                    // frozen; the permanent notification would just be clutter.
+                    unsafe {
+                        makepad_widgets::makepad_platform::os::linux::android::android_jni
+                            ::to_java_stop_session_service();
+                    }
+                    for tab in &mut self.tabs {
+                        // Only sessions that were still meant to be live: a tab the user
+                        // exited stays at its prompt.
+                        tab.reconnect(false);
+                    }
                 }
             }
             Event::Timer(_) => {
@@ -4539,6 +4587,14 @@ impl AppMain for App {
                 // the twice-a-second heartbeat covers what is not tied to grid content
                 // (the cursor and tab blink, the clock). Gestures and key presses redraw
                 // through their own paths, so nothing waits on the heartbeat to appear.
+                #[cfg(target_os = "android")]
+                if self.paused {
+                    let live = self.tabs.iter().filter(|t| t.ssh.is_some()).count();
+                    if live != self.service_live {
+                        self.service_live = live;
+                        self.update_background_service();
+                    }
+                }
                 let heartbeat = self.blink_phase % 15 == 0;
                 let mut visible_changed = false;
                 for (i, tab) in self.tabs.iter().enumerate() {

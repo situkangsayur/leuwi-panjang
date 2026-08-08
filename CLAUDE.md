@@ -25,6 +25,24 @@ cargo test             # 111 automated tests
 - Android state lives in `/data/user/0/com.situkangsayur.leuwipanjang/` (`state_dir()`):
   `config.toml`, `history`, `sessions.toml`, `ssh/`, `known_hosts`
 
+## Staying alive in the background
+Android freezes a backgrounded app, and its sockets die with it — no amount of reconnect
+logic makes a frozen process hold a TCP connection. `App::update_background_service()`
+starts a **foreground service** on `Event::Pause` when any tab has a live session, and
+stops it on `Event::Resume` or when the last session ends. It costs a permanent
+notification, so it only runs when there is something to keep alive, and the notification
+says how many sessions. The service is `MakepadActivity$SessionService` in the makepad
+fork (see docs/mobile/03-makepad-android-patches.md, patch 8).
+
+Check it is working:
+```bash
+adb shell dumpsys activity services <pkg> | grep isForeground   # isForeground=true
+adb shell cat /proc/<pid>/oom_score_adj                          # ~200, not 900+
+adb shell dumpsys deviceidle force-idle                          # then watch the session
+```
+`oom_score_adj` is the quick tell: a foreground-service process sits around 200, a cached
+one at 900+ (that is the band Android freezes and kills).
+
 ## Idle cost (do not regress this)
 The frame tick runs at 33 ms but **must not repaint unconditionally** — doing so cost a
 full CPU core while the terminal sat idle (measured: 2002 vs 278 jiffies/20 s, 7.2×).

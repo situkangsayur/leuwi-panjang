@@ -33,7 +33,7 @@ index e8b27fc..61d07e1 100644
          self.surface = (self.libegl.eglCreateWindowSurface.unwrap())(
              self.egl_display,
 diff --git a/platform/src/os/linux/android/android_jni.rs b/platform/src/os/linux/android/android_jni.rs
-index 10305bf..2b00fc4 100644
+index 10305bf..534ad12 100644
 --- a/platform/src/os/linux/android/android_jni.rs
 +++ b/platform/src/os/linux/android/android_jni.rs
 @@ -687,8 +687,16 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_onWebSocketError(
@@ -90,10 +90,28 @@ index 10305bf..2b00fc4 100644
  pub unsafe fn to_java_copy_to_clipboard(content: String) {
      let env = attach_jni_env();
      let content = CString::new(content.clone()).unwrap();
-@@ -768,6 +805,22 @@ pub unsafe fn to_java_copy_to_clipboard(content: String) {
+@@ -768,6 +805,40 @@ pub unsafe fn to_java_copy_to_clipboard(content: String) {
      ndk_utils::call_void_method!(env, get_activity(), "copyToClipboard", "(Ljava/lang/String;)V", content);
  }
  
++/// Start the foreground service that keeps the process (and therefore its sockets)
++/// alive while the app is in the background. `text` is the notification's body — it is
++/// on screen the whole time the service runs, so it should say what is still connected.
++pub unsafe fn to_java_start_session_service(text: String) {
++    let env = attach_jni_env();
++    let text = CString::new(text).unwrap();
++    let text = ((**env).NewStringUTF.unwrap())(env, text.as_ptr());
++    ndk_utils::call_void_method!(
++        env, get_activity(), "startSessionService", "(Ljava/lang/String;)V", text
++    );
++}
++
++/// Stop it again — the app is back in front, or nothing is connected any more.
++pub unsafe fn to_java_stop_session_service() {
++    let env = attach_jni_env();
++    ndk_utils::call_void_method!(env, get_activity(), "stopSessionService", "()V");
++}
++
 +/// Read the Android clipboard as plain text; empty when it holds nothing usable.
 +/// Makepad's own paste path (`from_java_on_paste_from_clipboard`) is commented out
 +/// upstream, so this is a direct synchronous pull, polled the same way as
@@ -210,14 +228,93 @@ index 2fd9886..cea6daf 100644
      }
      ret
  }
+diff --git a/tools/cargo_makepad/src/android/compile.rs b/tools/cargo_makepad/src/android/compile.rs
+index 51a4613..16d6302 100644
+--- a/tools/cargo_makepad/src/android/compile.rs
++++ b/tools/cargo_makepad/src/android/compile.rs
+@@ -275,37 +275,44 @@ fn build_dex(sdk_dir: &Path, build_paths: &BuildPaths, urls:&AndroidSDKUrls) ->
+ 
+     let compiled_java_classes_dir = build_paths.out_dir.join(makepad_package_path);
+ 
+-    shell_env_cap( 
++    // Dex every class javac produced, rather than a hand-maintained list. Nested and
++    // anonymous classes (MakepadActivity$1, $2, $SessionService, ...) belong to their
++    // outer class's "nest", and d8 refuses to compile a nest with a member missing —
++    // adding one nested class to the Java source would otherwise break the build with
++    // "requires its nest mates ... to be on program or class path".
++    let mut class_files: Vec<String> = Vec::new();
++    if let Ok(entries) = std::fs::read_dir(&compiled_java_classes_dir) {
++        let mut found: Vec<String> = entries
++            .filter_map( | e | e.ok())
++            .map( | e | e.path())
++            .filter( | p | p.extension().map( | x | x == "class").unwrap_or(false))
++            .filter_map( | p | p.to_str().map( | s | s.to_string()))
++            .collect();
++        found.sort();
++        class_files.append(&mut found);
++    }
++    // The generated app class lives in the app's own package directory, not makepad's.
++    class_files.push(build_paths.java_class.to_str().unwrap().to_string());
++    class_files.push(build_paths.xr_class.to_str().unwrap().to_string());
++
++    let d8_jar = d8_jar_path(sdk_dir, urls);
++    let android_jar = android_jar_path(sdk_dir, urls);
++    let mut args: Vec<&str> = vec![
++        "-cp",
++        d8_jar.to_str().unwrap(),
++        "com.android.tools.r8.D8",
++        "--classpath",
++        android_jar.to_str().unwrap(),
++        "--output",
++        build_paths.out_dir.to_str().unwrap(),
++    ];
++    args.extend(class_files.iter().map( | s | s.as_str()));
++
++    shell_env_cap(
+         &[("JAVA_HOME", (java_home.to_str().unwrap()))],
+         &cwd,
+         java_home.join("bin/java").to_str().unwrap(),
+-        &[ 
+-            "-cp",
+-            (d8_jar_path(sdk_dir, urls).to_str().unwrap()),
+-            "com.android.tools.r8.D8",
+-            "--classpath",
+-            (android_jar_path(sdk_dir, urls).to_str().unwrap()),
+-            "--output",  
+-            (build_paths.out_dir.to_str().unwrap()),
+-            (compiled_java_classes_dir.join("MakepadNative.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("MakepadActivity.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("MakepadSurface.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("ResizingLayout.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("MakepadNetwork.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("MakepadWebSocket.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("MakepadWebSocketReader.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("HttpResponse.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("ByteArrayMediaDataSource.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("VideoPlayer.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("VideoPlayerRunnable.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("VideoPlayer$1.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("VideoPlayer$2.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("VideoPlayer$3.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("MakepadActivity$1.class").to_str().unwrap()),
+-            (compiled_java_classes_dir.join("MakepadActivity$2.class").to_str().unwrap()),
+-            (build_paths.java_class.to_str().unwrap()),
+-            (build_paths.xr_class.to_str().unwrap()),
+-        ]
++        &args
+     ) ?;
+ 
+     Ok(())
 diff --git a/tools/cargo_makepad/src/android/java/dev/makepad/android/MakepadActivity.java b/tools/cargo_makepad/src/android/java/dev/makepad/android/MakepadActivity.java
-index 0d02a22..98904b8 100644
+index 0d02a22..b90b413 100644
 --- a/tools/cargo_makepad/src/android/java/dev/makepad/android/MakepadActivity.java
 +++ b/tools/cargo_makepad/src/android/java/dev/makepad/android/MakepadActivity.java
-@@ -1,6 +1,10 @@
+@@ -1,6 +1,12 @@
  package dev.makepad.android;
  
  import android.app.Activity;
++import android.app.Service;
++import android.os.IBinder;
 +import android.app.NotificationManager;
 +import android.app.NotificationChannel;
 +import android.app.Notification;
@@ -225,7 +322,7 @@ index 0d02a22..98904b8 100644
  import android.bluetooth.BluetoothAdapter;
  import android.bluetooth.BluetoothDevice;
  import android.bluetooth.BluetoothManager;
-@@ -312,6 +316,8 @@ public class MakepadActivity
+@@ -312,6 +318,8 @@ public class MakepadActivity
      @Override
      public void onCreate(Bundle savedInstanceState) {
          super.onCreate(savedInstanceState);
@@ -234,7 +331,7 @@ index 0d02a22..98904b8 100644
          
          this.requestWindowFeature(Window.FEATURE_NO_TITLE);
  
-@@ -476,6 +482,22 @@ public class MakepadActivity
+@@ -476,6 +484,22 @@ public class MakepadActivity
          clipboard.setPrimaryClip(clip);
      }
  
@@ -257,7 +354,7 @@ index 0d02a22..98904b8 100644
      private String getApplicationName() {
          ApplicationInfo applicationInfo = getApplicationContext().getApplicationInfo();
          CharSequence appName = applicationInfo.loadLabel(getPackageManager());
-@@ -733,4 +755,90 @@ public class MakepadActivity
+@@ -733,4 +757,169 @@ public class MakepadActivity
  
          return refreshRate;
      }
@@ -339,6 +436,85 @@ index 0d02a22..98904b8 100644
 +        }
 +    }
 +
++
++    // ── Keeping SSH sessions alive in the background ──────────────────────────
++    //
++    // Android freezes a backgrounded app, which kills its sockets: leave the terminal
++    // and the SSH connections die, however healthy they were. A foreground service is
++    // the only supported way to say "this process is doing something the user asked
++    // for" — it costs a permanent notification, which is also the honest signal that
++    // sessions are still connected.
++    //
++    // Nested inside the activity so it needs no new source file (cargo-makepad compiles
++    // an explicit list of .java files); the manifest names it MakepadActivity$SessionService.
++    // Same process as the app on purpose — the point is to keep *our* threads running.
++    public static class SessionService extends Service {
++        private static final String CHANNEL = "leuwi_sessions";
++        private static final int NOTIF_ID = 4242;
++
++        @Override
++        public IBinder onBind(Intent intent) { return null; }
++
++        @Override
++        public int onStartCommand(Intent intent, int flags, int startId) {
++            String text = intent != null ? intent.getStringExtra("text") : null;
++            if (text == null) text = "Sesi terminal aktif";
++            try {
++                if (Build.VERSION.SDK_INT >= 26) {
++                    NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
++                    // LOW, not HIGH: this one is always on screen while sessions are up,
++                    // so it must never make a sound or peek.
++                    NotificationChannel ch = new NotificationChannel(
++                        CHANNEL, "Sesi aktif", NotificationManager.IMPORTANCE_LOW);
++                    ch.setDescription("Menjaga koneksi SSH tetap hidup di latar belakang");
++                    ch.setShowBadge(false);
++                    nm.createNotificationChannel(ch);
++                }
++                Intent open = new Intent(this, MakepadActivity.class);
++                open.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
++                int flag = PendingIntent.FLAG_UPDATE_CURRENT;
++                if (Build.VERSION.SDK_INT >= 23) flag |= PendingIntent.FLAG_IMMUTABLE;
++                PendingIntent pi = PendingIntent.getActivity(this, 0, open, flag);
++
++                Notification.Builder b = (Build.VERSION.SDK_INT >= 26)
++                    ? new Notification.Builder(this, CHANNEL)
++                    : new Notification.Builder(this);
++                b.setContentTitle("Leuwi Panjang")
++                 .setContentText(text)
++                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
++                 .setOngoing(true)
++                 .setContentIntent(pi);
++                startForeground(NOTIF_ID, b.build());
++            } catch (Exception e) {
++                Log.e("Makepad", "startForeground failed", e);
++                stopSelf();
++            }
++            // Deliberately not sticky: if Android kills us anyway, coming back without
++            // the app in front would leave a notification for sessions nobody is watching.
++            return START_NOT_STICKY;
++        }
++    }
++
++    /// Called from native when the app goes to the background with sessions attached.
++    public void startSessionService(String text) {
++        try {
++            Intent i = new Intent(this, SessionService.class);
++            i.putExtra("text", text);
++            if (Build.VERSION.SDK_INT >= 26) startForegroundService(i); else startService(i);
++        } catch (Exception e) {
++            Log.e("Makepad", "startSessionService failed", e);
++        }
++    }
++
++    /// Called when the app is back in front, or the last session ended.
++    public void stopSessionService() {
++        try {
++            stopService(new Intent(this, SessionService.class));
++        } catch (Exception e) {
++            Log.e("Makepad", "stopSessionService failed", e);
++        }
++    }
++
 +    @Override
 +    protected void onNewIntent(Intent intent) {
 +        Log.i("Makepad", "leuwi: onNewIntent");
@@ -349,10 +525,10 @@ index 0d02a22..98904b8 100644
 +
  }
 diff --git a/tools/cargo_makepad/src/android/mod.rs b/tools/cargo_makepad/src/android/mod.rs
-index fe021e5..3267d22 100644
+index fe021e5..f127032 100644
 --- a/tools/cargo_makepad/src/android/mod.rs
 +++ b/tools/cargo_makepad/src/android/mod.rs
-@@ -30,23 +30,29 @@ fn from_str(opt: &str) -> Result<Self,String> {
+@@ -30,46 +30,47 @@ fn from_str(opt: &str) -> Result<Self,String> {
      }
      
      fn manifest_xml(&self, label:&str, class_name:&str, url:&str, sdk_version: usize)->String{
@@ -385,7 +561,13 @@ index fe021e5..3267d22 100644
                      android:exported="true">
                      <intent-filter>
                          <action android:name="android.intent.action.MAIN" />
-@@ -56,20 +62,9 @@ fn manifest_xml(&self, label:&str, class_name:&str, url:&str, sdk_version: usize
+                         <category android:name="android.intent.category.LAUNCHER" />
+                     </intent-filter>
+                     </activity>
++                    <service
++                        android:name="dev.makepad.android.MakepadActivity$SessionService"
++                        android:exported="false"
++                        android:foregroundServiceType="dataSync" />
                  </application>
                  <uses-sdk android:targetSdkVersion="{sdk_version}" />
                  <uses-feature android:glEsVersion="0x00020000" android:required="true"/>
@@ -404,6 +586,8 @@ index fe021e5..3267d22 100644
 -                <uses-permission android:name="android.permission.USE_BIOMETRIC" />
 -                <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
 +                <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
++                <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
++                <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
                              
                  <queries>
                  <intent>

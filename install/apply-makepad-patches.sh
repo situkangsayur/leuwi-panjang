@@ -50,9 +50,16 @@ echo ">> android resources copied"
 # Cargo assumes a git dependency never changes; without this the next build links the
 # makepad-platform compiled BEFORE the patch and fails on the new JNI functions.
 cd "$CRATE_DIR"
-for args in "" "--release" "--target aarch64-linux-android" "--release --target aarch64-linux-android"; do
-  # shellcheck disable=SC2086
-  cargo clean -p makepad-platform $args >/dev/null 2>&1 || true
+# Every target/profile pair, not a hand-kept list: forgetting one (x86_64 release, for
+# the emulator) fails as "cannot find function <the one just added>", which reads like a
+# source problem and is not.
+for target in "" "aarch64-linux-android" "x86_64-linux-android"; do
+  for profile in "" "--release"; do
+    tgt=""
+    [ -n "$target" ] && tgt="--target $target"
+    # shellcheck disable=SC2086
+    cargo clean -p makepad-platform $profile $tgt >/dev/null 2>&1 || true
+  done
 done
 echo ">> stale makepad-platform artifacts cleared"
 echo ">> DONE - now run ./install/build-release.sh"
