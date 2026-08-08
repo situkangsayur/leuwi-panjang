@@ -3,12 +3,21 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.4
+## Download — v0.1.5
 
-- **[⬇ leuwipanjang_v0.1.4.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.4.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.5.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.5.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
 ~55 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.5
+
+- **Sessions stay connected while the app is in the background.** Android freezes a
+  backgrounded app and its sockets die with it, so until now the connection was already
+  gone by the time you came back. A foreground service keeps the process running while
+  sessions are attached — which is why you now get a permanent notification saying how
+  many are connected. It appears only while something is actually connected, and goes
+  away when you return to the app or the last session ends.
 
 ## What's new in 0.1.4
 
