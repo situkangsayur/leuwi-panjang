@@ -1,6 +1,6 @@
 [package]
 name = "leuwi-panjang"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 
 # The app lives in the library so both the desktop binary (src/main.rs) and the
@@ -34,8 +34,8 @@ arboard = "3"
 
 # Metadata read by cargo-makepad for the Android build.
 [package.metadata.makepad.android]
-version_code = 12
-version_name = "0.1.2"
+version_code = 13
+version_name = "0.1.3"
 # 29 (Android 10): Makepad's platform links AMidi (libamidi), which only exists
 # in the NDK sysroot from API 29 onward — API 26 fails with `unable to find -lamidi`.
 min_sdk_version = 29

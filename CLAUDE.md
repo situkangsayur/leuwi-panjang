@@ -24,6 +24,20 @@ cargo test             # 111 automated tests
     *words* (`nvgpu-s` + session name) are stored, so no credentials are duplicated.
 - Android state lives in `/data/user/0/com.situkangsayur.leuwipanjang/` (`state_dir()`):
   `config.toml`, `history`, `sessions.toml`, `ssh/`, `known_hosts`
+
+## Idle cost (do not regress this)
+The frame tick runs at 33 ms but **must not repaint unconditionally** — doing so cost a
+full CPU core while the terminal sat idle (measured: 2002 vs 278 jiffies/20 s, 7.2×).
+`TermGrid::dirty` is set by anything that changes the contents; the tick repaints when the
+*visible* grid changed, plus a twice-a-second heartbeat for the cursor/tab blink and clock.
+Gestures and keys redraw through their own paths, so nothing waits on the heartbeat.
+Measure with:
+```bash
+P=$(adb -s <serial> shell ps -A | grep -i leuwi | awk '{print $2}')
+adb -s <serial> shell "awk '{print \$14+\$15}' /proc/$P/stat"   # before/after 20 s, idle
+```
+`detect_git_branch()` is a no-op on Android for the same reason: it walked ten directories
+of filesystem lookups every tick to return "" (there is no checkout, and CWD is `/`).
 - `src/main.rs` — thin desktop entry: `ssh-smoke` subcommand + `leuwi_panjang::app_main()`
 - `src/ssh.rs` — russh SSH backend (Android default; desktop SSH tabs); tmux attach-or-create; TOFU host-key pinning
 - `src/bin/ssh-smoke.rs` — headless SSH self-test (compiles only ssh.rs, no makepad)

@@ -131,6 +131,23 @@ pub(crate) fn default_key_path() -> PathBuf {
 /// The seed is read straight from `/dev/urandom` rather than going through a rand_core
 /// `OsRng`: ssh-key and russh pull in different rand_core majors, so the trait bounds
 /// don't line up, and a 32-byte seed needs no RNG plumbing at all.
+/// The public half of an existing key, in `authorized_keys` form. Reads the cached
+/// `.pub` when it is there and otherwise derives it from the private key, so a key
+/// provisioned by hand (adb push, file import) still yields something to paste.
+pub(crate) fn public_key_of(path: &Path) -> Result<String, String> {
+    if let Ok(text) = std::fs::read_to_string(path.with_extension("pub")) {
+        let line = text.trim();
+        if !line.is_empty() {
+            return Ok(line.to_string());
+        }
+    }
+    let key = russh::keys::load_secret_key(path, None)
+        .map_err(|e| format!("baca {}: {e}", path.display()))?;
+    key.public_key()
+        .to_openssh()
+        .map_err(|e| format!("encode public key: {e}"))
+}
+
 pub(crate) fn generate_key(path: &Path, comment: &str) -> Result<String, String> {
     use russh::keys::ssh_key::private::Ed25519Keypair;
     use russh::keys::ssh_key::LineEnding;

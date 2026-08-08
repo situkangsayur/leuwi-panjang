@@ -737,7 +737,8 @@ impl Repl {
             "\x1b[2mperintah built-in:\x1b[0m\r\n",
             "  sambung        sambung ulang sesi terakhir tab ini\r\n",
             "  config         lihat/ubah host, port, user, session\r\n",
-            "  keygen         buat SSH key baru + tampilkan public key\r\n",
+            "  keygen         buat SSH key baru (public key langsung disalin)\r\n",
+            "  pubkey         salin ulang public key ke papan klip\r\n",
             "  rename <nama>  ganti nama tab\r\n",
             "  clear          bersihkan layar\r\n",
             "  help           tampilkan bantuan ini\r\n",
@@ -1053,31 +1054,67 @@ impl TermTab {
             "keygen" => {
                 let path = ssh::default_key_path();
                 match ssh::generate_key(&path, "leuwi-panjang-android") {
-                    Ok(pubkey) => out.push_str(&format!(
-                        "\x1b[2mkey baru: {}\x1b[0m\r\n\r\n{}\r\n\r\n\x1b[2msalin baris di atas ke ~/.ssh/authorized_keys di server\x1b[0m\r\n",
-                        path.display(), pubkey)),
+                    Ok(pubkey) => {
+                        // Straight to the clipboard: a public key is 80 characters of
+                        // base64 that nobody is going to retype off a phone screen, and
+                        // the whole point of the command is to get it into
+                        // `authorized_keys` on the other machine.
+                        clip::set(&pubkey);
+                        out.push_str(&format!(
+                            "\x1b[2mkey baru: {}\x1b[0m\r\n\r\n{}\r\n\r\n\x1b[1;32m✓ public key sudah disalin ke papan klip\x1b[0m\r\n\x1b[2mtempel ke ~/.ssh/authorized_keys di server (chat/email/ssh dari mesin lain)\x1b[0m\r\n",
+                            path.display(), pubkey));
+                    }
                     Err(e) => out.push_str(&format!("\x1b[31m{}\x1b[0m\r\n", e)),
                 }
             }
+            // Re-copy the public key without generating a new one — the usual case is
+            // "I already made a key, I just need it on another machine".
+            "pubkey" => {
+                let path = ssh::default_key_path();
+                match ssh::public_key_of(&path) {
+                    Ok(pubkey) => {
+                        clip::set(&pubkey);
+                        out.push_str(&format!(
+                            "{}\r\n\r\n\x1b[1;32m✓ disalin ke papan klip\x1b[0m\r\n", pubkey));
+                    }
+                    Err(e) => out.push_str(&format!(
+                        "\x1b[31m{}\x1b[0m\r\n\x1b[2mbelum ada key? jalankan \x1b[0mkeygen\x1b[0m\r\n", e)),
+                }
+            }
+            // `config` reports and edits the *first* command profile — the one the
+            // connect word uses. It used to read and write the flat legacy `ssh_*`
+            // fields instead, which meant `config show` described a profile nobody
+            // connects with and `config set host …` changed nothing you could see.
             "config" => match args.split_first() {
-                None | Some((&"show", _)) => out.push_str(&format!(
-                    "\x1b[2mhost\x1b[0m    {}\r\n\x1b[2mport\x1b[0m    {}\r\n\x1b[2muser\x1b[0m    {}\r\n\x1b[2msession\x1b[0m {}\r\n\x1b[2mkey\x1b[0m     {}\r\n",
-                    cfg.ssh_host, cfg.ssh_port, cfg.ssh_user, cfg.ssh_session,
-                    ssh::default_key_path().display())),
+                None | Some((&"show", _)) => {
+                    let (host, port, user, session) = match cfg.commands.first() {
+                        Some(c) => (c.host.clone(), c.port, c.user.clone(), c.session.clone()),
+                        None => (cfg.ssh_host.clone(), cfg.ssh_port, cfg.ssh_user.clone(), cfg.ssh_session.clone()),
+                    };
+                    out.push_str(&format!(
+                        "\x1b[2mhost\x1b[0m    {}\r\n\x1b[2mport\x1b[0m    {}\r\n\x1b[2muser\x1b[0m    {}\r\n\x1b[2msession\x1b[0m {}\r\n\x1b[2mkey\x1b[0m     {}\r\n",
+                        host, port, user, session, ssh::default_key_path().display()));
+                }
                 Some((&"set", rest)) if rest.len() == 2 => {
                     let (k, v) = (rest[0], rest[1]);
                     match k {
-                        "host" => { cfg.ssh_host = v.into(); }
-                        "user" => { cfg.ssh_user = v.into(); }
-                        "session" => { cfg.ssh_session = v.into(); }
+                        "host" => { cfg.ssh_host = v.into(); if let Some(c) = cfg.commands.first_mut() { c.host = v.into(); } }
+                        "user" => { cfg.ssh_user = v.into(); if let Some(c) = cfg.commands.first_mut() { c.user = v.into(); } }
+                        "session" => { cfg.ssh_session = v.into(); if let Some(c) = cfg.commands.first_mut() { c.session = v.into(); } }
                         "port" => match v.parse::<u16>() {
-                            Ok(p) => { cfg.ssh_port = p; }
+                            Ok(p) => { cfg.ssh_port = p; if let Some(c) = cfg.commands.first_mut() { c.port = p; } }
                             Err(_) => out.push_str("\x1b[31mport harus angka\x1b[0m\r\n"),
                         },
                         _ => out.push_str("\x1b[31mkunci: host | port | user | session\x1b[0m\r\n"),
                     }
                     if out.is_empty() {
-                        out.push_str(&format!("\x1b[2m{} = {}\x1b[0m\r\n", k, v));
+                        // Written straight through: an edit that only lived in memory
+                        // was gone at the next launch, so the command looked like it
+                        // had done nothing.
+                        match cfg.save() {
+                            Ok(()) => out.push_str(&format!("\x1b[2m{} = {} (tersimpan)\x1b[0m\r\n", k, v)),
+                            Err(e) => out.push_str(&format!("\x1b[2m{} = {}\x1b[0m\r\n\x1b[31mgagal simpan: {}\x1b[0m\r\n", k, v, e)),
+                        }
                     }
                 }
                 _ => out.push_str("\x1b[2mpakai: config show | config set <host|port|user|session> <nilai>\x1b[0m\r\n"),
@@ -1303,6 +1340,7 @@ impl TermTab {
         let mut grid = self.grid.lock().unwrap_or_else(|e| e.into_inner());
         grid.resize(cols, rows);
         grid.scroll_bottom = rows.saturating_sub(1);
+        grid.mark_dirty();
         drop(grid);
         // SSH tab: forward the new size to the remote PTY (tmux/vim/htop adapt).
         if let Some(ssh) = &self.ssh {
@@ -1417,6 +1455,9 @@ struct TermGrid {
     // Response buffer (for DA, DSR replies sent back to PTY)
     /// Replies the terminal owes the program on the other end (DA, DSR, colour queries).
     response_buf: Vec<u8>,
+    /// Set whenever the contents change, cleared by the frame tick once it has
+    /// repainted. Lets an idle terminal cost nothing instead of a redraw every 33 ms.
+    dirty: bool,
     // Alternate screen buffer (for vim, htop, less, etc.)
     alt_cells: Option<Vec<Vec<Cell>>>,
     alt_cur_r: usize,
@@ -1449,7 +1490,7 @@ impl TermGrid {
             scrollback: Vec::new(),
             max_scrollback: 5000,
             cur_r: 0, cur_c: 0, cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false, cur_underline: false,
-            mouse_reporting: false, bracketed_paste: false, app_cursor_keys: false, response_buf: Vec::new(),
+            mouse_reporting: false, bracketed_paste: false, app_cursor_keys: false, response_buf: Vec::new(), dirty: true,
             alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
             saved_cur_r: 0, saved_cur_c: 0,
             scroll_top: 0, scroll_bottom: rows.saturating_sub(1),
@@ -1481,6 +1522,11 @@ impl TermGrid {
         self.cur_c = self.alt_cur_c;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows.saturating_sub(1);
+    }
+
+    /// Whether anything changed since the last repaint, clearing the flag.
+    fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
     }
 
     /// Take whatever replies the parser has queued, leaving the buffer empty.
@@ -1580,12 +1626,16 @@ impl TermGrid {
         results
     }
 
+    fn mark_dirty(&mut self) { self.dirty = true; }
+
     fn start_select(&mut self, row: usize, col: usize) {
+        self.dirty = true;
         self.sel_start = Some((row, col));
         self.sel_end = None;
     }
 
     fn update_select(&mut self, row: usize, col: usize) {
+        self.dirty = true;
         self.sel_end = Some((row, col));
     }
 
@@ -1621,6 +1671,7 @@ impl TermGrid {
     }
 
     fn clear_select(&mut self) {
+        self.dirty = true;
         self.sel_start = None;
         self.sel_end = None;
     }
@@ -1691,6 +1742,9 @@ impl TermGrid {
     }
 
     fn process(&mut self, data: &[u8]) {
+        // Every byte that reaches the grid can change what is on screen. The frame tick
+        // reads this instead of repainting unconditionally — see `App`'s Timer arm.
+        self.dirty = true;
         let mut i = 0;
         while i < data.len() {
             match data[i] {
@@ -1967,7 +2021,7 @@ impl TermGrid {
                                     // re-asking on every redraw; naming ourselves ends it.
                                     b'q' if intermediate == b'>' => {
                                         self.response_buf.extend_from_slice(
-                                            b"\x1bP>|leuwi-panjang(0.1.2)\x1b\\");
+                                            b"\x1bP>|leuwi-panjang(0.1.3)\x1b\\");
                                     }
                                     b'q' => {
                                         // DECSCUSR — Set Cursor Style
@@ -2134,6 +2188,9 @@ pub struct TermView {
     #[rust] hold_ticks: u32,
 }
 
+/// Height of the window caption bar. Sized for a thumb, and used by the layout maths
+/// and the mouse hit-tests so the three cannot drift apart again.
+const CAPTION_H: f64 = 44.0;
 /// How long a finger must stay put before a drag becomes a selection.
 const LONG_PRESS_SECS: f64 = 0.4;
 /// Finger travel (px) still counted as "held still" while waiting for a long press.
@@ -2692,6 +2749,7 @@ live_design! {
             draw_bg: { color: #x1E1E1E }
 
             caption_bar = <SolidView> {
+                // Keep in step with CAPTION_H, which the layout maths and hit-tests use.
                 visible: true, flow: Right, height: 44
                 draw_bg: { color: #x181818 }
                 caption_label = <View> { visible: false, width: 0, height: 0 }
@@ -3100,8 +3158,16 @@ impl App {
     fn send_wheel(&mut self, cx: &mut Cx, notches: i32, col: usize, row: usize) {
         if notches == 0 { return; }
         let tab = match self.tabs.get_mut(self.active_tab) { Some(t) => t, None => return };
-        let reporting = tab.grid.lock().unwrap_or_else(|e| e.into_inner()).mouse_reporting;
-        if !reporting {
+        // Both conditions, not just mouse reporting: a program can leave reporting on
+        // for a moment after giving the screen back, and a mouse report written to a
+        // plain shell does not disappear — zsh eats the ESC and types `[<64;11;9M` onto
+        // the command line. Requiring the alternate screen as well means the bytes only
+        // ever go somewhere that is drawing its own full-screen UI.
+        let (reporting, alt) = {
+            let g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
+            (g.mouse_reporting, g.in_alt_screen)
+        };
+        if !(reporting && alt) {
             self.ui.label(id!(status_left))
                 .set_text(cx, "scroll: jalankan  tmux set -g mouse on");
             return;
@@ -3173,6 +3239,12 @@ impl App {
     }
 
     fn save_sessions(&self) {
+        // Only Android restores sessions — a desktop window opening a fresh shell is
+        // the expected behaviour there, so writing the file would be litter.
+        #[cfg(not(target_os = "android"))]
+        { return; }
+        #[cfg(target_os = "android")]
+        {
         let state = SessionState {
             active: self.active_tab,
             tabs: self.tabs.iter().map(|t| {
@@ -3189,6 +3261,7 @@ impl App {
         }
         if let Ok(text) = toml::to_string_pretty(&state) {
             let _ = std::fs::write(path, text);
+        }
         }
     }
 
@@ -3532,7 +3605,13 @@ impl App {
 
     // ── Git branch detection ───────────────────────────────
     fn detect_git_branch() -> String {
+        // Android has no checkout to find and starts at `/`, so this would walk ten
+        // directories doing filesystem lookups, forever, to arrive at "" every time.
+        #[cfg(target_os = "android")]
+        { return String::new(); }
         // Try to read .git/HEAD in CWD or parents
+        #[cfg(not(target_os = "android"))]
+        {
         let mut dir = std::env::current_dir().unwrap_or_default();
         for _ in 0..10 {
             let head = dir.join(".git/HEAD");
@@ -3549,6 +3628,7 @@ impl App {
             if !dir.pop() { break; }
         }
         String::new()
+        }
     }
 
     /// A background tab wants attention. Surfaces it in the status bar; the blinking
@@ -4137,7 +4217,7 @@ impl App {
     }
 
     fn handle_resize(&mut self, width: f64, height: f64) {
-        let chrome_h = 44.0 + 22.0; // caption + status bar
+        let chrome_h = CAPTION_H + 22.0; // caption + status bar
         let search_h = if self.search_open { 28.0 } else { 0.0 };
         // The vertical tab sidebar and (on Android) the modifier key bar take space away
         // from the grid. Without accounting for them the terminal reflows wider/taller
@@ -4372,13 +4452,42 @@ impl AppMain for App {
                     self.notify_attention(cx, i, &title);
                 }
                 // Finger drags land in the view, which has no way to reach the session;
-                // collect what they produced and act on it here.
-                let (notches, wcol, wrow) = self.ui.term_view(id!(terminal)).take_wheel();
-                self.send_wheel(cx, notches, wcol, wrow);
-                if self.ui.term_view(id!(terminal)).take_copy_request() {
-                    self.copy_selection(cx);
+                // collect what they produced and act on it here. Both panes are drained:
+                // a split whose gestures were never read would keep accumulating them
+                // and replay the lot the moment it became the focused pane.
+                for view in [id!(terminal), id!(terminal2)] {
+                    let (notches, wcol, wrow) = self.ui.term_view(view).take_wheel();
+                    self.send_wheel(cx, notches, wcol, wrow);
+                    if self.ui.term_view(view).take_copy_request() {
+                        self.copy_selection(cx);
+                    }
                 }
                 self.blink_phase = self.blink_phase.wrapping_add(1);
+                // Repainting 30 times a second whether or not anything moved costs a
+                // phone real battery for nothing. Every grid reports whether it changed;
+                // the twice-a-second heartbeat covers what is not tied to grid content
+                // (the cursor and tab blink, the clock). Gestures and key presses redraw
+                // through their own paths, so nothing waits on the heartbeat to appear.
+                let heartbeat = self.blink_phase % 15 == 0;
+                let mut visible_changed = false;
+                for (i, tab) in self.tabs.iter().enumerate() {
+                    let changed = {
+                        let mut g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
+                        g.take_dirty()
+                    };
+                    let split_changed = tab.split.as_ref().map(|s| {
+                        let mut g = s.grid.lock().unwrap_or_else(|e| e.into_inner());
+                        g.take_dirty()
+                    }).unwrap_or(false);
+                    // Only what is on screen has to be painted; the flags are still
+                    // taken from every tab so they do not pile up and fire on a switch.
+                    if i == self.active_tab && (changed || split_changed) {
+                        visible_changed = true;
+                    }
+                }
+                if !visible_changed && !heartbeat {
+                    return;
+                }
                 // Persist the open-session list when it has actually changed — roughly
                 // once a second, so attaching a session inside the REPL is recorded
                 // without the file being rewritten 30 times a second.
@@ -4611,19 +4720,14 @@ impl AppMain for App {
                 }
             }
             Event::MouseDown(me) => {
-                // Detect clicks in caption bar area (y < 32)
-                if me.abs.y < 32.0 {
-                    let win_w = 1100.0; // approximate, TODO: get actual
-                    // ≡ button area: right side before window controls (~120px from right)
-                    if me.abs.x > win_w - 180.0 && me.abs.x < win_w - 140.0 {
-                        let open = !self.menu_open;
-                        self.set_menu_open(cx, open);
-                        self.ui.redraw(cx);
-                    }
-                    // + button area
-                    if me.abs.x > win_w - 220.0 && me.abs.x < win_w - 185.0 {
-                        self.new_tab(cx);
-                    }
+                // The caption bar's buttons are real widgets and report their own clicks
+                // in handle_actions. There used to be a second, coordinate-guessing path
+                // here that assumed a 1100 px window and a 32 px bar — both wrong once
+                // the bar grew to 44 px for touch, so it fired ≡ and + at whatever
+                // happened to sit at those coordinates. Only "click away to close the
+                // settings page" is left, which no widget can express.
+                if me.abs.y < CAPTION_H {
+                    // Caption bar: leave it to the buttons.
                 } else if self.menu_open {
                     self.set_menu_open(cx, false);
                     self.ui.redraw(cx);
@@ -4635,7 +4739,7 @@ impl AppMain for App {
                             let cw = self.config.cell_width;
                             let ch = self.config.cell_height;
                             let col = ((me.abs.x - 12.0) / cw).max(0.0) as usize + 1; // 1-based
-                            let row = ((me.abs.y - 32.0) / ch).max(0.0) as usize + 1;
+                            let row = ((me.abs.y - CAPTION_H) / ch).max(0.0) as usize + 1;
                             drop(g);
                             // SGR mouse: ESC [ < 0 ; col ; row M
                             let seq = format!("\x1b[<0;{};{}M", col, row);
@@ -4646,14 +4750,14 @@ impl AppMain for App {
             }
             Event::MouseUp(me) => {
                 // Send mouse release to PTY if reporting
-                if me.abs.y > 32.0 {
+                if me.abs.y > CAPTION_H {
                     if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                         let g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
                         if g.mouse_reporting {
                             let cw = self.config.cell_width;
                             let ch = self.config.cell_height;
                             let col = ((me.abs.x - 12.0) / cw).max(0.0) as usize + 1;
-                            let row = ((me.abs.y - 32.0) / ch).max(0.0) as usize + 1;
+                            let row = ((me.abs.y - CAPTION_H) / ch).max(0.0) as usize + 1;
                             drop(g);
                             let seq = format!("\x1b[<0;{};{}m", col, row); // lowercase m = release
                             tab.write(seq.as_bytes());
