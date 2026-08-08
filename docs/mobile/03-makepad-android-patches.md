@@ -34,8 +34,21 @@ ln -sfn /usr/lib/jvm/java-17-openjdk-amd64 $SDK/openjdk        # d8 rejects Java
 
 ## Makepad source patches (in `~/.cargo/git/checkouts/makepad-*/ff9048c/`)
 
-These live in the cargo git checkout (not version-controlled). Re-apply after any
-`cargo` re-checkout. Paths are under `platform/src/os/linux/`.
+These live in the cargo git checkout (not version-controlled), so they are captured in
+`install/makepad-patches/` and re-applied with:
+
+```bash
+./install/apply-makepad-patches.sh          # apply (idempotent)
+./install/apply-makepad-patches.sh --check  # is the checkout patched?
+```
+
+`install/build-release.sh` runs the check itself and applies when needed, so a fresh
+clone builds without hand-editing `~/.cargo`. The script also clears the compiled
+`makepad-platform`: **Cargo treats a git dependency as immutable and will happily link
+artifacts built before the patch**, which shows up as `cannot find function
+to_java_paste_from_clipboard` even though the function is right there in the file.
+
+Paths below are under `platform/src/os/linux/`.
 
 1. **`opengl.rs`** — `#version` must be the FIRST token of the shader. Makepad's
    `format!("\n            {version}…")` put `#version 300 es` on line 2 → strict GLES
@@ -69,6 +82,26 @@ Phone (arm64): same with `--abi=aarch64` and the `aarch64-…-clang` CC. The git
 cargo-makepad now completes packaging itself ("Compile APK completed"); finish with
 `zipalign -p -f 4` + `apksigner` as in `install/build-apk.sh`.
 
-## TODO — make this reproducible
-Vendor makepad as a local `[patch]` fork carrying fixes #1–#4, and pin cargo-makepad,
-so a clean checkout builds without hand-editing `~/.cargo`.
+## Feature patches (not bug fixes — makepad has no API for these)
+
+5. **Tab notifications** (`android_jni.rs` + `MakepadActivity.java`) — `showTabNotification`
+   / `cancelTabNotification` / `takePendingTab`, so a tab waiting on an answer can raise
+   a phone notification and the tap can bring that tab forward. Polled from the frame
+   tick rather than pushed, which avoids a native-callback registration path for one int.
+
+6. **Clipboard paste** (`android_jni.rs` + `MakepadActivity.java`) — upstream implements
+   `copyToClipboard` but leaves the paste direction commented out
+   (`from_java_on_paste_from_clipboard`), so pasting *into* the terminal from another app
+   was impossible. Adds `pasteFromClipboard(): String` on the activity and
+   `to_java_paste_from_clipboard()` on the Rust side. Android only serves the clipboard
+   to the focused app, which is the case whenever the paste key can be pressed.
+
+7. **Manifest trim + app icon** (`cargo_makepad/src/android/mod.rs`, `res/`) — the stock
+   template requests CAMERA / LOCATION / MEDIA / BLUETOOTH / QUERY_ALL_PACKAGES and marks
+   the app `debuggable`; a terminal needs INTERNET + ACCESS_NETWORK_STATE (+ POST_NOTIFICATIONS).
+   The icon files are untracked binaries, so they are archived under
+   `install/makepad-patches/res/` and copied rather than diffed.
+
+## Still TODO
+Vendor makepad as a local `[patch]` fork carrying all of the above and pin cargo-makepad,
+so the patches are a dependency rather than a script that edits `~/.cargo` in place.

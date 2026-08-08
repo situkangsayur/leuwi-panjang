@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 pub mod ssh;
 
 // ── Clipboard (platform-gated) ─────────────────────────────
-// Desktop uses the system clipboard via arboard. Android has no arboard
-// backend, so we fall back to a process-local buffer (copy/paste within app).
+// Desktop uses the system clipboard via arboard; Android goes through JNI to the
+// real ClipboardManager, so text crosses the app boundary in both directions.
 #[cfg(not(target_os = "android"))]
 mod clip {
     use arboard::Clipboard;
@@ -20,9 +20,49 @@ mod clip {
 #[cfg(target_os = "android")]
 mod clip {
     use std::sync::Mutex;
+    // Mirror of what we last copied. Android only serves the clipboard to the app
+    // that holds focus, so this is the fallback when the JNI read comes back empty.
     static BUF: Mutex<String> = Mutex::new(String::new());
-    pub fn set(text: &str) { if let Ok(mut b) = BUF.lock() { *b = text.to_string(); } }
-    pub fn get() -> String { BUF.lock().map(|b| b.clone()).unwrap_or_default() }
+
+    /// Copy out of the terminal into the Android clipboard, so other apps can paste it.
+    pub fn set(text: &str) {
+        if let Ok(mut b) = BUF.lock() { *b = text.to_string(); }
+        unsafe {
+            makepad_widgets::makepad_platform::os::linux::android::android_jni
+                ::to_java_copy_to_clipboard(text.to_string());
+        }
+    }
+
+    /// Paste into the terminal from whatever app the user last copied in.
+    pub fn get() -> String {
+        let system = unsafe {
+            makepad_widgets::makepad_platform::os::linux::android::android_jni
+                ::to_java_paste_from_clipboard()
+        };
+        if !system.is_empty() {
+            return system;
+        }
+        BUF.lock().map(|b| b.clone()).unwrap_or_default()
+    }
+}
+
+// ── Persistent state directory ─────────────────────────────
+
+/// Where the terminal keeps what must outlive one run: the command history and the
+/// list of open sessions. Android has neither a home nor an XDG config dir (both
+/// resolve to `/`, which is unwritable), so anchor on the app's own data directory —
+/// the same place `config.toml` lives.
+fn state_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        std::path::PathBuf::from("/data/user/0/com.situkangsayur.leuwipanjang")
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("leuwi-panjang")
+    }
 }
 
 // ── Theme ──────────────────────────────────────────────────
@@ -572,6 +612,43 @@ struct TermTab {
     split: Option<Box<TermTab>>,
     split_dir: SplitDir,
     split_focused: bool,
+    /// Which configured command and remote session this tab is attached to. Kept as
+    /// the *words* rather than a resolved profile so the saved session list holds no
+    /// credentials — those stay in config.toml — and so a re-pointed profile takes
+    /// effect on the next reconnect.
+    origin: Option<TabOrigin>,
+    /// The profile to dial again after Android freezes the process or the phone drops
+    /// the network. tmux keeps the session alive on the server, so re-running
+    /// `tmux new -A -s <session>` lands back in the same screen.
+    last_profile: Option<ssh::SshProfile>,
+    /// When the current SSH session came up, so a connection that dies immediately can
+    /// be told apart from one that ran for an hour before the phone slept.
+    connected_at: Option<std::time::Instant>,
+    /// Consecutive short-lived connections. Stops a dead host from being redialled
+    /// forever; reset as soon as a session survives long enough to be real.
+    reconnect_fails: u32,
+}
+
+/// The completion offered for `line` given past commands: the tail of the most recent
+/// entry that starts with what has been typed. Free-standing (rather than a method on
+/// the Android-only `Repl`) so it can be tested on any platform.
+fn history_suggestion(history: &[String], line: &str) -> Option<String> {
+    if line.is_empty() {
+        return None;
+    }
+    history
+        .iter()
+        .rev()
+        .find(|h| h.starts_with(line) && h.len() > line.len())
+        .map(|h| h[line.len()..].to_string())
+}
+
+/// The words that produced a tab's session: the connect command as typed (`nvgpu-s`)
+/// and the tmux session name. Enough to rebuild the tab after a restart.
+#[derive(Clone, Serialize, Deserialize)]
+struct TabOrigin {
+    cmd: String,
+    session: String,
 }
 
 /// The built-in prompt shown in every Android tab. Leuwi Panjang is a terminal
@@ -593,6 +670,50 @@ struct Repl {
 #[cfg(target_os = "android")]
 impl Repl {
     const PROMPT: &'static str = "\x1b[1;38;5;39mleuwi\x1b[0m\x1b[2m>\x1b[0m ";
+    /// How many lines the on-disk history keeps. Old entries fall off the front.
+    const HISTORY_MAX: usize = 500;
+
+    /// One file for the whole app, not one per tab: a command typed in tab 1 should
+    /// come back under the arrow key in tab 3, the way a shell's shared history does.
+    fn history_path() -> std::path::PathBuf {
+        state_dir().join("history")
+    }
+
+    /// Read the saved history, oldest first. A missing or unreadable file is simply
+    /// an empty history — never an error the user has to deal with.
+    fn load_history() -> Vec<String> {
+        let text = std::fs::read_to_string(Self::history_path()).unwrap_or_default();
+        let mut lines: Vec<String> = text
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        if lines.len() > Self::HISTORY_MAX {
+            lines.drain(..lines.len() - Self::HISTORY_MAX);
+        }
+        lines
+    }
+
+    /// Write the history back after every accepted line. Rewriting the whole (capped)
+    /// file keeps it trimmed and costs nothing at 500 short lines — and it means the
+    /// history survives the process being killed in the background, which is the
+    /// normal way this app ends on Android.
+    fn save_history(&self) {
+        let dir = Self::history_path();
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let start = self.history.len().saturating_sub(Self::HISTORY_MAX);
+        let text = self.history[start..].join("\n");
+        let _ = std::fs::write(Self::history_path(), text + "\n");
+    }
+
+    /// The part of a past command that would complete what is typed so far — the most
+    /// recent match wins. `None` when the line is empty or nothing matches, so the
+    /// caller can skip drawing a ghost entirely.
+    fn suggestion(&self) -> Option<String> {
+        history_suggestion(&self.history, &self.line)
+    }
     /// Built from the live config so the connect/list words shown are the ones the
     /// user actually configured, not a hardcoded `nvgpu`.
     fn help(cfg: &Config) -> String {
@@ -609,6 +730,7 @@ impl Repl {
         }
         s.push_str(concat!(
             "\x1b[2mperintah built-in:\x1b[0m\r\n",
+            "  sambung        sambung ulang sesi terakhir tab ini\r\n",
             "  config         lihat/ubah host, port, user, session\r\n",
             "  keygen         buat SSH key baru + tampilkan public key\r\n",
             "  rename <nama>  ganti nama tab\r\n",
@@ -620,15 +742,23 @@ impl Repl {
     }
 
     fn new() -> Self {
-        Self { line: String::new(), history: Vec::new(), hist_pos: None, esc: 0 }
+        Self { line: String::new(), history: Self::load_history(), hist_pos: None, esc: 0 }
     }
 
-    /// Redraw the prompt and the current line in place, after history replaced it.
+    /// Redraw the prompt, the current line, and the greyed-out completion behind the
+    /// cursor. The ghost is drawn *after* the cursor position and then stepped back
+    /// over, so the caret stays where the user is typing (fish-style).
     fn redraw_line(&self, g: &mut TermGrid) {
         g.process(b"\r");
         g.process(Repl::PROMPT.as_bytes());
         g.process(self.line.as_bytes());
         g.process(b"\x1b[K");
+        if let Some(rest) = self.suggestion() {
+            g.process(b"\x1b[2m");
+            g.process(rest.as_bytes());
+            g.process(b"\x1b[0m");
+            g.process(format!("\x1b[{}D", rest.chars().count()).as_bytes());
+        }
     }
 
     fn banner() -> String {
@@ -659,6 +789,7 @@ impl TermTab {
             title: format!("leuwi {}", id),
             attention: false,
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
+            origin: None, last_profile: None, connected_at: None, reconnect_fails: 0,
         }
     }
 
@@ -668,17 +799,66 @@ impl TermTab {
         self.ssh.is_none() && self.repl.is_some()
     }
 
-    /// Drop a finished SSH session and hand control back to the prompt.
+    /// Handle a session that has ended. A connection the phone dropped (screen off,
+    /// network change, the process frozen in the background) is dialled straight back:
+    /// tmux still holds the session on the server, so `tmux new -A -s` reattaches to
+    /// the very same screen instead of losing the work. Only a session that dies
+    /// immediately, several times over, is treated as genuinely gone — that is what an
+    /// unreachable host or a `exit`ed tmux looks like, and redialling it forever would
+    /// spin.
     #[cfg(target_os = "android")]
     fn reap_finished_ssh(&mut self) {
         let finished = self.ssh.as_ref().map(|h| h.is_done()).unwrap_or(false);
-        if finished {
-            self.ssh = None;
-            self.writer = None;
-            self.title = "leuwi".into();
-            let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
-            g.process(b"\r\n\x1b[2msesi berakhir\x1b[0m\r\n");
-            g.process(Repl::PROMPT.as_bytes());
+        if !finished { return; }
+        self.ssh = None;
+        self.writer = None;
+
+        // A session that stayed up for a while was working; the drop is the phone's
+        // doing, so the failure counter starts fresh.
+        let was_long = self.connected_at
+            .map(|t| t.elapsed() >= std::time::Duration::from_secs(20))
+            .unwrap_or(false);
+        if was_long { self.reconnect_fails = 0; }
+        self.connected_at = None;
+
+        const MAX_QUICK_FAILS: u32 = 3;
+        match self.last_profile.clone() {
+            Some(profile) if self.reconnect_fails < MAX_QUICK_FAILS => {
+                self.reconnect_fails += 1;
+                {
+                    let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
+                    g.process(b"\r\n\x1b[2mterputus - menyambung ulang...\x1b[0m\r\n");
+                }
+                self.pending_profile = Some(profile);
+                self.start_pending_ssh();
+            }
+            _ => {
+                self.title = "leuwi".into();
+                let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
+                g.process(b"\r\n\x1b[2msesi berakhir\x1b[0m\r\n");
+                if self.last_profile.is_some() {
+                    g.process(b"\x1b[2mketik \x1b[0msambung\x1b[2m untuk mencoba lagi\x1b[0m\r\n");
+                }
+                g.process(Repl::PROMPT.as_bytes());
+            }
+        }
+    }
+
+    /// Dial the tab's last session again, whatever state it is in. Used by the
+    /// `sambung` command and when the app returns to the foreground.
+    #[cfg(target_os = "android")]
+    fn reconnect(&mut self) -> bool {
+        if self.ssh.is_some() || self.pending_profile.is_some() {
+            return false;
+        }
+        match self.last_profile.clone() {
+            Some(profile) => {
+                self.reconnect_fails = 0;
+                self.pending_profile = Some(profile);
+                self.start_pending_ssh();
+                true
+            }
+            None => false,
         }
     }
 
@@ -699,6 +879,15 @@ impl TermTab {
                 if repl.esc == 2 {
                     repl.esc = 0;
                     match b {
+                        // Right arrow at the end of the line accepts the completion,
+                        // the same gesture as in fish/zsh-autosuggestions.
+                        b'C' => {
+                            if let Some(rest) = repl.suggestion() {
+                                repl.line.push_str(&rest);
+                                repl.hist_pos = None;
+                                repl.redraw_line(&mut g);
+                            }
+                        }
                         b'A' if !repl.history.is_empty() => {
                             let idx = match repl.hist_pos {
                                 None => repl.history.len() - 1,
@@ -729,19 +918,36 @@ impl TermTab {
                 }
                 match b {
                     0x1b => { repl.esc = 1; }
+                    // Tab accepts the greyed-out completion; with nothing to accept it
+                    // stays inert rather than typing a literal tab into the line.
+                    b'\t' => {
+                        if let Some(rest) = repl.suggestion() {
+                            repl.line.push_str(&rest);
+                            repl.hist_pos = None;
+                            repl.redraw_line(&mut g);
+                        }
+                    }
                     b'\r' | b'\n' => {
-                        g.process(b"\r\n");
+                        // Wipe the ghost completion before the newline, or it would be
+                        // left behind on screen as if it had been typed.
+                        g.process(b"\r");
+                        g.process(Repl::PROMPT.as_bytes());
+                        g.process(repl.line.as_bytes());
+                        g.process(b"\x1b[K\r\n");
                         let line = std::mem::take(&mut repl.line);
                         // Skip blanks and immediate repeats, the way a shell does.
                         if !line.trim().is_empty() && repl.history.last() != Some(&line) {
                             repl.history.push(line.clone());
+                            // Persisted per line: on Android the process is killed in
+                            // the background without any chance to flush on exit.
+                            repl.save_history();
                         }
                         repl.hist_pos = None;
                         lines.push(line);
                     }
                     0x7f | 0x08 => {
                         if repl.line.pop().is_some() {
-                            g.process(b"\x08 \x08");
+                            repl.redraw_line(&mut g);
                         }
                     }
                     0x03 => {
@@ -752,7 +958,7 @@ impl TermTab {
                     }
                     b if b >= 0x20 => {
                         repl.line.push(b as char);
-                        g.process(&[b]);
+                        repl.redraw_line(&mut g);
                     }
                     _ => {}
                 }
@@ -772,6 +978,7 @@ impl TermTab {
         // host/port/user instead of the single legacy profile.
         let mut connect: Option<ssh::SshProfile> = None;
         let mut suppress_prompt = false;
+        let mut do_reconnect = false;
         let mut argv = line.split_whitespace();
         let cmd = argv.next().unwrap_or("");
         let args: Vec<&str> = argv.collect();
@@ -794,6 +1001,16 @@ impl TermTab {
                 None => out.push_str("\x1b[2mpakai: rename <nama-tab>\x1b[0m\r\n"),
             },
             "exit" | "quit" => out.push_str("\x1b[2mtutup tab dengan tombol × di atas\x1b[0m\r\n"),
+            // Re-attach the session this tab last held, after it was dropped for good
+            // (host asleep, tmux exited) and the automatic retries gave up.
+            "sambung" | "reconnect" => {
+                if self.last_profile.is_none() {
+                    out.push_str("\x1b[2mtab ini belum pernah tersambung\x1b[0m\r\n");
+                } else {
+                    do_reconnect = true;
+                    suppress_prompt = true;
+                }
+            }
             "keygen" => {
                 let path = ssh::default_key_path();
                 match ssh::generate_key(&path, "leuwi-panjang-android") {
@@ -875,10 +1092,16 @@ impl TermTab {
             if !out.is_empty() { g.process(out.as_bytes()); }
             if connect.is_none() && !suppress_prompt { g.process(Repl::PROMPT.as_bytes()); }
         }
+        if do_reconnect {
+            self.reconnect();
+        }
         if let Some(profile) = connect {
             // Tab title shows which session it holds, since tabs can now be on
             // different hosts entirely.
             self.title = format!("{} {}", profile.label, profile.session);
+            // Remember how this tab was opened so it can be rebuilt on the next launch.
+            self.origin = Some(TabOrigin { cmd: cmd.to_string(), session: profile.session.clone() });
+            self.reconnect_fails = 0;
             self.pending_profile = Some(profile);
             self.start_pending_ssh();
         }
@@ -888,10 +1111,35 @@ impl TermTab {
     /// No-op if there is nothing pending or a connection already exists.
     fn start_pending_ssh(&mut self) {
         if let Some(profile) = self.pending_profile.take() {
+            // Remembered for the reconnect path — a dropped connection has nowhere
+            // else to learn where it was.
+            self.last_profile = Some(profile.clone());
+            self.connected_at = Some(std::time::Instant::now());
             let sink_grid = self.grid.clone();
+            // Filled immediately below; the sink cannot run before the connection is up.
+            let reply: Arc<Mutex<Option<ssh::SshWriter>>> = Arc::new(Mutex::new(None));
+            let reply_sink = reply.clone();
             let handle = ssh::spawn(profile, move |bytes| {
-                if let Ok(mut g) = sink_grid.lock() { g.process(bytes); }
+                let resp = {
+                    let mut g = sink_grid.lock().unwrap_or_else(|e| e.into_inner());
+                    g.process(bytes);
+                    g.take_response()
+                };
+                // Terminal queries (DA/DSR) have to be answered on the spot. The program
+                // that asked does write-then-read; a reply that arrives a frame later
+                // misses its window and lands in the shell's line editor instead, where
+                // zsh eats the `ESC [` as a meta prefix and types the rest — which is how
+                // `62;22c` kept appearing on the command line.
+                if !resp.is_empty() {
+                    if let Ok(mut slot) = reply_sink.lock() {
+                        if let Some(w) = slot.as_mut() {
+                            let _ = w.write_all(&resp);
+                            let _ = w.flush();
+                        }
+                    }
+                }
             });
+            *reply.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.writer());
             self.writer = Some(Box::new(handle.writer()));
             self.ssh = Some(handle);
         }
@@ -902,9 +1150,25 @@ impl TermTab {
     fn spawn_ssh(id: usize, cfg: &Config, profile: ssh::SshProfile) -> Self {
         let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
         let sink_grid = grid.clone();
+        // Same inline reply path as the Android tab — see start_pending_ssh.
+        let reply: Arc<Mutex<Option<ssh::SshWriter>>> = Arc::new(Mutex::new(None));
+        let reply_sink = reply.clone();
         let handle = ssh::spawn(profile, move |bytes| {
-            if let Ok(mut g) = sink_grid.lock() { g.process(bytes); }
+            let resp = {
+                let mut g = sink_grid.lock().unwrap_or_else(|e| e.into_inner());
+                g.process(bytes);
+                g.take_response()
+            };
+            if !resp.is_empty() {
+                if let Ok(mut slot) = reply_sink.lock() {
+                    if let Some(w) = slot.as_mut() {
+                        let _ = w.write_all(&resp);
+                        let _ = w.flush();
+                    }
+                }
+            }
         });
+        *reply.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.writer());
         let writer: Box<dyn Write + Send> = Box::new(handle.writer());
         Self {
             grid,
@@ -915,6 +1179,7 @@ impl TermTab {
             title: format!("nvgpu {}", id),
             attention: false,
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
+            origin: None, last_profile: None, connected_at: None, reconnect_fails: 0,
         }
     }
 
@@ -964,7 +1229,7 @@ impl TermTab {
             }
         });
 
-        Self { grid, writer: Some(writer), master: Some(master), ssh: None, pending_profile: None, title: format!("Terminal {}", id), attention: false, split: None, split_dir: SplitDir::Vertical, split_focused: false }
+        Self { grid, writer: Some(writer), master: Some(master), ssh: None, pending_profile: None, title: format!("Terminal {}", id), attention: false, split: None, split_dir: SplitDir::Vertical, split_focused: false, origin: None, last_profile: None, connected_at: None, reconnect_fails: 0 }
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -1096,6 +1361,7 @@ struct TermGrid {
     bracketed_paste: bool,
     app_cursor_keys: bool,
     // Response buffer (for DA, DSR replies sent back to PTY)
+    /// Replies the terminal owes the program on the other end (DA, DSR, colour queries).
     response_buf: Vec<u8>,
     // Alternate screen buffer (for vim, htop, less, etc.)
     alt_cells: Option<Vec<Vec<Cell>>>,
@@ -1161,6 +1427,15 @@ impl TermGrid {
         self.cur_c = self.alt_cur_c;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows.saturating_sub(1);
+    }
+
+    /// Take whatever replies the parser has queued, leaving the buffer empty.
+    fn take_response(&mut self) -> Vec<u8> {
+        if self.response_buf.is_empty() {
+            Vec::new()
+        } else {
+            self.response_buf.drain(..).collect()
+        }
     }
 
     fn save_cursor(&mut self) {
@@ -1362,10 +1637,18 @@ impl TermGrid {
                             let mut params: Vec<usize> = Vec::new();
                             let mut num: i32 = -1;
                             let mut private = false;
+                            // The `>` / `=` intermediate used to be skipped, which made
+                            // `ESC[>c` (secondary DA) and `ESC[=c` (tertiary DA) look like
+                            // `ESC[c` and get answered with the *primary* DA reply. Programs
+                            // that ask all three at start-up then keep re-asking, and every
+                            // stale reply lands in the shell's line editor — the runs of
+                            // `62;22c` filling the screen. Keep the intermediate so each
+                            // query gets the answer it actually asked for.
+                            let mut intermediate = 0u8;
                             while i < data.len() {
                                 let c = data[i];
                                 if c == b'?' { private = true; i += 1; continue; }
-                                if c == b'>' || c == b'=' || c == b'!' { i += 1; continue; }
+                                if c == b'>' || c == b'=' || c == b'!' { intermediate = c; i += 1; continue; }
                                 if (b'0'..=b'9').contains(&c) {
                                     if num < 0 { num = 0; }
                                     num = num * 10 + (c - b'0') as i32;
@@ -1567,12 +1850,26 @@ impl TermGrid {
                                             self.cells.insert(self.scroll_top, vec![Cell::default(); self.cols]);
                                         }
                                     }
-                                    b'c' => {
-                                        // DA — Report as xterm-256color compatible
-                                        if private || p0 == 0 {
+                                    b'c' => match intermediate {
+                                        // Primary DA (`ESC[c` / `ESC[0c`) — VT220 with
+                                        // ANSI colour, i.e. what xterm-256color reports.
+                                        0 if !private && p0 == 0 => {
                                             self.response_buf.extend_from_slice(b"\x1b[?62;22c");
                                         }
-                                    }
+                                        // Secondary DA (`ESC[>c`) — terminal type 0 (VT100
+                                        // family), firmware = our version, no cartridge.
+                                        b'>' => {
+                                            self.response_buf.extend_from_slice(b"\x1b[>0;10;1c");
+                                        }
+                                        // Tertiary DA (`ESC[=c`) — DECRPTUI, a 4-byte unit
+                                        // id. Answering keeps the asker from re-polling.
+                                        b'=' => {
+                                            self.response_buf.extend_from_slice(b"\x1bP!|00000000\x1b\\");
+                                        }
+                                        // `ESC[?c` is a *reply* shape, not a request: never
+                                        // answer it, or two terminals echo at each other.
+                                        _ => {}
+                                    },
                                     b'n' => {
                                         if p0 == 6 {
                                             let resp = format!("\x1b[{};{}R", self.cur_r + 1, self.cur_c + 1);
@@ -1600,6 +1897,12 @@ impl TermGrid {
                                             23 => {} // pop title
                                             _ => {}
                                         }
+                                    }
+                                    // XTVERSION (`ESC[>q`). Unanswered, some programs keep
+                                    // re-asking on every redraw; naming ourselves ends it.
+                                    b'q' if intermediate == b'>' => {
+                                        self.response_buf.extend_from_slice(
+                                            b"\x1bP>|leuwi-panjang(0.1.2)\x1b\\");
                                     }
                                     b'q' => {
                                         // DECSCUSR — Set Cursor Style
@@ -1743,6 +2046,90 @@ pub struct TermView {
     // Touch state (Android): (start_x, start_y, scroll_offset at touch start)
     #[rust] touch_start: Option<(f64, f64, i64)>,
     #[rust] touch_moved: bool,
+    /// When the finger went down, so a press held in place can be told from a drag.
+    #[rust] touch_time: f64,
+    /// The finger has been down long enough, without moving, that this drag is a text
+    /// selection rather than a scroll.
+    #[rust] selecting: bool,
+    /// Whole wheel notches this view owes the remote program, positive = scroll up.
+    /// The view has no writer of its own, so the app drains this each tick and sends
+    /// the bytes — that is what makes tmux and pagers scroll under a finger.
+    #[rust] wheel_pending: i32,
+    /// A selection drag has just finished; the app copies the text and reports it.
+    #[rust] copy_pending: bool,
+    /// Wheel notches already emitted during the current drag, so a continuing finger
+    /// only ever sends the difference.
+    #[rust] wheel_emitted: i32,
+    /// 1-based (col, row) on the visible screen where the wheel is being turned.
+    /// Mouse reports carry a position, and tmux uses it to decide which pane scrolls.
+    #[rust] wheel_cell: (usize, usize),
+}
+
+/// How long a finger must stay put before a drag becomes a selection.
+const LONG_PRESS_SECS: f64 = 0.4;
+/// Finger travel (px) still counted as "held still" while waiting for a long press.
+const LONG_PRESS_SLOP: f64 = 12.0;
+/// Terminal lines per wheel notch, matching what a desktop wheel sends.
+const WHEEL_LINES: f64 = 3.0;
+
+impl TermView {
+    /// Screen position → (absolute row in the scrollback+screen, column). Anchored on
+    /// the view's own rect and the same padding `draw_walk` uses, so a tap lands on the
+    /// character under the finger no matter where the view sits in the window.
+    fn cell_at(&self, cx: &mut Cx, x: f64, y: f64) -> Option<(usize, usize)> {
+        let grid = self.grid_ref.as_ref()?;
+        let rect = self.draw_bg.area().rect(cx);
+        let cw = if self.cw > 0.0 { self.cw } else { 9.2 };
+        let ch = if self.ch > 0.0 { self.ch } else { 20.0 };
+        let col = ((x - rect.pos.x - 12.0) / cw).max(0.0) as usize;
+        let screen_row = ((y - rect.pos.y - 8.0) / ch).max(0.0) as usize;
+        let g = grid.lock().unwrap_or_else(|e| e.into_inner());
+        let sb = g.scrollback.len();
+        let start = (sb + g.rows).saturating_sub(g.rows + self.scroll_offset as usize);
+        let abs_row = (start + screen_row).min(sb + g.rows - 1);
+        Some((abs_row, col.min(g.cols.saturating_sub(1))))
+    }
+
+    /// Screen position → 1-based (col, row) on the visible screen, which is the
+    /// coordinate system mouse reports use.
+    fn screen_cell(&self, cx: &mut Cx, x: f64, y: f64) -> (usize, usize) {
+        let rect = self.draw_bg.area().rect(cx);
+        let cw = if self.cw > 0.0 { self.cw } else { 9.2 };
+        let ch = if self.ch > 0.0 { self.ch } else { 20.0 };
+        let col = ((x - rect.pos.x - 12.0) / cw).max(0.0) as usize + 1;
+        let row = ((y - rect.pos.y - 8.0) / ch).max(0.0) as usize + 1;
+        (col, row)
+    }
+
+    /// Begin or extend the selection at a screen position.
+    fn select_at(&mut self, cx: &mut Cx, x: f64, y: f64, start: bool) {
+        if let Some((row, col)) = self.cell_at(cx, x, y) {
+            if let Some(grid) = &self.grid_ref {
+                let mut g = grid.lock().unwrap_or_else(|e| e.into_inner());
+                if start { g.start_select(row, col); } else { g.update_select(row, col); }
+            }
+        }
+    }
+
+    /// Turn a finger drag into movement. Over our own scrollback that is just an offset
+    /// into the buffer; but a full-screen program (tmux, vim, less) keeps its history on
+    /// the other end and our scrollback is empty — there the drag has to be forwarded as
+    /// wheel notches, which is what makes those programs scroll at all.
+    fn drag_scroll(&mut self, dy: f64, ch: f64, start_offset: i64) {
+        let remote = self.grid_ref.as_ref().map(|g| {
+            let g = g.lock().unwrap_or_else(|e| e.into_inner());
+            g.in_alt_screen || g.mouse_reporting
+        }).unwrap_or(false);
+        if remote {
+            // Drag down = look further back = wheel up.
+            let notches = (dy / (ch * WHEEL_LINES)) as i32;
+            self.wheel_pending += notches - self.wheel_emitted;
+            self.wheel_emitted = notches;
+        } else {
+            // Drag down (dy>0) reveals older output (scroll back).
+            self.scroll_offset = (start_offset + (dy / ch) as i64).max(0);
+        }
+    }
 }
 
 impl Widget for TermView {
@@ -1761,26 +2148,53 @@ impl Widget for TermView {
                         TouchState::Start => {
                             self.touch_start = Some((t.abs.x, t.abs.y, self.scroll_offset));
                             self.touch_moved = false;
+                            self.touch_time = t.time;
+                            self.selecting = false;
+                            self.wheel_emitted = 0;
+                            if let Some(grid) = &self.grid_ref {
+                                grid.lock().unwrap_or_else(|e| e.into_inner()).clear_select();
+                            }
                             cx.set_key_focus(self.draw_bg.area());
                         }
                         TouchState::Move | TouchState::Stable => {
-                            if let Some((_sx, sy, s_off)) = self.touch_start {
+                            if let Some((sx, sy, s_off)) = self.touch_start {
                                 let ch = if self.ch > 0.0 { self.ch } else { 20.0 };
                                 let dy = t.abs.y - sy;
-                                if dy.abs() > 6.0 { self.touch_moved = true; }
-                                // Drag down (dy>0) reveals older output (scroll back).
-                                let lines = (dy / ch) as i64;
-                                self.scroll_offset = (s_off + lines).max(0);
-                                self.redraw(cx);
+                                let moved = (t.abs.x - sx).abs().max(dy.abs());
+                                // A finger held still for a moment starts a selection —
+                                // the phone equivalent of pressing the mouse button
+                                // before dragging. Checked before `touch_moved` is set,
+                                // so the same gesture cannot also scroll.
+                                if !self.touch_moved
+                                    && !self.selecting
+                                    && moved < LONG_PRESS_SLOP
+                                    && t.time - self.touch_time >= LONG_PRESS_SECS
+                                {
+                                    self.selecting = true;
+                                    self.select_at(cx, sx, sy, true);
+                                }
+                                if self.selecting {
+                                    self.select_at(cx, t.abs.x, t.abs.y, false);
+                                    self.redraw(cx);
+                                } else {
+                                    if moved > 6.0 { self.touch_moved = true; }
+                                    self.wheel_cell = self.screen_cell(cx, t.abs.x, t.abs.y);
+                                    self.drag_scroll(dy, ch, s_off);
+                                    self.redraw(cx);
+                                }
                             }
                         }
                         TouchState::Stop => {
-                            if !self.touch_moved {
+                            if self.selecting {
+                                // Hand the text to the app, which owns the clipboard.
+                                self.copy_pending = true;
+                            } else if !self.touch_moved {
                                 // Tap: focus + show the on-screen keyboard.
                                 cx.set_key_focus(self.draw_bg.area());
                                 #[cfg(target_os = "android")]
                                 cx.show_text_ime(self.draw_bg.area(), dvec2(0.0, 0.0));
                             }
+                            self.selecting = false;
                             self.touch_start = None;
                         }
                     }
@@ -2005,6 +2419,28 @@ impl TermViewRef {
             inner.is_focused = focused;
         }
     }
+
+    /// Wheel notches a finger drag produced since the last call (positive = up), with
+    /// the 1-based cell they were turned over. The view cannot reach the session; the
+    /// app drains this and writes the bytes.
+    fn take_wheel(&self) -> (i32, usize, usize) {
+        match self.borrow_mut() {
+            Some(mut inner) => {
+                let n = std::mem::take(&mut inner.wheel_pending);
+                let (c, r) = inner.wheel_cell;
+                (n, c.max(1), r.max(1))
+            }
+            None => (0, 1, 1),
+        }
+    }
+
+    /// True once, right after a selection drag ends, so the app can copy the text.
+    fn take_copy_request(&self) -> bool {
+        match self.borrow_mut() {
+            Some(mut inner) => std::mem::take(&mut inner.copy_pending),
+            None => false,
+        }
+    }
 }
 
 // ── Makepad App ────────────────────────────────────────────
@@ -2040,6 +2476,13 @@ live_design! {
         draw_text: { color: #xC5C8C6, text_style: { font_size: 10.5 } }
         draw_bg: { color: #x30363D, fn pixel(self) -> vec4 { return mix(self.color, #x484F58, self.hover); } }
         padding: { left: 2, right: 2, top: 4, bottom: 4 }
+    }
+
+    // Clipboard keys carry words, not glyphs, so they get a fixed slot instead of an
+    // equal share of the bar — at ten buttons an equal share clips "Tempel" to "Temp".
+    ClipBtn = <KeyBtn> {
+        width: 58
+        draw_text: { text_style: { font_size: 9.5 } }
     }
 
     // A tappable row in the burger menu. Wide and tall enough for a thumb.
@@ -2275,6 +2718,11 @@ live_design! {
                     k_down = <KeyBtn> { text: "↓" }
                     k_up = <KeyBtn> { text: "↑" }
                     k_right = <KeyBtn> { text: "→" }
+                    // Clipboard, both directions. Selecting is a long press on the
+                    // terminal (which copies on release); these two cover the rest:
+                    // paste from any other app, and re-copy the current selection.
+                    k_paste = <ClipBtn> { text: "Tempel" }
+                    k_copy = <ClipBtn> { text: "Salin" }
                 }
 
                 // Status bar
@@ -2486,6 +2934,10 @@ pub struct App {
     #[rust] cfg_scroll: f64,
     /// (touch start y, scroll offset when the drag began)
     #[rust] cfg_touch: Option<(f64, f64)>,
+    /// Fingerprint of the last saved session list. Tabs get attached from inside the
+    /// REPL, far from any obvious save point, so the tick compares this instead of
+    /// threading a "dirty" flag through every path that can change a session.
+    #[rust] session_sig: String,
 }
 
 /// Which config tab is on screen. One variant per feature area.
@@ -2509,16 +2961,210 @@ impl LiveRegister for App {
     }
 }
 
+/// What the app writes down so a restart is not a fresh start. Android kills a
+/// backgrounded app whenever it likes, and until now that meant losing which sessions
+/// were open — the tmux sessions themselves survive on the server, only the app's
+/// knowledge of them was gone.
+#[derive(Serialize, Deserialize, Default)]
+struct SessionState {
+    #[serde(default)]
+    tabs: Vec<TabState>,
+    #[serde(default)]
+    active: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TabState {
+    #[serde(default)]
+    title: String,
+    /// The connect word as typed (`nvgpu-s`). Empty = the tab was still at the prompt,
+    /// so it is restored as a prompt.
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    session: String,
+}
+
 impl App {
+    /// Where the open-session list lives. Next to config.toml, in app-private storage.
+    fn sessions_path() -> std::path::PathBuf {
+        state_dir().join("sessions.toml")
+    }
+
+    /// Record which sessions are open. Called whenever that changes (connect, new tab,
+    /// close, rename) and when Android pauses us — by the time the process is killed
+    /// there is no chance to run anything.
+    /// Forward wheel notches from a finger drag to the program on the other end.
+    /// Two encodings, because the two cases behave differently: a program that asked
+    /// for mouse reports (tmux with `mouse on`, htop) gets real SGR wheel events and
+    /// scrolls its own history; a full-screen program that did not (less, man, vim)
+    /// gets arrow keys, which is what a wheel is mapped to there anyway.
+    fn send_wheel(&mut self, notches: i32, col: usize, row: usize) {
+        if notches == 0 { return; }
+        let tab = match self.tabs.get_mut(self.active_tab) { Some(t) => t, None => return };
+        let (reporting, app_cursor) = {
+            let g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
+            (g.mouse_reporting, g.app_cursor_keys)
+        };
+        let up = notches > 0;
+        let count = notches.unsigned_abs() as usize;
+        let mut out = Vec::new();
+        if reporting {
+            // SGR wheel: button 64 = up, 65 = down. `M` marks a press; a wheel event
+            // has no matching release.
+            let button = if up { 64 } else { 65 };
+            for _ in 0..count {
+                out.extend_from_slice(format!("\x1b[<{};{};{}M", button, col, row).as_bytes());
+            }
+        } else {
+            let key: &[u8] = match (up, app_cursor) {
+                (true, false) => b"\x1b[A",
+                (false, false) => b"\x1b[B",
+                (true, true) => b"\x1bOA",
+                (false, true) => b"\x1bOB",
+            };
+            for _ in 0..count * WHEEL_LINES as usize {
+                out.extend_from_slice(key);
+            }
+        }
+        tab.write(&out);
+    }
+
+    /// Copy whatever the user just selected with a long press, and say so in the
+    /// status bar — a phone has no other way to tell the copy actually happened.
+    fn copy_selection(&mut self, cx: &mut Cx) {
+        let text = match self.tabs.get(self.active_tab) {
+            Some(tab) => {
+                let g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
+                g.get_selection_text()
+            }
+            None => None,
+        };
+        match text {
+            Some(t) if !t.is_empty() => {
+                let n = t.chars().count();
+                clip::set(&t);
+                self.ui.label(id!(status_left)).set_text(cx, &format!("disalin {} karakter", n));
+            }
+            _ => {}
+        }
+    }
+
+    /// Paste the Android clipboard into the session. Bracketed paste is used when the
+    /// remote asked for it, so an editor treats the text as pasted rather than typed
+    /// (no auto-indent cascade), and CR is normalised the way a terminal delivers
+    /// Enter.
+    fn paste_clipboard(&mut self, cx: &mut Cx) {
+        let text = clip::get();
+        if text.is_empty() {
+            self.ui.label(id!(status_left)).set_text(cx, "papan klip kosong");
+            return;
+        }
+        let body = text.replace("\r\n", "\r").replace('\n', "\r");
+        let bracketed = self.tabs.get(self.active_tab).map(|t| {
+            t.grid.lock().unwrap_or_else(|e| e.into_inner()).bracketed_paste
+        }).unwrap_or(false);
+        let mut out = Vec::new();
+        if bracketed { out.extend_from_slice(b"\x1b[200~"); }
+        out.extend_from_slice(body.as_bytes());
+        if bracketed { out.extend_from_slice(b"\x1b[201~"); }
+        self.write_to_active(&out);
+        let n = text.chars().count();
+        self.ui.label(id!(status_left)).set_text(cx, &format!("ditempel {} karakter", n));
+    }
+
+    /// What `save_sessions` would write, condensed. Cheap enough to build every tick.
+    fn session_signature(&self) -> String {
+        let mut s = format!("{}|", self.active_tab);
+        for t in &self.tabs {
+            let (cmd, session) = match &t.origin {
+                Some(o) => (o.cmd.as_str(), o.session.as_str()),
+                None => ("", ""),
+            };
+            s.push_str(&format!("{}\u{1}{}\u{1}{}\u{2}", t.title, cmd, session));
+        }
+        s
+    }
+
+    fn save_sessions(&self) {
+        let state = SessionState {
+            active: self.active_tab,
+            tabs: self.tabs.iter().map(|t| {
+                let (cmd, session) = match &t.origin {
+                    Some(o) => (o.cmd.clone(), o.session.clone()),
+                    None => (String::new(), String::new()),
+                };
+                TabState { title: t.title.clone(), cmd, session }
+            }).collect(),
+        };
+        let path = Self::sessions_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(text) = toml::to_string_pretty(&state) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    /// Rebuild the tabs recorded by the previous run and dial each one back into its
+    /// tmux session. Returns false when there is nothing saved, leaving the caller to
+    /// open the usual single prompt tab.
+    #[cfg(target_os = "android")]
+    fn restore_sessions(&mut self) -> bool {
+        let text = match std::fs::read_to_string(Self::sessions_path()) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        let state: SessionState = match toml::from_str(&text) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if state.tabs.is_empty() { return false; }
+        for saved in state.tabs.iter().take(5) {
+            self.tab_counter = self.tabs.len() + 1;
+            let mut tab = TermTab::spawn(self.tab_counter, &self.config);
+            if !saved.title.is_empty() { tab.title = saved.title.clone(); }
+            // A tab that was attached to a session gets dialled straight back in.
+            // Resolving the command word again (rather than storing a profile) means a
+            // host edited in the config form takes effect on this reconnect.
+            if !saved.cmd.is_empty() {
+                if let Some((c, false)) = self.config.lookup_command(&saved.cmd) {
+                    let profile = self.config.profile_from_command(c, &saved.session, 1);
+                    tab.origin = Some(TabOrigin { cmd: saved.cmd.clone(), session: profile.session.clone() });
+                    {
+                        let mut g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
+                        g.process(format!(
+                            "\x1b[2mmemulihkan sesi \x1b[0m{}\x1b[2m ...\x1b[0m\r\n",
+                            profile.session).as_bytes());
+                    }
+                    // Deferred like every other connection: the boot tick starts it
+                    // once the window is up, so a slow network cannot stall launch.
+                    tab.pending_profile = Some(profile);
+                }
+            }
+            self.tabs.push(tab);
+        }
+        self.active_tab = state.active.min(self.tabs.len().saturating_sub(1));
+        true
+    }
+
     fn init(&mut self, cx: &mut Cx) {
         if self.started { return; }
         self.started = true;
         self.config = Config::load();
         self.theme = Theme::load(&self.config.theme);
         self.tab_counter = 1;
-        self.tabs.push(TermTab::spawn(1, &self.config));
-        self.active_tab = 0;
-        self.ui.term_view(id!(terminal)).set_grid(self.tabs[0].grid.clone());
+        // Android: bring back the sessions the last run had open. Everywhere else a
+        // fresh window is a fresh shell, which is what a desktop terminal should do.
+        #[cfg(target_os = "android")]
+        let restored = self.restore_sessions();
+        #[cfg(not(target_os = "android"))]
+        let restored = false;
+        if !restored {
+            self.tabs.push(TermTab::spawn(1, &self.config));
+            self.active_tab = 0;
+        }
+        self.ui.term_view(id!(terminal)).set_grid(self.tabs[self.active_tab].grid.clone());
         let block = self.config.cursor_style == "block";
         self.ui.term_view(id!(terminal)).set_cell_size(self.config.cell_width, self.config.cell_height, block);
         self.ui.term_view(id!(terminal2)).set_cell_size(self.config.cell_width, self.config.cell_height, block);
@@ -2535,6 +3181,7 @@ impl App {
         self.tabs.push(TermTab::spawn(self.tab_counter, &self.config));
         self.active_tab = self.tabs.len() - 1;
         self.switch_to_active(cx);
+        self.save_sessions();
     }
 
     fn close_active_tab(&mut self, cx: &mut Cx) {
@@ -2542,6 +3189,7 @@ impl App {
         self.tabs.remove(self.active_tab);
         if self.active_tab >= self.tabs.len() { self.active_tab = self.tabs.len() - 1; }
         self.switch_to_active(cx);
+        self.save_sessions();
     }
 
     fn next_tab(&mut self, cx: &mut Cx) {
@@ -3511,6 +4159,8 @@ impl MatchEvent for App {
         if self.ui.button(id!(k_down)).clicked(&actions) { self.write_to_active(b"\x1b[B"); }
         if self.ui.button(id!(k_up)).clicked(&actions) { self.write_to_active(b"\x1b[A"); }
         if self.ui.button(id!(k_right)).clicked(&actions) { self.write_to_active(b"\x1b[C"); }
+        if self.ui.button(id!(k_paste)).clicked(&actions) { self.paste_clipboard(cx); }
+        if self.ui.button(id!(k_copy)).clicked(&actions) { self.copy_selection(cx); }
         if self.ui.button(id!(k_ctrl)).clicked(&actions) {
             self.ctrl_pending = !self.ctrl_pending;
             self.update_modifier_labels(cx);
@@ -3562,6 +4212,20 @@ impl AppMain for App {
                 }
             }
             Event::Startup => { self.init(cx); }
+            // Going to the background is the last moment we are guaranteed to run:
+            // Android kills the process from here without further notice.
+            Event::Pause => {
+                self.save_sessions();
+            }
+            // Back on screen. Anything the OS froze or the network dropped while we
+            // were away gets dialled again, so the tabs are live by the time the user
+            // has finished looking at them.
+            Event::Resume => {
+                #[cfg(target_os = "android")]
+                for tab in &mut self.tabs {
+                    tab.reconnect();
+                }
+            }
             Event::Timer(_) => {
                 // Start deferred SSH connections ~0.5s after launch (off the
                 // startup/first-paint path). New tabs connect on the next tick.
@@ -3580,13 +4244,20 @@ impl AppMain for App {
                 for tab in &mut self.tabs {
                     tab.reap_finished_ssh();
                 }
-                // Flush response buffer (DA, DSR replies to PTY)
-                if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                    let mut g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
-                    if !g.response_buf.is_empty() {
-                        let resp = g.response_buf.drain(..).collect::<Vec<u8>>();
-                        drop(g);
-                        tab.write(&resp);
+                // Fallback flush for backends whose reader thread does not answer inline
+                // (the desktop PTY path). SSH tabs normally leave this empty because the
+                // sink replies immediately. Every tab is drained, not just the visible
+                // one: a background tab used to hoard its replies and dump them all at
+                // once when you switched to it, which is where the runs of
+                // `62;22c62;22c62;22c` came from.
+                for i in 0..self.tabs.len() {
+                    let resp = {
+                        let tab = &self.tabs[i];
+                        let mut g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
+                        g.take_response()
+                    };
+                    if !resp.is_empty() {
+                        self.tabs[i].write(&resp);
                     }
                 }
                 // Bell → attention. Every tab is scanned, not just the visible one:
@@ -3614,7 +4285,24 @@ impl AppMain for App {
                     let title = self.tabs[i].dynamic_title();
                     self.notify_attention(cx, i, &title);
                 }
+                // Finger drags land in the view, which has no way to reach the session;
+                // collect what they produced and act on it here.
+                let (notches, wcol, wrow) = self.ui.term_view(id!(terminal)).take_wheel();
+                self.send_wheel(notches, wcol, wrow);
+                if self.ui.term_view(id!(terminal)).take_copy_request() {
+                    self.copy_selection(cx);
+                }
                 self.blink_phase = self.blink_phase.wrapping_add(1);
+                // Persist the open-session list when it has actually changed — roughly
+                // once a second, so attaching a session inside the REPL is recorded
+                // without the file being rewritten 30 times a second.
+                if self.blink_phase % 30 == 0 {
+                    let sig = self.session_signature();
+                    if sig != self.session_sig {
+                        self.session_sig = sig;
+                        self.save_sessions();
+                    }
+                }
                 #[cfg(target_os = "android")]
                 self.poll_notification_tap(cx);
                 self.update_tab_label(cx);
@@ -4754,6 +5442,100 @@ mod tests {
         g.process(b"\x1b[18t"); // query text size
         let resp = String::from_utf8_lossy(&g.response_buf);
         assert!(resp.contains("8;24;80"));
+    }
+
+    // ── Device attributes: one answer per question ──
+    // Answering the wrong query (or answering `ESC[>c` with the primary reply) is how
+    // stale `62;22c` text ended up being typed into the shell.
+    #[test]
+    fn test_primary_device_attributes() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[c");
+        assert_eq!(g.take_response(), b"\x1b[?62;22c".to_vec());
+    }
+
+    #[test]
+    fn test_secondary_device_attributes() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[>c");
+        assert_eq!(g.take_response(), b"\x1b[>0;10;1c".to_vec());
+    }
+
+    #[test]
+    fn test_tertiary_device_attributes() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[=c");
+        assert_eq!(g.take_response(), b"\x1bP!|00000000\x1b\\".to_vec());
+    }
+
+    #[test]
+    fn test_device_attributes_reply_is_not_answered() {
+        // `ESC[?…c` is what a terminal *sends back*. Answering it makes two terminals
+        // talk past each other forever.
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[?62;22c");
+        assert!(g.take_response().is_empty());
+    }
+
+    #[test]
+    fn test_xtversion_is_answered() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[>q");
+        let resp = String::from_utf8_lossy(&g.response_buf).to_string();
+        assert!(resp.contains("leuwi-panjang"), "got {:?}", resp);
+    }
+
+    #[test]
+    fn test_take_response_drains() {
+        let mut g = new_grid(80, 24);
+        g.process(b"\x1b[c");
+        assert!(!g.take_response().is_empty());
+        // Second read finds nothing: a reply must be sent once, not once per frame.
+        assert!(g.take_response().is_empty());
+    }
+
+    // ── History completion ──
+    #[test]
+    fn test_history_suggestion_prefers_most_recent() {
+        let h = vec!["nvgpu-s main".to_string(), "nvgpu-s build".to_string()];
+        assert_eq!(history_suggestion(&h, "nvgpu-s "), Some("build".to_string()));
+    }
+
+    #[test]
+    fn test_history_suggestion_none_for_empty_or_exact() {
+        let h = vec!["help".to_string()];
+        assert_eq!(history_suggestion(&h, ""), None);
+        // An exact match has nothing left to suggest.
+        assert_eq!(history_suggestion(&h, "help"), None);
+        assert_eq!(history_suggestion(&h, "hel"), Some("p".to_string()));
+        assert_eq!(history_suggestion(&h, "xyz"), None);
+    }
+
+    // ── Session list round-trip ──
+    #[test]
+    fn test_session_state_roundtrip() {
+        let state = SessionState {
+            active: 1,
+            tabs: vec![
+                TabState { title: "leuwi 1".into(), cmd: String::new(), session: String::new() },
+                TabState { title: "nvgpu main".into(), cmd: "nvgpu-s".into(), session: "main".into() },
+            ],
+        };
+        let text = toml::to_string_pretty(&state).unwrap();
+        let back: SessionState = toml::from_str(&text).unwrap();
+        assert_eq!(back.active, 1);
+        assert_eq!(back.tabs.len(), 2);
+        assert_eq!(back.tabs[1].cmd, "nvgpu-s");
+        assert_eq!(back.tabs[1].session, "main");
+        // A tab still at the prompt carries no command and is restored as a prompt.
+        assert!(back.tabs[0].cmd.is_empty());
+    }
+
+    #[test]
+    fn test_session_state_missing_file_is_empty() {
+        let back: SessionState = toml::from_str("").unwrap();
+        assert!(back.tabs.is_empty());
+        assert_eq!(back.active, 0);
     }
 
     // ── Erase modes ──

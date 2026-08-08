@@ -1,5 +1,39 @@
+diff --git a/platform/src/os/linux/android/android.rs b/platform/src/os/linux/android/android.rs
+index e8b27fc..61d07e1 100644
+--- a/platform/src/os/linux/android/android.rs
++++ b/platform/src/os/linux/android/android.rs
+@@ -835,7 +835,11 @@ pub fn draw_pass_to_fullscreen(
+                     }));
+                     unsafe {
+                         if let Some(display) = &mut self.os.display { 
+-                            (display.libegl.eglSwapBuffers.unwrap())(display.egl_display, display.surface);
++                            // Surface can be destroyed by the OS (e.g. HyperOS density config
++                            // change). Swapping into a null surface floods EGL_BAD_SURFACE.
++                            if !display.surface.is_null() {
++                                (display.libegl.eglSwapBuffers.unwrap())(display.egl_display, display.surface);
++                            }
+                         }
+                     }
+                 }
+@@ -1093,13 +1097,13 @@ unsafe fn destroy_surface(&mut self) {
+     }
+ 
+     unsafe fn update_surface(&mut self, window: *mut ndk_sys::ANativeWindow) {
++        if self.surface.is_null() == false {
++            self.destroy_surface();
++        }
+         if !self.window.is_null() {
+             ndk_sys::ANativeWindow_release(self.window);
+         }
+         self.window = window;
+-        if self.surface.is_null() == false {
+-            self.destroy_surface();
+-        }
+ 
+         self.surface = (self.libegl.eglCreateWindowSurface.unwrap())(
+             self.egl_display,
 diff --git a/platform/src/os/linux/android/android_jni.rs b/platform/src/os/linux/android/android_jni.rs
-index 10305bf..0bd6f18 100644
+index 10305bf..2b00fc4 100644
 --- a/platform/src/os/linux/android/android_jni.rs
 +++ b/platform/src/os/linux/android/android_jni.rs
 @@ -687,8 +687,16 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_onWebSocketError(
@@ -20,6 +54,65 @@ index 10305bf..0bd6f18 100644
      (**env).ReleaseStringUTFChars.unwrap()(env, java_string, chars);
      rust_string
  }
+@@ -761,6 +769,35 @@ pub unsafe fn to_java_show_keyboard(visible: bool) {
+     ndk_utils::call_void_method!(env, get_activity(), "showKeyboard", "(Z)V", visible as i32);
+ }
+ 
++/// Post (or replace) a system notification for a terminal tab that is waiting on a
++/// response. `tab` doubles as the notification id, so re-ringing the same tab updates
++/// the existing notification instead of stacking a new one.
++pub unsafe fn to_java_show_notification(tab: i32, title: String, body: String) {
++    let env = attach_jni_env();
++    let title = CString::new(title).unwrap();
++    let title = ((**env).NewStringUTF.unwrap())(env, title.as_ptr());
++    let body = CString::new(body).unwrap();
++    let body = ((**env).NewStringUTF.unwrap())(env, body.as_ptr());
++    ndk_utils::call_void_method!(
++        env, get_activity(), "showTabNotification",
++        "(ILjava/lang/String;Ljava/lang/String;)V",
++        tab, title, body
++    );
++}
++
++pub unsafe fn to_java_cancel_notification(tab: i32) {
++    let env = attach_jni_env();
++    ndk_utils::call_void_method!(env, get_activity(), "cancelTabNotification", "(I)V", tab);
++}
++
++/// Tab index recorded when a notification was tapped, or -1. Reading it clears it.
++/// Polled from the frame tick rather than pushed from Java, which would need a whole
++/// native-callback registration path for one integer.
++pub unsafe fn to_java_take_pending_tab() -> i32 {
++    let env = attach_jni_env();
++    ndk_utils::call_int_method!(env, get_activity(), "takePendingTab", "()I")
++}
++
+ pub unsafe fn to_java_copy_to_clipboard(content: String) {
+     let env = attach_jni_env();
+     let content = CString::new(content.clone()).unwrap();
+@@ -768,6 +805,22 @@ pub unsafe fn to_java_copy_to_clipboard(content: String) {
+     ndk_utils::call_void_method!(env, get_activity(), "copyToClipboard", "(Ljava/lang/String;)V", content);
+ }
+ 
++/// Read the Android clipboard as plain text; empty when it holds nothing usable.
++/// Makepad's own paste path (`from_java_on_paste_from_clipboard`) is commented out
++/// upstream, so this is a direct synchronous pull, polled the same way as
++/// `to_java_take_pending_tab`. Android 10+ only serves the clipboard to the focused
++/// app, which is exactly when a paste button can be pressed.
++pub unsafe fn to_java_paste_from_clipboard() -> String {
++    let env = attach_jni_env();
++    let s = ndk_utils::call_object_method!(
++        env, get_activity(), "pasteFromClipboard", "()Ljava/lang/String;"
++    );
++    if s.is_null() {
++        return String::new();
++    }
++    jstring_to_string(env, s as jni_sys::jstring)
++}
++
+ pub unsafe fn to_java_http_request(request_id: LiveId, request: HttpRequest) {
+     let env = attach_jni_env();
+     let url = CString::new(request.url.clone()).unwrap();
 diff --git a/platform/src/os/linux/libc_sys.rs b/platform/src/os/linux/libc_sys.rs
 index 16fa9bd..dd6dc5a 100644
 --- a/platform/src/os/linux/libc_sys.rs
@@ -37,10 +130,25 @@ index 16fa9bd..dd6dc5a 100644
      
  extern "C"{
 diff --git a/platform/src/os/linux/opengl.rs b/platform/src/os/linux/opengl.rs
-index e2acc71..15217fd 100644
+index e2acc71..8becb33 100644
 --- a/platform/src/os/linux/opengl.rs
 +++ b/platform/src/os/linux/opengl.rs
-@@ -1025,8 +1025,9 @@ pub fn new(gl:&LibGl, vertex: &str, pixel: &str, os_type: &OsType) -> Self {
+@@ -944,8 +944,12 @@ pub fn new(gl:&LibGl, vertex: &str, pixel: &str, os_type: &OsType) -> Self {
+         let is_vendor_adreno = get_gl_string(gl, gl_sys::RENDERER).contains("Adreno"); 
+         
+         let (tex_ext_import, tex_ext_sampler) = if is_external_texture_supported && !is_vendor_adreno && !is_emulator {(
+-            "#extension GL_OES_EGL_image_external : require\n",
+-            "vec4 sample2dOES(samplerExternalOES sampler, vec2 pos){ return texture2D(sampler, vec2(pos.x, pos.y));}"
++            // ESSL3 (#version 300 es) removed texture2D() and deprecated the old
++            // GL_OES_EGL_image_external extension. Strict drivers (Mali) reject the old
++            // form outright, which fails vertex-shader compilation and leaves a black
++            // screen. The _essl3 variant defines the texture() overload for samplerExternalOES.
++            "#extension GL_OES_EGL_image_external_essl3 : require\n",
++            "vec4 sample2dOES(samplerExternalOES sampler, vec2 pos){ return texture(sampler, vec2(pos.x, pos.y));}"
+         )}
+         else{
+             ("","")
+@@ -1025,8 +1029,9 @@ pub fn new(gl:&LibGl, vertex: &str, pixel: &str, os_type: &OsType) -> Self {
          mat2 transpose(mat2 m){{return mat2(m[0][0],m[1][0],m[0][1],m[1][1]);}}
          ";
          */
@@ -52,7 +160,7 @@ index e2acc71..15217fd 100644
              {vertex_exts}
              {tex_ext_import}
              precision highp float;
-@@ -1037,8 +1038,7 @@ pub fn new(gl:&LibGl, vertex: &str, pixel: &str, os_type: &OsType) -> Self {
+@@ -1037,8 +1042,7 @@ pub fn new(gl:&LibGl, vertex: &str, pixel: &str, os_type: &OsType) -> Self {
              {vertex}\0",
          );
          //crate::log!("{}", vertex.replace("int mvo = 0;","int mvo = gl_ViewID_OVR==0?0:16;"));
@@ -102,3 +210,200 @@ index 2fd9886..cea6daf 100644
      }
      ret
  }
+diff --git a/tools/cargo_makepad/src/android/java/dev/makepad/android/MakepadActivity.java b/tools/cargo_makepad/src/android/java/dev/makepad/android/MakepadActivity.java
+index 0d02a22..98904b8 100644
+--- a/tools/cargo_makepad/src/android/java/dev/makepad/android/MakepadActivity.java
++++ b/tools/cargo_makepad/src/android/java/dev/makepad/android/MakepadActivity.java
+@@ -1,6 +1,10 @@
+ package dev.makepad.android;
+ 
+ import android.app.Activity;
++import android.app.NotificationManager;
++import android.app.NotificationChannel;
++import android.app.Notification;
++import android.app.PendingIntent;
+ import android.bluetooth.BluetoothAdapter;
+ import android.bluetooth.BluetoothDevice;
+ import android.bluetooth.BluetoothManager;
+@@ -312,6 +316,8 @@ public class MakepadActivity
+     @Override
+     public void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
++        requestNotificationPermission();
++        captureLeuwiTab(getIntent());
+         
+         this.requestWindowFeature(Window.FEATURE_NO_TITLE);
+ 
+@@ -476,6 +482,22 @@ public class MakepadActivity
+         clipboard.setPrimaryClip(clip);
+     }
+ 
++    // Counterpart of copyToClipboard: hand the clipboard's plain text to native code.
++    // Never throws across JNI — an unreadable clipboard is reported as an empty string.
++    public String pasteFromClipboard() {
++        try {
++            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
++            if (clipboard == null || !clipboard.hasPrimaryClip()) return "";
++            ClipData clip = clipboard.getPrimaryClip();
++            if (clip == null || clip.getItemCount() == 0) return "";
++            CharSequence text = clip.getItemAt(0).coerceToText(this);
++            return text == null ? "" : text.toString();
++        } catch (Exception e) {
++            Log.e("Makepad", "pasteFromClipboard failed", e);
++            return "";
++        }
++    }
++
+     private String getApplicationName() {
+         ApplicationInfo applicationInfo = getApplicationContext().getApplicationInfo();
+         CharSequence appName = applicationInfo.loadLabel(getPackageManager());
+@@ -733,4 +755,90 @@ public class MakepadActivity
+ 
+         return refreshRate;
+     }
++
++    // ---- Terminal tab notifications -------------------------------------------
++    // A tab that rings the bell while backgrounded (an AI CLI waiting on an answer)
++    // posts one of these. Tapping it brings the app back and hands the tab index to
++    // the Rust side via takePendingTab(), which it polls on its frame tick.
++    private static final String LEUWI_CHANNEL = "leuwi_tabs";
++    private static int sPendingTab = -1;
++
++
++    private void requestNotificationPermission() {
++        try {
++            if (android.os.Build.VERSION.SDK_INT >= 33) {
++                if (checkSelfPermission("android.permission.POST_NOTIFICATIONS")
++                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
++                    requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 1001);
++                }
++            }
++        } catch (Exception e) {
++            Log.e("Makepad", "requestNotificationPermission failed", e);
++        }
++    }
++
++    public void showTabNotification(int tab, String title, String body) {
++        try {
++            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
++            if (android.os.Build.VERSION.SDK_INT >= 26) {
++                NotificationChannel ch = new NotificationChannel(
++                    LEUWI_CHANNEL, "Terminal", NotificationManager.IMPORTANCE_HIGH);
++                ch.setDescription("Sesi terminal yang menunggu respons");
++                nm.createNotificationChannel(ch);
++            }
++            Intent intent = new Intent(this, getClass());
++            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP);
++            intent.putExtra("leuwi_tab", tab);
++            int flags = PendingIntent.FLAG_CANCEL_CURRENT;
++            if (android.os.Build.VERSION.SDK_INT >= 23) flags |= PendingIntent.FLAG_IMMUTABLE;
++            // Request code must differ per tab, or every tab reuses the first intent.
++            PendingIntent pi = PendingIntent.getActivity(this, tab, intent, flags);
++
++            Notification.Builder b = (android.os.Build.VERSION.SDK_INT >= 26)
++                ? new Notification.Builder(this, LEUWI_CHANNEL)
++                : new Notification.Builder(this);
++            b.setContentTitle(title)
++             .setContentText(body)
++             .setSmallIcon(android.R.drawable.ic_dialog_email)
++             .setAutoCancel(true)
++             .setContentIntent(pi);
++            nm.notify(tab, b.build());
++        } catch (Exception e) {
++            Log.e("Makepad", "showTabNotification failed", e);
++        }
++    }
++
++    public void cancelTabNotification(int tab) {
++        try {
++            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
++            nm.cancel(tab);
++        } catch (Exception e) {
++            Log.e("Makepad", "cancelTabNotification failed", e);
++        }
++    }
++
++    public int takePendingTab() {
++        int t = sPendingTab;
++        if (t >= 0) Log.i("Makepad", "leuwi: takePendingTab -> " + t);
++        sPendingTab = -1;
++        return t;
++    }
++
++    private void captureLeuwiTab(Intent intent) {
++        boolean has = intent != null && intent.hasExtra("leuwi_tab");
++        Log.i("Makepad", "leuwi: captureLeuwiTab has=" + has);
++        if (has) {
++            sPendingTab = intent.getIntExtra("leuwi_tab", -1);
++            Log.i("Makepad", "leuwi: sPendingTab=" + sPendingTab);
++        }
++    }
++
++    @Override
++    protected void onNewIntent(Intent intent) {
++        Log.i("Makepad", "leuwi: onNewIntent");
++        super.onNewIntent(intent);
++        setIntent(intent);
++        captureLeuwiTab(intent);
++    }
++
+ }
+diff --git a/tools/cargo_makepad/src/android/mod.rs b/tools/cargo_makepad/src/android/mod.rs
+index fe021e5..3267d22 100644
+--- a/tools/cargo_makepad/src/android/mod.rs
++++ b/tools/cargo_makepad/src/android/mod.rs
+@@ -30,23 +30,29 @@ fn from_str(opt: &str) -> Result<Self,String> {
+     }
+     
+     fn manifest_xml(&self, label:&str, class_name:&str, url:&str, sdk_version: usize)->String{
++        let version_code = std::env::var("MAKEPAD_VERSION_CODE").unwrap_or_else(|_| "1".to_string());
++        let version_name = std::env::var("MAKEPAD_VERSION_NAME").unwrap_or_else(|_| "1.0".to_string());
+         match self{
+             Self::Default=>format!(r#"<?xml version="1.0" encoding="utf-8"?>
+                 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+                 xmlns:tools="http://schemas.android.com/tools"
+-                package="{url}">
++                package="{url}"
++                android:versionCode="{version_code}"
++                android:versionName="{version_name}">
+                 <application
+                     android:label="{label}"
++                    android:icon="@mipmap/ic_launcher"
+                     android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+                     android:allowBackup="true"
+                     android:supportsRtl="true"
+-                    android:debuggable="true"
+                     android:largeHeap="true"
+                     tools:targetApi="{sdk_version}">
+                     <meta-data android:name="android.max_aspect" android:value="2.1" />
+                     <activity
+                     android:name=".{class_name}"
+-                    android:configChanges="orientation|screenSize|keyboardHidden"
++                    android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|layoutDirection|fontScale"
++                    android:windowSoftInputMode="adjustResize"
++                    android:launchMode="singleTop"
+                     android:exported="true">
+                     <intent-filter>
+                         <action android:name="android.intent.action.MAIN" />
+@@ -56,20 +62,9 @@ fn manifest_xml(&self, label:&str, class_name:&str, url:&str, sdk_version: usize
+                 </application>
+                 <uses-sdk android:targetSdkVersion="{sdk_version}" />
+                 <uses-feature android:glEsVersion="0x00020000" android:required="true"/>
+-                <uses-feature android:name="android.hardware.bluetooth_le" android:required="true"/>
+-                <uses-feature android:name="android.software.midi" android:required="true"/>
+-                <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+-                <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"  />
+-                <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"  />
+                 <uses-permission android:name="android.permission.INTERNET" />
+                 <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+-                <uses-permission android:name="android.permission.BLUETOOTH"/>
+-                <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+-                <uses-permission android:name="android.permission.CAMERA"/>
+-                <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+-                <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+-                <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+-                <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
++                <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+                             
+                 <queries>
+                 <intent>

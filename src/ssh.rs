@@ -298,8 +298,17 @@ impl client::Handler for Client {
 // ── shared connect + authenticate ──────────────────────────
 async fn connect_auth(p: &SshProfile) -> Result<client::Handle<Client>, String> {
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(3600)),
-        keepalive_interval: Some(Duration::from_secs(30)),
+        // No inactivity timeout: a session left open overnight is the normal case here
+        // (that is what tmux is for), and dropping it after an hour of silence is
+        // exactly the "came back and everything was gone" failure. Liveness is decided
+        // by keepalives instead, which say something about the *link* rather than about
+        // how recently the user typed.
+        inactivity_timeout: None,
+        // Three unanswered keepalives ≈ 45 s to notice a dead link — quick enough that
+        // the tab reconnects itself soon after the phone wakes, slow enough to ride out
+        // a mobile network hiccup.
+        keepalive_interval: Some(Duration::from_secs(15)),
+        keepalive_max: 3,
         ..Default::default()
     });
 

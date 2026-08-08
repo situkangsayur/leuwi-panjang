@@ -22,6 +22,12 @@ KS="${LEUWI_KEYSTORE:-$HOME/.android/leuwi-release.keystore}"
 KS_PASS="${LEUWI_KS_PASS:-leuwipanjang}"
 KS_ALIAS="${LEUWI_KS_ALIAS:-leuwi}"
 
+# The makepad fork edits live in ~/.cargo and vanish on a fresh checkout; without them
+# the APK crashes on launch or fails to compile. Re-applied only when missing, because
+# applying also forces a full makepad-platform rebuild.
+"$CRATE_DIR/install/apply-makepad-patches.sh" --check >/dev/null 2>&1 \
+  || "$CRATE_DIR/install/apply-makepad-patches.sh"
+
 VERSION_NAME="$(grep -m1 '^version_name' "$CRATE_DIR/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 VERSION_CODE="$(grep -m1 '^version_code' "$CRATE_DIR/Cargo.toml" | sed 's/[^0-9]*\([0-9]*\).*/\1/')"
 [ -n "$VERSION_NAME" ] && [ -n "$VERSION_CODE" ] || { echo "ERROR: cannot read version_name/version_code from Cargo.toml"; exit 1; }
