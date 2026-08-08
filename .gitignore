@@ -1,0 +1,4 @@
+# This branch carries release binaries only — never the build tree. A stray
+# `git add -A` here once staged 20k files out of target/.
+/target/
+/Cargo.lock

@@ -3,12 +3,37 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.1
+## Download — v0.1.3
 
-- **[⬇ leuwipanjang_v0.1.1.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.1.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.3.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.3.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
 ~55 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.3
+
+The release that makes the app survive being put down.
+
+- **Sessions come back.** Open tabs are written down and re-attached on launch, and a
+  connection the phone drops is dialled again — tmux was still holding the session on the
+  server all along; only the app's knowledge of it was lost. The SSH layer also had a
+  one-hour inactivity timeout, which by itself killed anything left overnight; liveness is
+  now decided by keepalives instead.
+- **Command history is kept**, shared across tabs, with a greyed-out completion from past
+  commands that Tab or → accepts. It used to live in memory only, and Android kills a
+  backgrounded app without warning.
+- **No more `62;22c` filling the screen.** Two causes: replies to terminal capability
+  questions were being sent late and to the wrong question, and — the bigger one — the
+  remote PTY was requested at the desktop config's 115 columns while the phone draws about
+  23, so every tmux status redraw wrapped five times.
+- **Touch scroll and copy/paste.** A drag scrolls inside tmux (needs `tmux set -g mouse on`
+  — arrow keys are deliberately *not* faked, they would type old commands into your shell),
+  a long press selects and copies to the Android clipboard on release, and **Tempel** pastes
+  from any other app. `keygen` now copies the public key straight to the clipboard, and
+  `pubkey` re-copies it later.
+- **Bigger touch targets** — tab entries and the tab-list/new/close/settings buttons.
+- **7× less CPU when idle** (a full core down to about 14% of one): the terminal only
+  repaints when something actually changed.
 
 ## What's new in 0.1.1
 
