@@ -124,13 +124,6 @@ pub(crate) fn default_key_path() -> PathBuf {
         .join(".ssh/id_rsa")
 }
 
-/// Generate a fresh ed25519 keypair at `path` (replacing any existing one) and return
-/// the public key line to install in the server's `authorized_keys`. Used by the built-in
-/// `keygen` command so a phone can be enrolled without going through a laptop.
-///
-/// The seed is read straight from `/dev/urandom` rather than going through a rand_core
-/// `OsRng`: ssh-key and russh pull in different rand_core majors, so the trait bounds
-/// don't line up, and a 32-byte seed needs no RNG plumbing at all.
 /// The public half of an existing key, in `authorized_keys` form. Reads the cached
 /// `.pub` when it is there and otherwise derives it from the private key, so a key
 /// provisioned by hand (adb push, file import) still yields something to paste.
@@ -148,6 +141,13 @@ pub(crate) fn public_key_of(path: &Path) -> Result<String, String> {
         .map_err(|e| format!("encode public key: {e}"))
 }
 
+/// Generate a fresh ed25519 keypair at `path` (replacing any existing one) and return
+/// the public key line to install in the server's `authorized_keys`. Used by the built-in
+/// `keygen` command so a phone can be enrolled without going through a laptop.
+///
+/// The seed is read straight from `/dev/urandom` rather than going through a rand_core
+/// `OsRng`: ssh-key and russh pull in different rand_core majors, so the trait bounds
+/// don't line up, and a 32-byte seed needs no RNG plumbing at all.
 pub(crate) fn generate_key(path: &Path, comment: &str) -> Result<String, String> {
     use russh::keys::ssh_key::private::Ed25519Keypair;
     use russh::keys::ssh_key::LineEnding;
@@ -416,12 +416,24 @@ pub struct SshHandle {
     /// Set by the worker when the session ends (clean exit or error), so the tab
     /// can drop this handle and return to the built-in prompt.
     done: Arc<AtomicBool>,
+    /// Set when the *remote command* reported an exit status — i.e. tmux ended because
+    /// someone typed `exit`, not because the link died. A dropped connection never
+    /// delivers one, which is the only trustworthy way to tell the two apart: both look
+    /// identical from the outside, and "the session lasted a while" says nothing (a
+    /// session you worked in for an hour and then exited looks exactly like a healthy
+    /// one that dropped).
+    exited: Arc<AtomicBool>,
 }
 
 impl SshHandle {
     /// True once the SSH worker has finished — the tab should fall back to the prompt.
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Relaxed)
+    }
+    /// True when the remote command ended by itself (`exit` in tmux). The tab uses this
+    /// to decide between "go back to the prompt" and "the phone dropped us, redial".
+    pub fn exited_cleanly(&self) -> bool {
+        self.exited.load(Ordering::Relaxed)
     }
     pub fn writer(&self) -> SshWriter {
         SshWriter { tx: self.tx.clone() }
@@ -460,6 +472,8 @@ where
     let (tx, rx) = mpsc::unbounded_channel::<InMsg>();
     let done = Arc::new(AtomicBool::new(false));
     let done_worker = done.clone();
+    let exited = Arc::new(AtomicBool::new(false));
+    let exited_worker = exited.clone();
     // Spawn best-effort: never panic the caller (UI thread) if the OS refuses a
     // thread. The whole worker body is caught so an SSH/tokio/ring panic can't
     // escape and abort the process.
@@ -475,7 +489,7 @@ where
                     }
                 };
                 rt.block_on(async move {
-                    if let Err(e) = run_session(&profile, &mut sink, rx).await {
+                    if let Err(e) = run_session(&profile, &mut sink, rx, &exited_worker).await {
                         sink(format!("\r\n\x1b[31m{}\x1b[0m\r\n", e).as_bytes());
                     }
                 });
@@ -487,13 +501,14 @@ where
         done.store(true, Ordering::Relaxed);
         // Extremely unlikely, but degrade gracefully instead of panicking.
     }
-    SshHandle { tx, done }
+    SshHandle { tx, done, exited }
 }
 
 async fn run_session<S>(
     p: &SshProfile,
     sink: &mut S,
     mut rx: mpsc::UnboundedReceiver<InMsg>,
+    exited: &AtomicBool,
 ) -> Result<(), String>
 where
     S: FnMut(&[u8]),
@@ -525,6 +540,9 @@ where
                     Some(ChannelMsg::Data { data }) => sink(&data),
                     Some(ChannelMsg::ExtendedData { data, .. }) => sink(&data),
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        // The remote command finished on its own terms. Recorded before
+                        // the loop ends so the tab knows this was `exit`, not a drop.
+                        exited.store(true, Ordering::Relaxed);
                         sink(format!("\r\n\x1b[2m[sesi berakhir, status {}]\x1b[0m\r\n", exit_status).as_bytes());
                     }
                     Some(ChannelMsg::Eof) | None => break,
@@ -540,6 +558,7 @@ where
                         let _ = channel.window_change(c as u32, r as u32, 0, 0).await;
                     }
                     Some(InMsg::Close) | None => {
+                        exited.store(true, Ordering::Relaxed);
                         let _ = channel.eof().await;
                         break;
                     }

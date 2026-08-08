@@ -627,6 +627,46 @@ struct TermTab {
     /// Consecutive short-lived connections. Stops a dead host from being redialled
     /// forever; reset as soon as a session survives long enough to be real.
     reconnect_fails: u32,
+    /// Whether this tab still *wants* a live session. Cleared when the remote command
+    /// ends by itself — typing `exit` in tmux means "I am done", and redialling that is
+    /// the app arguing with the user. Set again by `sambung` or a new connect command.
+    auto_reconnect: bool,
+}
+
+/// What a finished SSH session means for the tab it was running in.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum SessionEnd {
+    /// The remote command ended by itself (`exit` in tmux). Back to the built-in prompt,
+    /// and stay there — including across Resume.
+    UserExited,
+    /// The link died under a session that was supposed to be running. tmux still holds
+    /// it on the server, so dial straight back in.
+    Redial,
+    /// Redialling is not working (or was never wanted). Back to the prompt, with the
+    /// session remembered so `sambung` can try again by hand.
+    GiveUp,
+}
+
+/// Decide what to do with a session that has ended.
+///
+/// Split out and tested because the first version of this got it backwards: it inferred
+/// "was this a drop?" from how long the session had lasted, so a session you worked in
+/// for an hour and then exited looked exactly like a healthy connection dropping, and the
+/// app dialled it straight back every time you typed `exit`. Only the remote exit status
+/// distinguishes the two.
+fn classify_session_end(
+    user_exited: bool,
+    auto_reconnect: bool,
+    fails: u32,
+    max_fails: u32,
+) -> SessionEnd {
+    if user_exited {
+        SessionEnd::UserExited
+    } else if auto_reconnect && fails < max_fails {
+        SessionEnd::Redial
+    } else {
+        SessionEnd::GiveUp
+    }
 }
 
 /// The completion offered for `line` given past commands: the tail of the most recent
@@ -825,7 +865,7 @@ impl TermTab {
             title: format!("leuwi {}", id),
             attention: false,
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
-            origin: None, last_profile: None, connected_at: None, reconnect_fails: 0,
+            origin: None, last_profile: None, connected_at: None, reconnect_fails: 0, auto_reconnect: false,
         }
     }
 
@@ -846,29 +886,51 @@ impl TermTab {
     fn reap_finished_ssh(&mut self) {
         let finished = self.ssh.as_ref().map(|h| h.is_done()).unwrap_or(false);
         if !finished { return; }
+        // Read before the handle goes: did the remote command end by itself?
+        let user_exited = self.ssh.as_ref().map(|h| h.exited_cleanly()).unwrap_or(false);
         self.ssh = None;
         self.writer = None;
 
-        // A session that stayed up for a while was working; the drop is the phone's
-        // doing, so the failure counter starts fresh.
-        let was_long = self.connected_at
-            .map(|t| t.elapsed() >= std::time::Duration::from_secs(20))
-            .unwrap_or(false);
-        if was_long { self.reconnect_fails = 0; }
-        self.connected_at = None;
-
+        // `exit` in tmux is an instruction, not a failure. The tab goes back to the
+        // built-in prompt and stays there — including across Resume, which is why the
+        // flag is cleared rather than just skipping the redial once. (An earlier version
+        // decided this from how long the session had lasted, which got it exactly
+        // backwards: a session you worked in and then exited had lasted a long time, so
+        // it was read as a healthy connection dropping and dialled straight back.)
         const MAX_QUICK_FAILS: u32 = 3;
-        match self.last_profile.clone() {
-            Some(profile) if self.reconnect_fails < MAX_QUICK_FAILS => {
+        match classify_session_end(user_exited, self.auto_reconnect, self.reconnect_fails, MAX_QUICK_FAILS) {
+            SessionEnd::UserExited => {
+                self.auto_reconnect = false;
+                self.reconnect_fails = 0;
+                self.connected_at = None;
+                self.title = "leuwi".into();
+                // The saved session list should not bring this tab back attached either.
+                self.origin = None;
+                if let Some(r) = self.repl.as_mut() { r.rendered_rows = 0; }
+                let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
+                g.process(b"\r\n");
+                g.process(Repl::PROMPT.as_bytes());
+            }
+            SessionEnd::Redial => {
+                // A session that stayed up for a while was working; the drop is the
+                // phone's doing, so the failure counter starts fresh.
+                let was_long = self.connected_at
+                    .map(|t| t.elapsed() >= std::time::Duration::from_secs(20))
+                    .unwrap_or(false);
+                if was_long { self.reconnect_fails = 0; }
+                self.connected_at = None;
                 self.reconnect_fails += 1;
                 {
                     let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
                     g.process(b"\r\n\x1b[2mterputus - menyambung ulang...\x1b[0m\r\n");
                 }
-                self.pending_profile = Some(profile);
-                self.start_pending_ssh();
+                if let Some(profile) = self.last_profile.clone() {
+                    self.pending_profile = Some(profile);
+                    self.start_pending_ssh();
+                }
             }
-            _ => {
+            SessionEnd::GiveUp => {
+                self.connected_at = None;
                 self.title = "leuwi".into();
                 // Control is going back to the built-in prompt, drawn fresh at column 0.
                 if let Some(r) = self.repl.as_mut() { r.rendered_rows = 0; }
@@ -882,11 +944,16 @@ impl TermTab {
         }
     }
 
-    /// Dial the tab's last session again, whatever state it is in. Used by the
-    /// `sambung` command and when the app returns to the foreground.
+    /// Dial the tab's last session again. `asked_for` separates the two callers: the
+    /// `sambung` command means "yes, I want it back" and revives a tab the user had
+    /// exited, while the app returning to the foreground must only revive sessions that
+    /// were still meant to be running.
     #[cfg(target_os = "android")]
-    fn reconnect(&mut self) -> bool {
+    fn reconnect(&mut self, asked_for: bool) -> bool {
         if self.ssh.is_some() || self.pending_profile.is_some() {
+            return false;
+        }
+        if !asked_for && !self.auto_reconnect {
             return false;
         }
         match self.last_profile.clone() {
@@ -1172,7 +1239,8 @@ impl TermTab {
         // of where the caret sits has to start over.
         if let Some(r) = self.repl.as_mut() { r.rendered_rows = 0; }
         if do_reconnect {
-            self.reconnect();
+            // Typed by hand, so it revives even a tab that was exited on purpose.
+            self.reconnect(true);
         }
         if let Some(profile) = connect {
             // Tab title shows which session it holds, since tabs can now be on
@@ -1206,6 +1274,7 @@ impl TermTab {
             // else to learn where it was.
             self.last_profile = Some(profile.clone());
             self.connected_at = Some(std::time::Instant::now());
+            self.auto_reconnect = true;
             let sink_grid = self.grid.clone();
             // Filled immediately below; the sink cannot run before the connection is up.
             let reply: Arc<Mutex<Option<ssh::SshWriter>>> = Arc::new(Mutex::new(None));
@@ -1270,7 +1339,7 @@ impl TermTab {
             title: format!("nvgpu {}", id),
             attention: false,
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
-            origin: None, last_profile: None, connected_at: None, reconnect_fails: 0,
+            origin: None, last_profile: None, connected_at: None, reconnect_fails: 0, auto_reconnect: false,
         }
     }
 
@@ -1320,7 +1389,7 @@ impl TermTab {
             }
         });
 
-        Self { grid, writer: Some(writer), master: Some(master), ssh: None, pending_profile: None, title: format!("Terminal {}", id), attention: false, split: None, split_dir: SplitDir::Vertical, split_focused: false, origin: None, last_profile: None, connected_at: None, reconnect_fails: 0 }
+        Self { grid, writer: Some(writer), master: Some(master), ssh: None, pending_profile: None, title: format!("Terminal {}", id), attention: false, split: None, split_dir: SplitDir::Vertical, split_focused: false, origin: None, last_profile: None, connected_at: None, reconnect_fails: 0, auto_reconnect: false }
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -2021,7 +2090,7 @@ impl TermGrid {
                                     // re-asking on every redraw; naming ourselves ends it.
                                     b'q' if intermediate == b'>' => {
                                         self.response_buf.extend_from_slice(
-                                            b"\x1bP>|leuwi-panjang(0.1.3)\x1b\\");
+                                            b"\x1bP>|leuwi-panjang(0.1.4)\x1b\\");
                                     }
                                     b'q' => {
                                         // DECSCUSR — Set Cursor Style
@@ -4389,7 +4458,9 @@ impl AppMain for App {
             Event::Resume => {
                 #[cfg(target_os = "android")]
                 for tab in &mut self.tabs {
-                    tab.reconnect();
+                    // Only sessions that were still meant to be live: a tab the user
+                    // exited stays at its prompt.
+                    tab.reconnect(false);
                 }
             }
             Event::Timer(_) => {
@@ -5632,6 +5703,33 @@ mod tests {
         g.process(b"\x1b[18t"); // query text size
         let resp = String::from_utf8_lossy(&g.response_buf);
         assert!(resp.contains("8;24;80"));
+    }
+
+    // ── What a finished session means ──
+    // The rule this pins down was wrong once, in the direction that annoyed the user
+    // most: typing `exit` in tmux dialled straight back in.
+    #[test]
+    fn test_exit_returns_to_prompt_however_long_the_session_ran() {
+        // The remote reported an exit status: an instruction, never a redial — and not
+        // even when the tab was otherwise happily reconnecting.
+        assert_eq!(classify_session_end(true, true, 0, 3), SessionEnd::UserExited);
+        assert_eq!(classify_session_end(true, false, 0, 3), SessionEnd::UserExited);
+        assert_eq!(classify_session_end(true, true, 2, 3), SessionEnd::UserExited);
+    }
+
+    #[test]
+    fn test_dropped_link_is_redialled() {
+        // No exit status = the link died under a session that was meant to be running.
+        assert_eq!(classify_session_end(false, true, 0, 3), SessionEnd::Redial);
+        assert_eq!(classify_session_end(false, true, 2, 3), SessionEnd::Redial);
+    }
+
+    #[test]
+    fn test_redialling_gives_up_and_never_starts_unasked() {
+        // Out of attempts: stop, and let `sambung` try by hand.
+        assert_eq!(classify_session_end(false, true, 3, 3), SessionEnd::GiveUp);
+        // A tab the user exited stays exited even if the link then drops.
+        assert_eq!(classify_session_end(false, false, 0, 3), SessionEnd::GiveUp);
     }
 
     // ── Selection does not drag the empty cells along ──
