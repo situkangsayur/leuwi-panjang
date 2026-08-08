@@ -3,12 +3,18 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.3
+## Download — v0.1.4
 
-- **[⬇ leuwipanjang_v0.1.3.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.3.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.4.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.4.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
 ~55 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.4
+
+- **`exit` in tmux returns to the `leuwi>` prompt.** It used to dial the session straight
+  back and recreate what you had just closed. Only a connection that actually dropped is
+  redialled now; `sambung` brings back one you ended on purpose.
 
 ## What's new in 0.1.3
 
