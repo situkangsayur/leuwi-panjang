@@ -665,11 +665,16 @@ struct Repl {
     /// Without this the `[` and `A` of an arrow key fall through to the printable
     /// branch and get typed into the line.
     esc: u8,
+    /// How many screen rows below the first one the caret sat after the last draw —
+    /// non-zero only once the line is long enough to wrap. See `redraw_line`.
+    rendered_rows: usize,
 }
 
 #[cfg(target_os = "android")]
 impl Repl {
     const PROMPT: &'static str = "\x1b[1;38;5;39mleuwi\x1b[0m\x1b[2m>\x1b[0m ";
+    /// Printable width of PROMPT ("leuwi> "); the escapes in it occupy no cells.
+    const PROMPT_WIDTH: usize = 7;
     /// How many lines the on-disk history keeps. Old entries fall off the front.
     const HISTORY_MAX: usize = 500;
 
@@ -737,27 +742,57 @@ impl Repl {
             "  clear          bersihkan layar\r\n",
             "  help           tampilkan bantuan ini\r\n",
             "\x1b[2mperintah lain diteruskan ke /system/bin/sh (non-interaktif)\x1b[0m\r\n",
+            "\r\n\x1b[2msentuhan:\x1b[0m\r\n",
+            "  geser         scroll layar\r\n",
+            "  tekan lama    pilih teks (dilepas = tersalin)\r\n",
+            "  Tempel/Salin  papan klip Android\r\n",
+            "\x1b[2muntuk scroll di dalam tmux: \x1b[0mtmux set -g mouse on\r\n",
         ));
         s
     }
 
     fn new() -> Self {
-        Self { line: String::new(), history: Self::load_history(), hist_pos: None, esc: 0 }
+        Self { line: String::new(), history: Self::load_history(), hist_pos: None, esc: 0, rendered_rows: 0 }
     }
 
     /// Redraw the prompt, the current line, and the greyed-out completion behind the
     /// cursor. The ghost is drawn *after* the cursor position and then stepped back
     /// over, so the caret stays where the user is typing (fish-style).
-    fn redraw_line(&self, g: &mut TermGrid) {
-        g.process(b"\r");
+    ///
+    /// The wrapping is the fiddly part. `\r` goes to the start of the *screen row*, not
+    /// the start of the logical line, so on a 23-column phone a line long enough to wrap
+    /// used to be redrawn one row lower on every keystroke — the prompt printed itself
+    /// down the screen. `rendered_rows` remembers how far down the caret sat after the
+    /// last draw so the redraw can climb back to the first row and erase from there.
+    fn redraw_line(&mut self, g: &mut TermGrid) {
+        self.draw_line(g, true);
+    }
+
+    /// `redraw_line`, with the completion suppressed when the line is about to be
+    /// committed — a ghost left on screen at that moment reads as typed text.
+    fn draw_line(&mut self, g: &mut TermGrid, show_ghost: bool) {
+        let width = g.cols.max(1);
+        // Climb to the first row of the wrapped block, then wipe it and everything after.
+        if self.rendered_rows > 0 {
+            g.process(format!("\x1b[{}A", self.rendered_rows).as_bytes());
+        }
+        g.process(b"\r\x1b[J");
         g.process(Repl::PROMPT.as_bytes());
         g.process(self.line.as_bytes());
-        g.process(b"\x1b[K");
-        if let Some(rest) = self.suggestion() {
-            g.process(b"\x1b[2m");
-            g.process(rest.as_bytes());
-            g.process(b"\x1b[0m");
-            g.process(format!("\x1b[{}D", rest.chars().count()).as_bytes());
+
+        let head = Repl::PROMPT_WIDTH + self.line.chars().count();
+        self.rendered_rows = head / width;
+        // The completion is only drawn when it fits on the caret's own row: stepping
+        // back over a ghost that wrapped would need cursor-up as well, and a completion
+        // is a hint, not something worth risking the line's layout for.
+        if let Some(rest) = self.suggestion().filter(|_| show_ghost) {
+            let len = rest.chars().count();
+            if head % width + len < width {
+                g.process(b"\x1b[2m");
+                g.process(rest.as_bytes());
+                g.process(b"\x1b[0m");
+                g.process(format!("\x1b[{}D", len).as_bytes());
+            }
         }
     }
 
@@ -834,6 +869,8 @@ impl TermTab {
             }
             _ => {
                 self.title = "leuwi".into();
+                // Control is going back to the built-in prompt, drawn fresh at column 0.
+                if let Some(r) = self.repl.as_mut() { r.rendered_rows = 0; }
                 let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
                 g.process(b"\r\n\x1b[2msesi berakhir\x1b[0m\r\n");
                 if self.last_profile.is_some() {
@@ -929,11 +966,12 @@ impl TermTab {
                     }
                     b'\r' | b'\n' => {
                         // Wipe the ghost completion before the newline, or it would be
-                        // left behind on screen as if it had been typed.
-                        g.process(b"\r");
-                        g.process(Repl::PROMPT.as_bytes());
-                        g.process(repl.line.as_bytes());
-                        g.process(b"\x1b[K\r\n");
+                        // left behind on screen as if it had been typed. Going through
+                        // redraw_line (with the completion suppressed) keeps the wrapped
+                        // case correct; a bare `\r` would land mid-block.
+                        repl.draw_line(&mut g, false);
+                        g.process(b"\r\n");
+                        repl.rendered_rows = 0;
                         let line = std::mem::take(&mut repl.line);
                         // Skip blanks and immediate repeats, the way a shell does.
                         if !line.trim().is_empty() && repl.history.last() != Some(&line) {
@@ -955,6 +993,7 @@ impl TermTab {
                         repl.hist_pos = None;
                         g.process(b"^C\r\n");
                         g.process(Repl::PROMPT.as_bytes());
+                        repl.rendered_rows = 0;
                     }
                     b if b >= 0x20 => {
                         repl.line.push(b as char);
@@ -1092,6 +1131,9 @@ impl TermTab {
             if !out.is_empty() { g.process(out.as_bytes()); }
             if connect.is_none() && !suppress_prompt { g.process(Repl::PROMPT.as_bytes()); }
         }
+        // The prompt above was printed straight to the grid, so the line editor's idea
+        // of where the caret sits has to start over.
+        if let Some(r) = self.repl.as_mut() { r.rendered_rows = 0; }
         if do_reconnect {
             self.reconnect();
         }
@@ -1110,7 +1152,19 @@ impl TermTab {
     /// Start a deferred SSH connection into this tab's existing grid (Android).
     /// No-op if there is nothing pending or a connection already exists.
     fn start_pending_ssh(&mut self) {
-        if let Some(profile) = self.pending_profile.take() {
+        if let Some(mut profile) = self.pending_profile.take() {
+            // Ask for a PTY the size of the grid we actually draw, not the size in
+            // config.toml. The config default (115x33) is a desktop window; a phone in
+            // portrait is around 23 columns. Handing tmux a 115-column terminal and
+            // then drawing 23 of them makes every status-line redraw wrap five times,
+            // which is what filled the screen with repeated green status bars. The
+            // window-change on the first layout used to be the only correction, and it
+            // fires before the connection exists.
+            {
+                let g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
+                profile.cols = g.cols as u16;
+                profile.rows = g.rows as u16;
+            }
             // Remembered for the reconnect path — a dropped connection has nowhere
             // else to learn where it was.
             self.last_profile = Some(profile.clone());
@@ -1551,7 +1605,18 @@ impl TermGrid {
             }
             if r < e.0 { text.push('\n'); }
         }
-        let trimmed = text.trim_end().to_string();
+        // A terminal row is a fixed grid of cells, so dragging across "43" on an
+        // 80-column screen also drags 78 blank cells. Pasting that back somewhere would
+        // carry the padding along — which is how a two-character copy came back as a
+        // full-width line. Every line loses its trailing blanks; interior lines keep
+        // their own content untouched.
+        let trimmed = text
+            .lines()
+            .map(|l| l.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end()
+            .to_string();
         if trimmed.is_empty() { None } else { Some(trimmed) }
     }
 
@@ -2063,6 +2128,10 @@ pub struct TermView {
     /// 1-based (col, row) on the visible screen where the wheel is being turned.
     /// Mouse reports carry a position, and tmux uses it to decide which pane scrolls.
     #[rust] wheel_cell: (usize, usize),
+    /// Frame ticks the finger has been down without moving. Android delivers no touch
+    /// events at all while a finger is held perfectly still, so a long press cannot be
+    /// detected from touch events alone — the frame tick counts it instead.
+    #[rust] hold_ticks: u32,
 }
 
 /// How long a finger must stay put before a drag becomes a selection.
@@ -2142,6 +2211,21 @@ impl Widget for TermView {
             }
             // Touch (Android): one-finger drag scrolls scrollback; a tap raises the
             // soft keyboard. Desktop uses mouse events above; phones only get these.
+            // A finger held still produces no touch events, so the long press that
+            // starts a selection is timed here instead. `LONG_PRESS_SECS` at the app's
+            // 33 ms interval.
+            Event::Timer(_) => {
+                if self.touch_start.is_some() && !self.touch_moved && !self.selecting {
+                    self.hold_ticks += 1;
+                    if self.hold_ticks as f64 * 0.033 >= LONG_PRESS_SECS {
+                        if let Some((sx, sy, _)) = self.touch_start {
+                            self.selecting = true;
+                            self.select_at(cx, sx, sy, true);
+                            self.redraw(cx);
+                        }
+                    }
+                }
+            }
             Event::TouchUpdate(e) => {
                 if let Some(t) = e.touches.first() {
                     match t.state {
@@ -2151,6 +2235,7 @@ impl Widget for TermView {
                             self.touch_time = t.time;
                             self.selecting = false;
                             self.wheel_emitted = 0;
+                            self.hold_ticks = 0;
                             if let Some(grid) = &self.grid_ref {
                                 grid.lock().unwrap_or_else(|e| e.into_inner()).clear_select();
                             }
@@ -2177,7 +2262,9 @@ impl Widget for TermView {
                                     self.select_at(cx, t.abs.x, t.abs.y, false);
                                     self.redraw(cx);
                                 } else {
-                                    if moved > 6.0 { self.touch_moved = true; }
+                                    // Same threshold as the long-press slop, so a finger
+                                    // that drifts a few pixels is still "held", not a drag.
+                                    if moved > LONG_PRESS_SLOP { self.touch_moved = true; }
                                     self.wheel_cell = self.screen_cell(cx, t.abs.x, t.abs.y);
                                     self.drag_scroll(dy, ch, s_off);
                                     self.redraw(cx);
@@ -2577,13 +2664,15 @@ live_design! {
     // Vertical tab entry (Zen-browser style sidebar). Full-width and tall enough to
     // stay comfortably tappable when many tabs are open, instead of cramming them
     // into a horizontal strip.
+    // 56 px: a finger pad is around 9 mm, and 38 px was under that on a phone — tabs
+    // were being switched by accident and missed on purpose.
     VTabBtn = <Button> {
         text: ""
-        width: Fill, height: 38
+        width: Fill, height: 56
         align: { x: 0.0, y: 0.5 }
-        draw_text: { color: #xC5C8C6, text_style: { font_size: 10.0 } }
+        draw_text: { color: #xC5C8C6, text_style: { font_size: 10.5 } }
         draw_bg: { color: #x1E1E1E, fn pixel(self) -> vec4 { return mix(self.color, #x30363D80, self.hover); } }
-        padding: { left: 8, right: 6, top: 4, bottom: 4 }
+        padding: { left: 10, right: 6, top: 8, bottom: 8 }
     }
 
     // One touch-tappable tab button (Termius-style). Text + active marker are set
@@ -2603,31 +2692,34 @@ live_design! {
             draw_bg: { color: #x1E1E1E }
 
             caption_bar = <SolidView> {
-                visible: true, flow: Right, height: 32
+                visible: true, flow: Right, height: 44
                 draw_bg: { color: #x181818 }
                 caption_label = <View> { visible: false, width: 0, height: 0 }
                 tabs = <View> {
                     width: Fill, height: Fill, flow: Right, align: { y: 0.5 }, padding: { left: 6 }
                     <View> { width: Fill, height: Fill }
+                    // The caption bar is 44 px tall on purpose: these four are the only
+                    // way to open the tab list, add a tab, close one, or reach the
+                    // settings, and at 26-32 px wide they were a coin toss under a thumb.
                     sidebar_btn = <Button> {
                         // U+258C: the UI font lacks U+25A4, which rendered as blank.
-                        text: "▌", width: 30
-                        draw_text: { color: #x6E7681, text_style: { font_size: 13.0 } }
+                        text: "▌", width: 52, height: Fill
+                        draw_text: { color: #x8B949E, text_style: { font_size: 16.0 } }
                         draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #x30363D60, self.hover); } }
                     }
                     close_btn = <Button> {
-                        text: "×", width: 26
-                        draw_text: { color: #x6E7681, text_style: { font_size: 15.0 } }
+                        text: "×", width: 48, height: Fill
+                        draw_text: { color: #x8B949E, text_style: { font_size: 19.0 } }
                         draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #xE0303060, self.hover); } }
                     }
                     plus_btn = <Button> {
-                        text: "+", width: 28
-                        draw_text: { color: #x6E7681, text_style: { font_size: 13.0 } }
+                        text: "+", width: 48, height: Fill
+                        draw_text: { color: #x8B949E, text_style: { font_size: 17.0 } }
                         draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #x30363D60, self.hover); } }
                     }
                     menu_btn = <Button> {
-                        text: "≡", width: 32
-                        draw_text: { color: #x6E7681, text_style: { font_size: 14.0 } }
+                        text: "≡", width: 52, height: Fill
+                        draw_text: { color: #x8B949E, text_style: { font_size: 18.0 } }
                         draw_bg: { color: #x00000000, fn pixel(self) -> vec4 { return mix(self.color, #x30363D60, self.hover); } }
                     }
                 }
@@ -2995,37 +3087,31 @@ impl App {
     /// close, rename) and when Android pauses us — by the time the process is killed
     /// there is no chance to run anything.
     /// Forward wheel notches from a finger drag to the program on the other end.
-    /// Two encodings, because the two cases behave differently: a program that asked
-    /// for mouse reports (tmux with `mouse on`, htop) gets real SGR wheel events and
-    /// scrolls its own history; a full-screen program that did not (less, man, vim)
-    /// gets arrow keys, which is what a wheel is mapped to there anyway.
-    fn send_wheel(&mut self, notches: i32, col: usize, row: usize) {
+    ///
+    /// Only when that program asked for mouse reports (tmux with `mouse on`, nvim,
+    /// htop): it then scrolls its own history, which is the only place the history
+    /// exists once the screen belongs to a full-screen program.
+    ///
+    /// The tempting fallback — send arrow keys — is a trap. tmux puts the terminal in
+    /// the alternate screen for its whole lifetime, so "alternate screen" does not mean
+    /// "something scrollable is on screen"; at a shell prompt inside tmux those arrows
+    /// would walk the *shell's* command history and type old commands into the line.
+    /// Unscrollable is better than that, so instead the status bar says what to turn on.
+    fn send_wheel(&mut self, cx: &mut Cx, notches: i32, col: usize, row: usize) {
         if notches == 0 { return; }
         let tab = match self.tabs.get_mut(self.active_tab) { Some(t) => t, None => return };
-        let (reporting, app_cursor) = {
-            let g = tab.grid.lock().unwrap_or_else(|e| e.into_inner());
-            (g.mouse_reporting, g.app_cursor_keys)
-        };
-        let up = notches > 0;
-        let count = notches.unsigned_abs() as usize;
+        let reporting = tab.grid.lock().unwrap_or_else(|e| e.into_inner()).mouse_reporting;
+        if !reporting {
+            self.ui.label(id!(status_left))
+                .set_text(cx, "scroll: jalankan  tmux set -g mouse on");
+            return;
+        }
+        // SGR wheel: button 64 = up, 65 = down. `M` marks a press; a wheel event has no
+        // matching release.
+        let button = if notches > 0 { 64 } else { 65 };
         let mut out = Vec::new();
-        if reporting {
-            // SGR wheel: button 64 = up, 65 = down. `M` marks a press; a wheel event
-            // has no matching release.
-            let button = if up { 64 } else { 65 };
-            for _ in 0..count {
-                out.extend_from_slice(format!("\x1b[<{};{};{}M", button, col, row).as_bytes());
-            }
-        } else {
-            let key: &[u8] = match (up, app_cursor) {
-                (true, false) => b"\x1b[A",
-                (false, false) => b"\x1b[B",
-                (true, true) => b"\x1bOA",
-                (false, true) => b"\x1bOB",
-            };
-            for _ in 0..count * WHEEL_LINES as usize {
-                out.extend_from_slice(key);
-            }
+        for _ in 0..notches.unsigned_abs() {
+            out.extend_from_slice(format!("\x1b[<{};{};{}M", button, col, row).as_bytes());
         }
         tab.write(&out);
     }
@@ -4051,7 +4137,7 @@ impl App {
     }
 
     fn handle_resize(&mut self, width: f64, height: f64) {
-        let chrome_h = 32.0 + 22.0; // caption + status bar
+        let chrome_h = 44.0 + 22.0; // caption + status bar
         let search_h = if self.search_open { 28.0 } else { 0.0 };
         // The vertical tab sidebar and (on Android) the modifier key bar take space away
         // from the grid. Without accounting for them the terminal reflows wider/taller
@@ -4288,7 +4374,7 @@ impl AppMain for App {
                 // Finger drags land in the view, which has no way to reach the session;
                 // collect what they produced and act on it here.
                 let (notches, wcol, wrow) = self.ui.term_view(id!(terminal)).take_wheel();
-                self.send_wheel(notches, wcol, wrow);
+                self.send_wheel(cx, notches, wcol, wrow);
                 if self.ui.term_view(id!(terminal)).take_copy_request() {
                     self.copy_selection(cx);
                 }
@@ -5442,6 +5528,29 @@ mod tests {
         g.process(b"\x1b[18t"); // query text size
         let resp = String::from_utf8_lossy(&g.response_buf);
         assert!(resp.contains("8;24;80"));
+    }
+
+    // ── Selection does not drag the empty cells along ──
+    #[test]
+    fn test_selection_trims_each_line() {
+        // A drag covers whole cells, so selecting "42" on a wide screen also selects the
+        // blanks after it. Pasting that back used to reproduce the padding, which is how
+        // a two-character copy came out as a full-width line.
+        let mut g = new_grid(20, 24);
+        g.process(b"42\r\n43\r\n");
+        g.start_select(0, 0);
+        g.update_select(1, 19);
+        assert_eq!(g.get_selection_text().unwrap(), "42\n43");
+    }
+
+    #[test]
+    fn test_selection_keeps_interior_text() {
+        let mut g = new_grid(20, 24);
+        g.process(b"ab cd\r\n");
+        g.start_select(0, 0);
+        g.update_select(0, 19);
+        // Only the trailing blanks go; the space inside the line stays.
+        assert_eq!(g.get_selection_text().unwrap(), "ab cd");
     }
 
     // ── Device attributes: one answer per question ──
