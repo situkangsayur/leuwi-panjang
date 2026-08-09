@@ -65,6 +65,27 @@ fn state_dir() -> std::path::PathBuf {
     }
 }
 
+/// Where local commands start, and what `~` and `$HOME` mean in the built-in prompt.
+/// Android gives an app no home directory at all — the process starts at `/`, which an
+/// untrusted app may not even list, which is why a bare `ls` used to fail with
+/// "Permission denied" and read as a broken shell. So we make one inside the app's own
+/// storage. Created on demand; falls back to the data dir, which is always writable.
+fn home_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        let home = state_dir().join("home");
+        if std::fs::create_dir_all(&home).is_ok() {
+            let _ = std::fs::create_dir_all(home.join("tmp"));
+            return home;
+        }
+        state_dir()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
+    }
+}
+
 // ── Theme ──────────────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -627,6 +648,9 @@ struct TermTab {
     /// Consecutive short-lived connections. Stops a dead host from being redialled
     /// forever; reset as soon as a session survives long enough to be real.
     reconnect_fails: u32,
+    /// Working directory for local commands. An Android process starts at `/`, which
+    /// an app may not even list, so the prompt starts somewhere it owns instead.
+    cwd: std::path::PathBuf,
     /// Whether this tab still *wants* a live session. Cleared when the remote command
     /// ends by itself — typing `exit` in tmux means "I am done", and redialling that is
     /// the app arguing with the user. Set again by `sambung` or a new connect command.
@@ -775,6 +799,7 @@ impl Repl {
         }
         s.push_str(concat!(
             "\x1b[2mperintah built-in:\x1b[0m\r\n",
+            "  cd / pwd       pindah & tampilkan direktori kerja\r\n",
             "  sambung        sambung ulang sesi terakhir tab ini\r\n",
             "  config         lihat/ubah host, port, user, session\r\n",
             "  keygen         buat SSH key baru (public key langsung disalin)\r\n",
@@ -866,6 +891,7 @@ impl TermTab {
             attention: false,
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
             origin: None, last_profile: None, connected_at: None, reconnect_fails: 0, auto_reconnect: false,
+            cwd: home_dir(),
         }
     }
 
@@ -1216,13 +1242,62 @@ impl TermTab {
                     connect = Some(profile);
                 }
             }
+            // Move around the filesystem. A shell that forgets where it is after every
+            // command is not a shell, and `cd` cannot be handed to a child process —
+            // the child would change its own directory and then exit.
+            "cd" => {
+                let target = match args.first() {
+                    None | Some(&"~") => home_dir(),
+                    Some(a) => {
+                        let p = std::path::Path::new(a);
+                        if p.is_absolute() { p.to_path_buf() } else { self.cwd.join(p) }
+                    }
+                };
+                // Canonicalize so `..` collapses and a bad path is caught here rather
+                // than by every command that follows.
+                match target.canonicalize() {
+                    Ok(p) if p.is_dir() => {
+                        self.cwd = p;
+                        out.push_str(&format!("\x1b[2m{}\x1b[0m\r\n", self.cwd.display()));
+                    }
+                    _ => out.push_str(&format!(
+                        "\x1b[31mcd: {}: tidak ada atau tidak bisa dibuka\x1b[0m\r\n",
+                        target.display())),
+                }
+            }
+            "pwd" => out.push_str(&format!("{}\r\n", self.cwd.display())),
             other => {
                 // Not a built-in: hand it to the OS shell. This is non-interactive
                 // (output is captured, no PTY), so `ls`/`cat`/`ps` work but `vim` does not.
-                match std::process::Command::new("/system/bin/sh").arg("-c").arg(line).output() {
+                //
+                // `current_dir` matters more than it looks: an Android app process starts
+                // at `/`, which an untrusted app is not allowed to read, so a bare `ls`
+                // came back "ls: .: Permission denied" and looked like a broken shell.
+                // Commands now run somewhere the app actually owns.
+                match std::process::Command::new("/system/bin/sh")
+                    .arg("-c").arg(line)
+                    .current_dir(&self.cwd)
+                    .env("HOME", home_dir())
+                    .env("TERM", "xterm-256color")
+                    .env("TMPDIR", home_dir().join("tmp"))
+                    .output()
+                {
                     Ok(o) => {
                         for chunk in [&o.stdout[..], &o.stderr[..]] {
                             out.push_str(&String::from_utf8_lossy(chunk).replace(char::from(10), "\r\n"));
+                        }
+                        // Android ships a small toybox userland and no package manager,
+                        // so "not found" here is usually a tool that simply does not
+                        // exist on the device rather than a typo. Say so once, with the
+                        // way out, instead of leaving a bare error.
+                        if !o.status.success() {
+                            let err = String::from_utf8_lossy(&o.stderr);
+                            if err.contains("inaccessible or not found") {
+                                out.push_str(&format!(
+                                    "\x1b[2m{} bukan bagian dari Android (tidak ada apt/pkg di sini).\r\n\
+                                     jalankan di server lewat sesi SSH — di sana ada git, python, dll.\x1b[0m\r\n",
+                                    other));
+                            }
                         }
                     }
                     Err(e) => out.push_str(&format!("\x1b[31m{}: {}\x1b[0m\r\n", other, e)),
@@ -1340,6 +1415,7 @@ impl TermTab {
             attention: false,
             split: None, split_dir: SplitDir::Vertical, split_focused: false,
             origin: None, last_profile: None, connected_at: None, reconnect_fails: 0, auto_reconnect: false,
+            cwd: home_dir(),
         }
     }
 
@@ -1389,7 +1465,7 @@ impl TermTab {
             }
         });
 
-        Self { grid, writer: Some(writer), master: Some(master), ssh: None, pending_profile: None, title: format!("Terminal {}", id), attention: false, split: None, split_dir: SplitDir::Vertical, split_focused: false, origin: None, last_profile: None, connected_at: None, reconnect_fails: 0, auto_reconnect: false }
+        Self { grid, writer: Some(writer), master: Some(master), ssh: None, pending_profile: None, title: format!("Terminal {}", id), attention: false, split: None, split_dir: SplitDir::Vertical, split_focused: false, origin: None, last_profile: None, connected_at: None, reconnect_fails: 0, auto_reconnect: false, cwd: home_dir() }
     }
 
     fn write(&mut self, data: &[u8]) {
@@ -2090,7 +2166,7 @@ impl TermGrid {
                                     // re-asking on every redraw; naming ourselves ends it.
                                     b'q' if intermediate == b'>' => {
                                         self.response_buf.extend_from_slice(
-                                            b"\x1bP>|leuwi-panjang(0.1.5)\x1b\\");
+                                            b"\x1bP>|leuwi-panjang(0.1.6)\x1b\\");
                                     }
                                     b'q' => {
                                         // DECSCUSR — Set Cursor Style
