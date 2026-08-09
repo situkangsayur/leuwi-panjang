@@ -525,13 +525,21 @@ index 0d02a22..b90b413 100644
 +
  }
 diff --git a/tools/cargo_makepad/src/android/mod.rs b/tools/cargo_makepad/src/android/mod.rs
-index fe021e5..f127032 100644
+index fe021e5..6222b93 100644
 --- a/tools/cargo_makepad/src/android/mod.rs
 +++ b/tools/cargo_makepad/src/android/mod.rs
-@@ -30,46 +30,47 @@ fn from_str(opt: &str) -> Result<Self,String> {
+@@ -30,46 +30,55 @@ fn from_str(opt: &str) -> Result<Self,String> {
      }
      
      fn manifest_xml(&self, label:&str, class_name:&str, url:&str, sdk_version: usize)->String{
++        // targetSdk is overridable because it decides whether the app may execute
++        // binaries it downloaded into its own data directory: Android puts apps
++        // targeting <= 28 in the untrusted_app_27 SELinux domain, which still allows it.
++        // That is the only way a package manager can work at all (it is what Termux
++        // relies on), so a build can opt into the older target on purpose.
++        let sdk_version: usize = std::env::var("MAKEPAD_TARGET_SDK").ok()
++            .and_then(|v| v.parse().ok())
++            .unwrap_or(sdk_version);
 +        let version_code = std::env::var("MAKEPAD_VERSION_CODE").unwrap_or_else(|_| "1".to_string());
 +        let version_name = std::env::var("MAKEPAD_VERSION_NAME").unwrap_or_else(|_| "1.0".to_string());
          match self{

@@ -7,3 +7,6 @@ Cargo.lock
 .idea/
 .vscode/
 *.log
+
+# Built by install/build-userland.sh (7 MB of binaries; rebuild rather than commit)
+/install/userland/

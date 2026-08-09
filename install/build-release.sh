@@ -74,6 +74,31 @@ if [ ! -f "$KS" ]; then
     -dname "CN=Leuwi Panjang, O=situkangsayur, C=ID"
 fi
 
+# Bundled userland. These go in lib/<abi>/ because that is the ONLY place an app
+# targeting a modern SDK may execute a binary from: Android extracts it read-only and
+# system-owned, so it escapes the W^X rule that blocks exec from app storage (verified —
+# the same binary in the app's data dir gives "Permission denied"). They are named
+# lib*.so because the installer only extracts files matching that pattern.
+# Built by install/build-userland.sh; skipped silently when not present.
+UL="$CRATE_DIR/install/userland/aarch64"
+if [ -d "$UL" ]; then
+  echo ">> bundling userland: $(ls "$UL" | tr '\n' ' ')"
+  python3 - "$UNALIGNED" "$UL" <<'PY'
+import sys, os, zipfile, shutil
+apk, uldir = sys.argv[1], sys.argv[2]
+tmp = apk + ".ul"
+with zipfile.ZipFile(apk) as zin, zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+    for item in zin.infolist():
+        if item.filename.startswith("lib/arm64-v8a/lib") and item.filename.endswith(".so") \
+           and os.path.basename(item.filename)[3:-3] in os.listdir(uldir):
+            continue  # replace an older copy rather than duplicating the entry
+        zout.writestr(item, zin.read(item.filename))
+    for name in sorted(os.listdir(uldir)):
+        zout.write(os.path.join(uldir, name), "lib/arm64-v8a/lib%s.so" % name)
+shutil.move(tmp, apk)
+PY
+fi
+
 echo ">> zipalign"
 "$SDK/android-13/zipalign" -p -f 4 "$UNALIGNED" "$APKDIR/aligned.tmp.apk"
 echo ">> apksigner sign (v1+v2+v3)"

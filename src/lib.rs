@@ -86,6 +86,120 @@ fn home_dir() -> std::path::PathBuf {
     }
 }
 
+// ── Bundled userland (Android) ─────────────────────────────
+//
+// Android's own userland is toybox plus mksh, and the platform has no package manager,
+// so there is no `bash`, no `git`, and nothing to install them with. We ship them: static
+// aarch64 builds ride along inside the APK as `lib/arm64-v8a/lib<name>.so`.
+//
+// That location is not decoration. An app targeting a modern SDK may only execute
+// binaries from its native library directory — the installer extracts those read-only and
+// system-owned, so they escape the W^X rule. The same binary written into the app's own
+// data directory gives "Permission denied" (checked on a real phone), which is also why a
+// download-and-install package manager cannot work without dropping to targetSdk 28.
+#[cfg(target_os = "android")]
+mod userland {
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    /// The directory holding the APK's extracted native libraries. Found by looking up
+    /// our own loaded `.so` in the process map, which needs no JNI and no guessing at the
+    /// randomised install path.
+    fn native_lib_dir() -> Option<PathBuf> {
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        for line in maps.lines() {
+            if let Some(idx) = line.find("/libmakepad.so") {
+                let start = line[..idx].rfind(' ')? + 1;
+                return Path::new(&line[start..idx + "/libmakepad.so".len()])
+                    .parent()
+                    .map(|p| p.to_path_buf());
+            }
+        }
+        None
+    }
+
+    fn link(target: &Path, link_path: &Path) {
+        use std::os::unix::fs::symlink;
+        let _ = std::fs::remove_file(link_path);
+        let _ = symlink(target, link_path);
+    }
+
+    /// Build a `bin/` of command names pointing at the bundled binaries, and report it.
+    /// Symlinks rather than copies: a copy would live in app storage and be unexecutable,
+    /// while executing a symlink resolves to the library file, which is allowed.
+    /// busybox is asked for its own applet list, so the set of commands always matches
+    /// whatever the shipped build actually supports.
+    fn build_bin_dir() -> Option<PathBuf> {
+        let libdir = native_lib_dir()?;
+        let bin = super::home_dir().join("bin");
+        std::fs::create_dir_all(&bin).ok()?;
+
+        for name in ["bash", "git", "busybox"] {
+            let target = libdir.join(format!("lib{name}.so"));
+            if target.is_file() {
+                link(&target, &bin.join(name));
+            }
+        }
+
+        let bb = libdir.join("libbusybox.so");
+        if bb.is_file() {
+            use std::os::unix::process::CommandExt;
+            // argv[0] decides which applet a multi-call binary runs, so it has to say
+            // "busybox" here — called by its library name it just reports "not found".
+            let listed = std::process::Command::new(&bb).arg0("busybox").arg("--list").output();
+            if let Ok(out) = listed {
+                for applet in String::from_utf8_lossy(&out.stdout).lines() {
+                    let applet = applet.trim();
+                    // Never shadow the real shell or the standalone tools above.
+                    if applet.is_empty() || matches!(applet, "busybox" | "bash" | "git" | "sh") {
+                        continue;
+                    }
+                    link(&bb, &bin.join(applet));
+                }
+            }
+        }
+        Some(bin)
+    }
+
+    /// Set up once per run; afterwards this is a cheap lookup.
+    pub fn bin_dir() -> Option<&'static PathBuf> {
+        static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+        BIN.get_or_init(build_bin_dir).as_ref()
+    }
+
+    /// PATH for local commands: Android's own tools first, ours last.
+    ///
+    /// The order is deliberate. Android's toybox is built for this device and is what the
+    /// platform shell expects; our busybox is the fallback that fills the gaps (and the
+    /// only way to reach the ~200 applets Android does not ship). Putting ours first
+    /// replaced working commands with ones that are killed by the app sandbox's seccomp
+    /// filter when they are spawned inside a pipeline — a regression against a shell that
+    /// already worked. Gaps get filled; nothing that worked gets taken away.
+    pub fn path_env() -> String {
+        let android = std::env::var("PATH")
+            .unwrap_or_else(|_| "/system/bin:/system/xbin:/vendor/bin".to_string());
+        match bin_dir() {
+            Some(bin) => format!("{}:{}", android, bin.display()),
+            None => android,
+        }
+    }
+
+    /// The shell commands run under. Android's mksh, not the bundled bash: bash is here
+    /// to be *used* (type `bash`), not to sit under every command, because a busybox
+    /// applet spawned from a bash pipeline currently dies with SIGSYS in the app sandbox.
+    pub fn shell() -> PathBuf {
+        PathBuf::from("/system/bin/sh")
+    }
+
+    /// How many commands the bundled userland provides, for the banner.
+    pub fn command_count() -> usize {
+        bin_dir()
+            .and_then(|b| std::fs::read_dir(b).ok())
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+}
+
 // ── Theme ──────────────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -863,8 +977,14 @@ impl Repl {
     }
 
     fn banner() -> String {
+        let tools = userland::command_count();
+        let tools = if tools > 0 {
+            format!("  \x1b[2m{} perintah lokal (bash, git, busybox) siap — ketik \x1b[0mbash\x1b[2m atau \x1b[0mgit --version\x1b[0m\r\n", tools)
+        } else {
+            String::new()
+        };
         format!(
-            "\r\n  \x1b[1;38;5;39mLeuwi Panjang\x1b[0m \x1b[2mAndroid\x1b[0m\r\n  \x1b[2m—————————————————————————————\x1b[0m\r\n  \x1b[2mketik \x1b[0mhelp\x1b[2m untuk daftar perintah, \x1b[0m<nama>-s <sesi>\x1b[2m untuk menyambung\x1b[0m\r\n\r\n"
+            "\r\n  \x1b[1;38;5;39mLeuwi Panjang\x1b[0m \x1b[2mAndroid\x1b[0m\r\n  \x1b[2m—————————————————————————————\x1b[0m\r\n  \x1b[2mketik \x1b[0mhelp\x1b[2m untuk daftar perintah, \x1b[0m<nama>-s <sesi>\x1b[2m untuk menyambung\x1b[0m\r\n{tools}\r\n"
         )
     }
 }
@@ -1274,12 +1394,13 @@ impl TermTab {
                 // at `/`, which an untrusted app is not allowed to read, so a bare `ls`
                 // came back "ls: .: Permission denied" and looked like a broken shell.
                 // Commands now run somewhere the app actually owns.
-                match std::process::Command::new("/system/bin/sh")
+                match std::process::Command::new(userland::shell())
                     .arg("-c").arg(line)
                     .current_dir(&self.cwd)
                     .env("HOME", home_dir())
                     .env("TERM", "xterm-256color")
                     .env("TMPDIR", home_dir().join("tmp"))
+                    .env("PATH", userland::path_env())
                     .output()
                 {
                     Ok(o) => {
@@ -2166,7 +2287,7 @@ impl TermGrid {
                                     // re-asking on every redraw; naming ourselves ends it.
                                     b'q' if intermediate == b'>' => {
                                         self.response_buf.extend_from_slice(
-                                            b"\x1bP>|leuwi-panjang(0.1.6)\x1b\\");
+                                            b"\x1bP>|leuwi-panjang(0.1.7)\x1b\\");
                                     }
                                     b'q' => {
                                         // DECSCUSR — Set Cursor Style
