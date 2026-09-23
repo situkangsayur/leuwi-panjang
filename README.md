@@ -3,12 +3,43 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.5
+## Download — v0.1.8
 
-- **[⬇ leuwipanjang_v0.1.5.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.5.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.8.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.8.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
-~55 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+~59 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.8
+
+- **SSH keys survive changing phones.** The key path is stored in full in
+  `config.toml`, so a config that came across from another phone still named that
+  phone's directory and connecting failed with *"No such file or directory"* even
+  when the key itself had been copied over. Keys are now re-found by file name, and
+  the config repairs itself when the app starts. The key directory is fixed as well
+  (it used to follow whatever directory the default key happened to be in, including
+  `/sdcard`), and a phone running the app under a work profile or a second user is
+  read correctly instead of being looked for under `/data/user/0`.
+- **The Identity field accepts what you type** — an identity name, a file name, or a
+  path. A name it did not recognise used to fall through to the default key, so
+  setting the new key's name silently authenticated with a different one.
+- **`keys`** (new) lists every key with `ok`/`HILANG` per file, the key directory, and
+  which key each connect word resolves to. The first thing to run after moving phones.
+- **`keygen <name>`** makes a named key *and* registers it as an identity, so the name
+  at the prompt is the name a command profile points at. It no longer overwrites an
+  existing key without `-f` — doing so used to throw away a key that was already
+  installed in `authorized_keys`, leaving no way back in from the phone.
+  **`pubkey <name>`** re-copies any of them.
+
+## What's new in 0.1.6 – 0.1.7
+
+These two were never uploaded here; both are included in 0.1.8.
+
+- **`bash` 5.2.21, `git` 2.43.0 and busybox (241 commands) are bundled in the APK** —
+  grep, sed, awk, find, tar, vi, wget, less and the rest run on the phone itself, with
+  no Termux and no network. The shell stays Android's own `sh`; type `bash` for bash.
+- **`cd` and `pwd` work.** Local commands used to run from `/`, which an app may not
+  read, so a plain `ls` always failed.
 
 ## What's new in 0.1.5
 
