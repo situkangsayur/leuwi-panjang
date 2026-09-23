@@ -89,39 +89,118 @@ impl SshProfile {
 // is `/`, so the desktop defaults below would resolve to an unwritable `/.ssh/id_rsa` and
 // `/leuwi-panjang/known_hosts`. Anchor both on the app`s own directories instead.
 #[cfg(target_os = "android")]
+pub(crate) const ANDROID_PKG: &str = "com.situkangsayur.leuwipanjang";
+#[cfg(target_os = "android")]
 const ANDROID_FILES_DIR: &str = "/sdcard/Android/data/com.situkangsayur.leuwipanjang/files";
-#[cfg(target_os = "android")]
-const ANDROID_DATA_DIR: &str = "/data/user/0/com.situkangsayur.leuwipanjang";
 
-/// Where to look for the private key on Android, in order. The external files dir comes
-/// first because the user can drop a key there with a file manager or `adb push` without
-/// root; the private data dir is the more secure spot for a key we provision ourselves.
+/// The app`s private data directory. It is *not* always `/data/user/0/<pkg>`: a work
+/// profile, a second user on the phone, or a "dual app" clone runs the same package
+/// under `/data/user/<n>/<pkg>`, and the hard-coded `0` is then a directory this
+/// process cannot even stat. That is one of the ways a path written on the old phone
+/// becomes a path that does not exist on the new one. Android derives the user id from
+/// the process uid (`uid / 100000`), so derive it the same way.
 #[cfg(target_os = "android")]
+pub(crate) fn android_data_dir() -> PathBuf {
+    let user = unsafe { libc::getuid() } / 100_000;
+    for c in [
+        format!("/data/user/{user}/{ANDROID_PKG}"),
+        format!("/data/data/{ANDROID_PKG}"),
+        format!("/data/user/0/{ANDROID_PKG}"),
+    ] {
+        let p = PathBuf::from(&c);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    PathBuf::from(format!("/data/user/{user}/{ANDROID_PKG}"))
+}
+
+/// The one directory new private keys are written to, and the first place they are
+/// looked for. Deliberately fixed: it used to be derived from
+/// `default_key_path().parent()`, which meant it moved to /sdcard as soon as some
+/// unrelated `id_ed25519` happened to be lying there — so the same key name resolved
+/// to different directories on different phones, and the absolute path saved in
+/// config.toml pointed at nothing after the config was carried over.
+#[cfg(target_os = "android")]
+pub(crate) fn key_dir() -> PathBuf {
+    android_data_dir().join("ssh")
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn key_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/home/hendri"))
+        .join(".ssh")
+}
+
+/// Every directory a private key may legitimately sit in, most-preferred first. Used
+/// both to find the default key and to re-find a key whose stored absolute path no
+/// longer resolves (new phone, restored config, app data moved between users).
+pub(crate) fn key_dirs() -> Vec<PathBuf> {
+    #[cfg(target_os = "android")]
+    {
+        let mut v = vec![key_dir()];
+        for c in [
+            ANDROID_FILES_DIR.to_string(),
+            format!("/data/user/0/{ANDROID_PKG}/ssh"),
+            format!("/sdcard/Android/media/{ANDROID_PKG}/import"),
+            format!("{ANDROID_FILES_DIR}/import"),
+        ] {
+            let p = PathBuf::from(&c);
+            if !v.contains(&p) {
+                v.push(p);
+            }
+        }
+        v
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let mut v = vec![key_dir()];
+        if let Some(d) = dirs::config_dir().map(|d| d.join("leuwi-panjang/ssh")) {
+            v.push(d);
+        }
+        v
+    }
+}
+
+/// The key used when nothing names one: the first `id_ed25519`/`id_rsa` that actually
+/// exists, searched in `key_dirs()` order, else where one would be created.
 pub(crate) fn default_key_path() -> PathBuf {
-    let candidates = [
-        format!("{ANDROID_FILES_DIR}/id_ed25519"),
-        format!("{ANDROID_FILES_DIR}/id_rsa"),
-        format!("{ANDROID_DATA_DIR}/ssh/id_ed25519"),
-        format!("{ANDROID_DATA_DIR}/ssh/id_rsa"),
-    ];
-    for c in &candidates {
-        let p = PathBuf::from(c);
+    for d in key_dirs() {
+        for name in ["id_ed25519", "id_rsa"] {
+            let p = d.join(name);
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    key_dir().join("id_ed25519")
+}
+
+/// Turn a key path recorded in config.toml into one that exists on *this* device.
+/// The recorded path is absolute, so a config that travels to another phone (cloud
+/// restore, an imported config.toml, the app reinstalled under a different Android
+/// user) keeps pointing at the old device`s directory. Connecting then failed with
+/// "No such file or directory" even when the key file itself had been copied over, so
+/// re-find it by file name before giving up. Falling back to `key_dir()` rather than
+/// the stale path means the error message names the place the key should be put.
+pub(crate) fn resolve_key_path(stored: &Path) -> PathBuf {
+    if stored.as_os_str().is_empty() {
+        return default_key_path();
+    }
+    if stored.is_file() {
+        return stored.to_path_buf();
+    }
+    let Some(name) = stored.file_name() else {
+        return stored.to_path_buf();
+    };
+    for d in key_dirs() {
+        let p = d.join(name);
         if p.is_file() {
             return p;
         }
     }
-    // None present yet. Point at the app-private dir, not the external one: this path is
-    // also where the config form writes keys it generates, and a private key on
-    // /sdcard is readable by anything holding storage access. (dev.21 dropped the
-    // storage permissions entirely, so we cannot rely on that dir being ours anyway.)
-    PathBuf::from(format!("{ANDROID_DATA_DIR}/ssh/id_ed25519"))
-}
-
-#[cfg(not(target_os = "android"))]
-pub(crate) fn default_key_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/home/hendri"))
-        .join(".ssh/id_rsa")
+    key_dir().join(name)
 }
 
 /// The public half of an existing key, in `authorized_keys` form. Reads the cached
@@ -228,7 +307,7 @@ pub(crate) fn import_key(path: &Path, private_pem: &str, public_line: &str) -> R
 
 #[cfg(target_os = "android")]
 pub(crate) fn default_known_hosts() -> PathBuf {
-    PathBuf::from(format!("{ANDROID_DATA_DIR}/known_hosts"))
+    android_data_dir().join("known_hosts")
 }
 
 #[cfg(not(target_os = "android"))]
@@ -354,8 +433,19 @@ async fn connect_auth(p: &SshProfile) -> Result<client::Handle<Client>, String> 
             .await
             .map_err(|e| format!("auth error: {}", e))?
     } else {
-        let key = load_secret_key(&p.key_path, None)
-            .map_err(|e| format!("load key {}: {}", p.key_path.display(), e))?;
+        // Re-resolve here too: a profile can be built from a config that was written
+        // on another device, and the key may well be present under a different
+        // directory on this one.
+        let key_path = resolve_key_path(&p.key_path);
+        if !key_path.is_file() {
+            return Err(format!(
+                "key tidak ada: {}\r\n  buat yang baru dengan `keygen <nama>`, \
+                 atau salin key lama ke folder itu",
+                key_path.display()
+            ));
+        }
+        let key = load_secret_key(&key_path, None)
+            .map_err(|e| format!("load key {}: {}", key_path.display(), e))?;
         let hash = handle
             .best_supported_rsa_hash()
             .await

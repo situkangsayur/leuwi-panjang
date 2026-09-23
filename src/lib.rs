@@ -55,7 +55,7 @@ mod clip {
 fn state_dir() -> std::path::PathBuf {
     #[cfg(target_os = "android")]
     {
-        std::path::PathBuf::from("/data/user/0/com.situkangsayur.leuwipanjang")
+        ssh::android_data_dir()
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -374,6 +374,24 @@ struct SshIdentity {
     public_key: String,
 }
 
+/// File name for a key called `name`. The name is free text typed into a form, so it
+/// is reduced to characters that are safe in a path; the mapping must stay stable,
+/// because it is how a key is re-found when the recorded path no longer resolves.
+fn key_file_name(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    format!("id_{safe}")
+}
+
+/// Where a key called `name` is written. Always the app's own key directory — it used
+/// to follow whatever directory the *default* key happened to live in, which made the
+/// destination depend on unrelated files and differ from phone to phone.
+fn key_file_for(name: &str) -> std::path::PathBuf {
+    ssh::key_dir().join(key_file_name(name))
+}
+
 /// One connectable host, exposed to the REPL as `<name>-s <session>` (connect) and
 /// `<name>-ls` (list sessions). Each has its own host/port/user and picks either a
 /// password or one of the `identities` by name — so `nvgpu-s` and another terminal
@@ -560,12 +578,71 @@ impl Config {
 
     /// Where a named identity's private key lives, falling back to the default path
     /// when the profile does not name one (or names a deleted one).
+    ///
+    /// The stored path is never trusted as-is: it is absolute, and a config that
+    /// moved to another phone keeps naming the old device's directory. `resolve_key_path`
+    /// re-finds the file by name, so a key that was copied into the app's key
+    /// directory is used instead of reporting a file that does not exist.
     fn identity_key_path(&self, name: &str) -> std::path::PathBuf {
-        self.identities
-            .iter()
-            .find(|i| i.name == name)
-            .map(|i| std::path::PathBuf::from(&i.key_path))
-            .unwrap_or_else(ssh::default_key_path)
+        let name = name.trim();
+        if name.is_empty() {
+            return ssh::default_key_path();
+        }
+        if let Some(i) = self.identities.iter().find(|i| i.name == name) {
+            return ssh::resolve_key_path(std::path::Path::new(&i.key_path));
+        }
+        // The field holds a name the identity list does not have — a config imported
+        // from another device, an entry deleted by hand, or simply the *file* name
+        // typed in place of the identity name. Take it as a file name too, rather
+        // than silently falling back to the default key and reporting a path the
+        // user never asked for.
+        if name.contains('/') {
+            let p = ssh::resolve_key_path(std::path::Path::new(name));
+            if p.is_file() {
+                return p;
+            }
+        }
+        for candidate in [key_file_name(name), name.to_string()] {
+            let p = ssh::resolve_key_path(&ssh::key_dir().join(candidate));
+            if p.is_file() {
+                return p;
+            }
+        }
+        ssh::default_key_path()
+    }
+
+    /// Point every identity at a file that exists on *this* device, and report whether
+    /// anything moved. Run once at load so a phone swap is repaired before the first
+    /// connect rather than surfacing as an opaque "No such file or directory".
+    fn repair_key_paths(&mut self) -> bool {
+        let mut changed = false;
+        for id in &mut self.identities {
+            let cur = std::path::PathBuf::from(&id.key_path);
+            if cur.is_file() {
+                continue;
+            }
+            let fixed = ssh::resolve_key_path(&cur);
+            if fixed.is_file() && fixed != cur {
+                id.key_path = fixed.display().to_string();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Record a generated or imported key under `name`, replacing a same-named entry.
+    /// Shared by the config form and the REPL `keygen`, so a key made at the prompt is
+    /// selectable as an identity and vice versa.
+    fn register_identity(&mut self, name: &str, path: &std::path::Path, public_key: &str) {
+        let entry = SshIdentity {
+            name: name.to_string(),
+            key_path: path.display().to_string(),
+            public_key: public_key.to_string(),
+        };
+        match self.identities.iter().position(|i| i.name == name) {
+            Some(i) => self.identities[i] = entry,
+            None => self.identities.push(entry),
+        }
     }
 
     /// Build a connectable profile from a command entry. `session` empty = the
@@ -614,18 +691,18 @@ impl Config {
             //      (we never call getExternalFilesDir, so usually it does not).
             //   3. app-private — always works, but only the app can put files there.
             // Whichever succeeds is reported in the UI so the path is never a guess.
-            const CANDIDATES: [&str; 3] = [
-                "/sdcard/Android/media/com.situkangsayur.leuwipanjang/import",
-                "/sdcard/Android/data/com.situkangsayur.leuwipanjang/files/import",
-                "/data/user/0/com.situkangsayur.leuwipanjang/import",
+            let private = ssh::android_data_dir().join("import");
+            let candidates = [
+                std::path::PathBuf::from("/sdcard/Android/media/com.situkangsayur.leuwipanjang/import"),
+                std::path::PathBuf::from("/sdcard/Android/data/com.situkangsayur.leuwipanjang/files/import"),
+                private.clone(),
             ];
-            for c in CANDIDATES {
-                let p = std::path::PathBuf::from(c);
-                if p.is_dir() || std::fs::create_dir_all(&p).is_ok() {
-                    return p;
+            for c in candidates {
+                if c.is_dir() || std::fs::create_dir_all(&c).is_ok() {
+                    return c;
                 }
             }
-            std::path::PathBuf::from(CANDIDATES[2])
+            private
         }
         #[cfg(not(target_os = "android"))]
         {
@@ -677,7 +754,7 @@ impl Config {
     fn config_path() -> std::path::PathBuf {
         #[cfg(target_os = "android")]
         {
-            std::path::PathBuf::from("/data/user/0/com.situkangsayur.leuwipanjang/config.toml")
+            ssh::android_data_dir().join("config.toml")
         }
         #[cfg(not(target_os = "android"))]
         {
@@ -703,6 +780,12 @@ impl Config {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(mut cfg) = toml::from_str::<Config>(&content) {
                     cfg.migrate_legacy();
+                    // A config restored from another phone still names that phone's
+                    // key directory; rewrite the paths that moved so the form shows
+                    // "ok" and the connect word finds the key.
+                    if cfg.repair_key_paths() {
+                        let _ = cfg.save();
+                    }
                     return cfg;
                 }
             }
@@ -916,8 +999,9 @@ impl Repl {
             "  cd / pwd       pindah & tampilkan direktori kerja\r\n",
             "  sambung        sambung ulang sesi terakhir tab ini\r\n",
             "  config         lihat/ubah host, port, user, session\r\n",
-            "  keygen         buat SSH key baru (public key langsung disalin)\r\n",
-            "  pubkey         salin ulang public key ke papan klip\r\n",
+            "  keys           daftar SSH key + cek file-nya masih ada\r\n",
+            "  keygen [nama]  buat SSH key baru (public key langsung disalin)\r\n",
+            "  pubkey [nama]  salin ulang public key ke papan klip\r\n",
             "  rename <nama>  ganti nama tab\r\n",
             "  clear          bersihkan layar\r\n",
             "  help           tampilkan bantuan ini\r\n",
@@ -1264,34 +1348,100 @@ impl TermTab {
                     suppress_prompt = true;
                 }
             }
+            // `keygen <nama>` makes a *named* key and registers it in the identity
+            // list, so the name typed here is the same name a command profile points
+            // at with `identity`. Without a name it keeps writing the default key.
             "keygen" => {
-                let path = ssh::default_key_path();
-                match ssh::generate_key(&path, "leuwi-panjang-android") {
-                    Ok(pubkey) => {
-                        // Straight to the clipboard: a public key is 80 characters of
-                        // base64 that nobody is going to retype off a phone screen, and
-                        // the whole point of the command is to get it into
-                        // `authorized_keys` on the other machine.
-                        clip::set(&pubkey);
-                        out.push_str(&format!(
-                            "\x1b[2mkey baru: {}\x1b[0m\r\n\r\n{}\r\n\r\n\x1b[1;32m✓ public key sudah disalin ke papan klip\x1b[0m\r\n\x1b[2mtempel ke ~/.ssh/authorized_keys di server (chat/email/ssh dari mesin lain)\x1b[0m\r\n",
-                            path.display(), pubkey));
+                let force = args.iter().any(|a| *a == "-f" || *a == "--force");
+                let name = args.iter().find(|a| !a.starts_with('-')).map(|a| a.trim()).unwrap_or("");
+                let path = if name.is_empty() { ssh::default_key_path() } else { key_file_for(name) };
+                if path.is_file() && !force {
+                    // Overwriting silently threw away a key that was already in the
+                    // server's `authorized_keys`, leaving no way back in from the phone.
+                    out.push_str(&format!(
+                        "\x1b[33mkey sudah ada: {}\x1b[0m\r\n\x1b[2mpakai \x1b[0mpubkey{}\x1b[2m untuk menyalin ulang, atau \x1b[0mkeygen {}-f\x1b[2m untuk menimpa\x1b[0m\r\n",
+                        path.display(),
+                        if name.is_empty() { String::new() } else { format!(" {name}") },
+                        if name.is_empty() { String::new() } else { format!("{name} ") }));
+                } else {
+                    let comment = if name.is_empty() {
+                        "leuwi-panjang-android".to_string()
+                    } else {
+                        format!("leuwi-panjang-{name}")
+                    };
+                    match ssh::generate_key(&path, &comment) {
+                        Ok(pubkey) => {
+                            if !name.is_empty() {
+                                cfg.register_identity(name, &path, &pubkey);
+                                if let Err(e) = cfg.save() {
+                                    out.push_str(&format!("\x1b[31mgagal simpan config: {}\x1b[0m\r\n", e));
+                                }
+                            }
+                            // Straight to the clipboard: a public key is 80 characters of
+                            // base64 that nobody is going to retype off a phone screen, and
+                            // the whole point of the command is to get it into
+                            // `authorized_keys` on the other machine.
+                            clip::set(&pubkey);
+                            out.push_str(&format!(
+                                "\x1b[2mkey baru: {}\x1b[0m\r\n{}\r\n{}\r\n\r\n\x1b[1;32m✓ public key sudah disalin ke papan klip\x1b[0m\r\n\x1b[2mtempel ke ~/.ssh/authorized_keys di server (chat/email/ssh dari mesin lain)\x1b[0m\r\n",
+                                path.display(),
+                                if name.is_empty() {
+                                    "\x1b[2m(key default — beri nama, mis. `keygen poco`, supaya bisa dipilih per perintah)\x1b[0m".to_string()
+                                } else {
+                                    format!("\x1b[2mterdaftar sebagai identity '{name}' — isi kolom Identity di ≡ › Perintah dengan nama itu\x1b[0m")
+                                },
+                                pubkey));
+                        }
+                        Err(e) => out.push_str(&format!("\x1b[31m{}\x1b[0m\r\n", e)),
                     }
-                    Err(e) => out.push_str(&format!("\x1b[31m{}\x1b[0m\r\n", e)),
                 }
             }
             // Re-copy the public key without generating a new one — the usual case is
             // "I already made a key, I just need it on another machine".
             "pubkey" => {
-                let path = ssh::default_key_path();
+                let name = args.first().map(|a| a.trim()).unwrap_or("");
+                let path = if name.is_empty() {
+                    ssh::default_key_path()
+                } else {
+                    cfg.identity_key_path(name)
+                };
                 match ssh::public_key_of(&path) {
                     Ok(pubkey) => {
                         clip::set(&pubkey);
                         out.push_str(&format!(
-                            "{}\r\n\r\n\x1b[1;32m✓ disalin ke papan klip\x1b[0m\r\n", pubkey));
+                            "\x1b[2m{}\x1b[0m\r\n{}\r\n\r\n\x1b[1;32m✓ disalin ke papan klip\x1b[0m\r\n",
+                            path.display(), pubkey));
                     }
                     Err(e) => out.push_str(&format!(
-                        "\x1b[31m{}\x1b[0m\r\n\x1b[2mbelum ada key? jalankan \x1b[0mkeygen\x1b[0m\r\n", e)),
+                        "\x1b[31m{}\x1b[0m\r\n\x1b[2mlihat daftar key dengan \x1b[0mkeys\x1b[2m, atau buat baru dengan \x1b[0mkeygen <nama>\x1b[0m\r\n", e)),
+                }
+            }
+            // Which keys this install actually has, and whether the file behind each
+            // one is still there. The first thing to check after moving phones.
+            "keys" => {
+                if cfg.identities.is_empty() {
+                    out.push_str("\x1b[2mbelum ada key bernama — buat dengan \x1b[0mkeygen <nama>\x1b[0m\r\n");
+                } else {
+                    for i in &cfg.identities {
+                        let path = ssh::resolve_key_path(std::path::Path::new(&i.key_path));
+                        let (mark, color) = if path.is_file() { ("ok", "32") } else { ("HILANG", "31") };
+                        out.push_str(&format!(
+                            "  {:<14} \x1b[{}m{:<7}\x1b[0m \x1b[2m{}\x1b[0m\r\n",
+                            i.name, color, mark, path.display()));
+                    }
+                }
+                out.push_str(&format!(
+                    "\x1b[2mkey default: {}\x1b[0m\r\n\x1b[2mfolder key : {}\x1b[0m\r\n",
+                    ssh::default_key_path().display(), ssh::key_dir().display()));
+                for c in &cfg.commands {
+                    if c.password.is_empty() {
+                        let path = cfg.identity_key_path(&c.identity);
+                        out.push_str(&format!(
+                            "\x1b[2m{} → {}{}\x1b[0m\r\n",
+                            c.cmd_connect(),
+                            if c.identity.trim().is_empty() { "(default)".to_string() } else { c.identity.clone() },
+                            if path.is_file() { String::new() } else { format!(" \x1b[31m[{} hilang]\x1b[0m", path.display()) }));
+                    }
                 }
             }
             // `config` reports and edits the *first* command profile — the one the
@@ -1304,9 +1454,17 @@ impl TermTab {
                         Some(c) => (c.host.clone(), c.port, c.user.clone(), c.session.clone()),
                         None => (cfg.ssh_host.clone(), cfg.ssh_port, cfg.ssh_user.clone(), cfg.ssh_session.clone()),
                     };
+                    // The key line used to print `default_key_path()` unconditionally,
+                    // which is not the key the connect word uses once a profile names
+                    // an identity — so it described a file nobody authenticates with.
+                    let key = match cfg.commands.first() {
+                        Some(c) => cfg.identity_key_path(&c.identity),
+                        None => ssh::default_key_path(),
+                    };
                     out.push_str(&format!(
-                        "\x1b[2mhost\x1b[0m    {}\r\n\x1b[2mport\x1b[0m    {}\r\n\x1b[2muser\x1b[0m    {}\r\n\x1b[2msession\x1b[0m {}\r\n\x1b[2mkey\x1b[0m     {}\r\n",
-                        host, port, user, session, ssh::default_key_path().display()));
+                        "\x1b[2mhost\x1b[0m    {}\r\n\x1b[2mport\x1b[0m    {}\r\n\x1b[2muser\x1b[0m    {}\r\n\x1b[2msession\x1b[0m {}\r\n\x1b[2mkey\x1b[0m     {}{}\r\n",
+                        host, port, user, session, key.display(),
+                        if key.is_file() { "" } else { " \x1b[31m(file tidak ada)\x1b[0m" }));
                 }
                 Some((&"set", rest)) if rest.len() == 2 => {
                     let (k, v) = (rest[0], rest[1]);
@@ -4059,7 +4217,7 @@ impl App {
             if visible {
                 let k = &self.config.identities[i];
                 let marker = if self.sel_key == Some(i) { "▌" } else { " " };
-                let has = std::path::Path::new(&k.key_path).is_file();
+                let has = ssh::resolve_key_path(std::path::Path::new(&k.key_path)).is_file();
                 self.ui.button(*row).set_text(
                     cx, &format!("{}{}  ·  {}", marker, k.name, if has { "ok" } else { "file hilang" }));
             }
@@ -4068,7 +4226,11 @@ impl App {
             "belum ada key — generate atau tempel di bawah".to_string()
         } else {
             match self.sel_key.and_then(|i| self.config.identities.get(i)) {
-                Some(k) => format!("terpilih: {}\n{}", k.name, k.key_path),
+                Some(k) => {
+                    let path = ssh::resolve_key_path(std::path::Path::new(&k.key_path));
+                    format!("terpilih: {}\n{}{}", k.name, path.display(),
+                        if path.is_file() { "" } else { "\n(file tidak ada di hp ini — Generate ulang atau Muat dari folder import)" })
+                }
                 None => "pilih satu key untuk melihat detailnya".to_string(),
             }
         };
@@ -4096,9 +4258,11 @@ impl App {
         let hint = if c.identity.trim().is_empty() {
             format!("pakai key default: {}", ssh::default_key_path().display())
         } else if self.config.identities.iter().any(|i| i.name == c.identity) {
-            format!("pakai key: {}", self.config.identity_key_path(&c.identity).display())
+            let path = self.config.identity_key_path(&c.identity);
+            format!("pakai key: {}{}", path.display(),
+                if path.is_file() { "" } else { "  ← file tidak ada" })
         } else {
-            format!("key '{}' tidak ada — akan jatuh ke default", c.identity)
+            format!("key '{}' tidak ada di daftar — akan jatuh ke default", c.identity)
         };
         self.ui.widget(id!(id_hint)).set_text(cx, &hint);
         self.ui.widget(id!(form_msg)).set_text(cx, "");
@@ -4188,20 +4352,6 @@ impl App {
         self.ui.redraw(cx);
     }
 
-    /// Where a newly created key file should live (app-private on Android).
-    fn key_file_for(name: &str) -> std::path::PathBuf {
-        // Keep the filename tame: it becomes a real path, and the name comes from a
-        // free-text field.
-        let safe: String = name.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-            .collect();
-        let dir = ssh::default_key_path()
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        dir.join(format!("id_{safe}"))
-    }
-
     /// Generate a named keypair and show the public half to paste into the server.
     fn run_keygen(&mut self, cx: &mut Cx) {
         let name = self.ui.widget(id!(in_key_name)).text().trim().to_string();
@@ -4210,25 +4360,27 @@ impl App {
             self.ui.redraw(cx);
             return;
         }
-        if self.config.identities.iter().any(|i| i.name == name) {
-            self.ui.widget(id!(key_pub)).set_text(cx, "nama key itu sudah dipakai");
-            self.ui.redraw(cx);
-            return;
+        // A name is only "taken" while the key behind it still exists. After a phone
+        // swap the entry is there but the file is not, and refusing to regenerate left
+        // no way to get a working key under the name the command profiles refer to.
+        if let Some(i) = self.config.identities.iter().position(|i| i.name == name) {
+            let path = ssh::resolve_key_path(std::path::Path::new(&self.config.identities[i].key_path));
+            if path.is_file() {
+                self.ui.widget(id!(key_pub)).set_text(cx, "nama key itu sudah dipakai");
+                self.ui.redraw(cx);
+                return;
+            }
         }
         if self.config.identities.len() >= MAX_KEY_ROWS {
             self.ui.widget(id!(key_pub)).set_text(cx, "maksimum 6 key");
             self.ui.redraw(cx);
             return;
         }
-        let path = Self::key_file_for(&name);
+        let path = key_file_for(&name);
         let text = match ssh::generate_key(&path, &format!("leuwi-panjang-{name}")) {
             Ok(pubkey) => {
-                self.config.identities.push(SshIdentity {
-                    name: name.clone(),
-                    key_path: path.display().to_string(),
-                    public_key: pubkey.clone(),
-                });
-                self.sel_key = Some(self.config.identities.len() - 1);
+                self.config.register_identity(&name, &path, &pubkey);
+                self.sel_key = self.config.identities.iter().position(|i| i.name == name);
                 let _ = self.config.save();
                 format!("{pubkey}\n\nsalin baris di atas ke ~/.ssh/authorized_keys di server")
             }
@@ -4255,7 +4407,7 @@ impl App {
             self.ui.redraw(cx);
             return;
         }
-        let path = Self::key_file_for(&name);
+        let path = key_file_for(&name);
         let text = match ssh::import_key(&path, &priv_pem, &pub_line) {
             Ok(pubkey) => {
                 let entry = SshIdentity {
@@ -4305,7 +4457,7 @@ impl App {
             Some(pp) => {
                 let priv_pem = std::fs::read_to_string(&pp).unwrap_or_default();
                 let pub_line = std::fs::read_to_string(pp.with_extension("pub")).unwrap_or_default();
-                let dest = Self::key_file_for(&name);
+                let dest = key_file_for(&name);
                 match ssh::import_key(&dest, &priv_pem, &pub_line) {
                     Ok(pubkey) => {
                         let entry = SshIdentity {
@@ -6273,5 +6425,74 @@ mod tests {
     fn test_config_has_theme() {
         let cfg = Config::default();
         assert_eq!(cfg.theme, "leuwi-dark");
+    }
+
+    // ── SSH key paths ──
+    // The phone-swap bug: an absolute key path saved on one device, looked up on
+    // another where that directory does not exist.
+
+    #[test]
+    fn test_key_file_name_is_stable_and_safe() {
+        assert_eq!(key_file_name("poco-x6"), "id_poco-x6");
+        // Whatever cannot go in a path becomes `_`, and the same name always maps to
+        // the same file — that mapping is how a moved key is found again.
+        assert_eq!(key_file_name("hp baru/2"), "id_hp_baru_2");
+        assert_eq!(key_file_name("poco x6"), key_file_name("poco x6"));
+    }
+
+    #[test]
+    fn test_resolve_key_path_keeps_a_path_that_exists() {
+        let f = std::env::temp_dir().join("leuwi-test-id_ed25519");
+        std::fs::write(&f, b"x").unwrap();
+        assert_eq!(ssh::resolve_key_path(&f), f);
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn test_resolve_key_path_falls_back_to_the_key_dir() {
+        // A path from another device: nothing at that location, and no file of that
+        // name anywhere we look. The answer names where the key belongs on *this*
+        // device, so the error the user reads is actionable.
+        let stale = std::path::PathBuf::from("/data/user/0/com.example.old/ssh/id_nothing-here");
+        assert_eq!(ssh::resolve_key_path(&stale), ssh::key_dir().join("id_nothing-here"));
+    }
+
+    #[test]
+    fn test_identity_key_path_repairs_a_stale_entry() {
+        let mut cfg = Config::default();
+        cfg.identities.push(SshIdentity {
+            name: "poco".into(),
+            key_path: "/data/user/0/com.example.old/ssh/id_poco".into(),
+            public_key: String::new(),
+        });
+        // No file behind it anywhere, so the resolved path is the local key dir
+        // rather than the directory the old phone used.
+        let p = cfg.identity_key_path("poco");
+        assert_eq!(p.parent(), Some(ssh::key_dir().as_path()));
+        assert_eq!(p.file_name().unwrap(), "id_poco");
+    }
+
+    #[test]
+    fn test_repair_key_paths_finds_a_key_that_moved() {
+        // Planted in the *second* search directory (the app's own config dir, never
+        // the user's ~/.ssh) so the test also covers "the key is here, just not where
+        // config.toml said it was".
+        let Some(dir) = ssh::key_dirs().into_iter().nth(1) else { return };
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let moved = dir.join("id_leuwi-test-moved");
+        if std::fs::write(&moved, b"x").is_err() {
+            return;
+        }
+        let mut cfg = Config::default();
+        cfg.identities.push(SshIdentity {
+            name: "moved".into(),
+            key_path: "/data/user/0/com.example.old/ssh/id_leuwi-test-moved".into(),
+            public_key: String::new(),
+        });
+        assert!(cfg.repair_key_paths());
+        assert_eq!(cfg.identities[0].key_path, moved.display().to_string());
+        let _ = std::fs::remove_file(&moved);
     }
 }
