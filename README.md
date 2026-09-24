@@ -3,12 +3,30 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.9
+## Download — v0.1.10
 
-- **[⬇ leuwipanjang_v0.1.9.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.9.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.10.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.10.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
 ~59 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.10
+
+The release that makes the terminal usable with a full TUI like Claude Code.
+
+- **23 columns became 64.** The tab sidebar took a fixed 150 px out of a ~390 px phone
+  window, so the grid was 23 columns wide and everything wrapped or was cut off. It
+  starts folded now (the ▌ button toggles it, and the choice is saved), and **A− / A+**
+  on the key bar change the font size — there was no control for it at all before.
+- **⇧Tab, PgUp and PgDn.** Shift+Tab is how Claude Code moves backwards through its
+  options and the Android keyboard cannot produce it. The key bar is two rows so they
+  fit.
+- **Scrolling back works.** A drag reported wheel notches that tmux discarded unless
+  `mouse` was on, so nothing moved; connecting turns it on now. When the program inside
+  tmux holds the mouse itself, the new **Gulir** key enters tmux copy-mode directly.
+- **The cursor stops disappearing.** A sideways swipe carried enough vertical movement
+  to push the view off the bottom, and the cursor is only drawn at the bottom. Only
+  vertical drags scroll now, and any key returns to the bottom.
 
 ## What's new in 0.1.9
 
