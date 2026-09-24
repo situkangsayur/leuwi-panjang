@@ -320,6 +320,11 @@ struct Config {
     opacity: f64,
     #[serde(default = "default_cursor_style")]
     cursor_style: String,  // "block" or "beam"
+    /// Tab sidebar folded away. It costs 150 px of a ~390 px phone window — 38% of
+    /// the width, which is why the grid came out 23 columns wide and everything
+    /// wrapped. Off by default on Android, remembered once the user toggles it.
+    #[serde(default = "default_sidebar_hidden")]
+    sidebar_hidden: bool,
     #[serde(default = "default_cell_width")]
     cell_width: f64,
     #[serde(default = "default_cell_height")]
@@ -459,7 +464,18 @@ fn default_ssh_key() -> String { "~/.ssh/id_rsa".into() }
 fn default_ssh_session() -> String { "main".into() }
 fn default_cmd_connect() -> String { "nvgpu-s".into() }
 fn default_cmd_list() -> String { "nvgpu-ls".into() }
-fn default_font_size() -> f64 { 12.0 }
+// A phone default that fits a real terminal. 12.0 gave ~23 columns even with the
+// sidebar folded, so tmux status lines and Claude's option boxes wrapped or were cut.
+fn default_font_size() -> f64 { if cfg!(target_os = "android") { 8.5 } else { 12.0 } }
+
+/// The cell box that goes with a font size. These are the ratios the shipped
+/// defaults were built on (9.2 and 20.0 at 12.0), so changing the size keeps the
+/// grid aligned instead of leaving gaps or overlap between glyphs.
+fn cell_box_for(font_size: f64) -> (f64, f64) {
+    (font_size * (9.2 / 12.0), font_size * (20.0 / 12.0))
+}
+const FONT_SIZE_MIN: f64 = 5.5;
+const FONT_SIZE_MAX: f64 = 18.0;
 fn default_cols() -> usize { 115 }
 fn default_rows() -> usize { 33 }
 fn default_scrollback() -> usize { 5000 }
@@ -468,8 +484,35 @@ fn default_fg() -> String { "#C5C8C6".into() }
 fn default_prompt() -> String { "%n@%m %~ %# ".into() }
 fn default_opacity() -> f64 { 0.97 }
 fn default_cursor_style() -> String { "block".into() }
-fn default_cell_width() -> f64 { 9.2 }
-fn default_cell_height() -> f64 { 20.0 }
+/// What each "just send this" key on the on-screen bar puts on the wire. Kept in one
+/// place because these are the sequences the phone cannot produce any other way — the
+/// soft keyboard has no Esc, no Tab, no Shift+Tab, no page keys — and getting one wrong
+/// is invisible until a TUI misbehaves.
+fn key_bar_seq(key: &str) -> Option<&'static [u8]> {
+    let seq: &'static [u8] = match key {
+        "esc" => b"\x1b",
+        "tab" => b"\t",
+        // CSI Z — back-tab. This is Shift+Tab, which Claude Code and most TUIs use to
+        // move backwards through their options.
+        "shift_tab" => b"\x1b[Z",
+        "left" => b"\x1b[D",
+        "down" => b"\x1b[B",
+        "up" => b"\x1b[A",
+        "right" => b"\x1b[C",
+        "pgup" => b"\x1b[5~",
+        "pgdn" => b"\x1b[6~",
+        // tmux prefix (C-b) then `[`: copy-mode, where the arrows and page keys walk
+        // back through the history. A drag reports the wheel instead, but whatever runs
+        // inside tmux may be holding the mouse itself and drop it.
+        "tmux_copy_mode" => b"\x02[",
+        _ => return None,
+    };
+    Some(seq)
+}
+
+fn default_sidebar_hidden() -> bool { cfg!(target_os = "android") }
+fn default_cell_width() -> f64 { cell_box_for(default_font_size()).0 }
+fn default_cell_height() -> f64 { cell_box_for(default_font_size()).1 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -480,6 +523,7 @@ impl Default for Config {
             bg_color: default_bg(), fg_color: default_fg(),
             prompt: default_prompt(), opacity: default_opacity(),
             cursor_style: default_cursor_style(),
+            sidebar_hidden: default_sidebar_hidden(),
             cell_width: default_cell_width(), cell_height: default_cell_height(),
             theme: default_theme_name(),
             ssh_host: default_ssh_host(), ssh_port: default_ssh_port(),
@@ -1008,6 +1052,11 @@ impl Repl {
             "  clear          bersihkan layar\r\n",
             "  help           tampilkan bantuan ini\r\n",
             "\x1b[2mperintah lain diteruskan ke /system/bin/sh (non-interaktif)\x1b[0m\r\n",
+            "\r\n\x1b[2mtombol layar:\x1b[0m\r\n",
+            "  ⇧Tab          Shift+Tab (mundur di menu Claude/TUI)\r\n",
+            "  Gulir         masuk mode gulir tmux (Esc untuk keluar)\r\n",
+            "  PgUp/PgDn     naik/turun satu layar\r\n",
+            "  A− / A+       perkecil/perbesar huruf (menambah kolom)\r\n",
             "\r\n\x1b[2msentuhan:\x1b[0m\r\n",
             "  geser         scroll layar\r\n",
             "  tekan lama    pilih teks (dilepas = tersalin)\r\n",
@@ -1105,6 +1154,18 @@ impl TermTab {
     #[cfg(target_os = "android")]
     fn repl_active(&self) -> bool {
         self.ssh.is_none() && self.repl.is_some()
+    }
+
+    /// Re-print the prompt after the grid changed shape. The block on screen was
+    /// wrapped against the old width, so `rendered_rows` no longer describes it and
+    /// the caret ends up adrift from the prompt — which is what a font change looked
+    /// like: a cursor sitting a few columns to the right of `leuwi>`.
+    #[cfg(target_os = "android")]
+    fn repl_reflow(&mut self) {
+        let Some(repl) = self.repl.as_mut() else { return };
+        let mut g = self.grid.lock().unwrap_or_else(|e| e.into_inner());
+        repl.rendered_rows = 0;
+        repl.redraw_line(&mut g);
     }
 
     /// Handle a session that has ended. A connection the phone dropped (screen off,
@@ -2617,6 +2678,8 @@ pub struct TermView {
 /// Height of the window caption bar. Sized for a thumb, and used by the layout maths
 /// and the mouse hit-tests so the three cannot drift apart again.
 const CAPTION_H: f64 = 44.0;
+/// Height of the two-row on-screen key bar (Android). Mirrors the `key_bar` view.
+const KEY_BAR_H: f64 = 81.0;
 /// How long a finger must stay put before a drag becomes a selection.
 const LONG_PRESS_SECS: f64 = 0.4;
 /// Finger travel (px) still counted as "held still" while waiting for a long press.
@@ -2749,7 +2812,14 @@ impl Widget for TermView {
                                     // that drifts a few pixels is still "held", not a drag.
                                     if moved > LONG_PRESS_SLOP { self.touch_moved = true; }
                                     self.wheel_cell = self.screen_cell(cx, t.abs.x, t.abs.y);
-                                    self.drag_scroll(dy, ch, s_off);
+                                    // Only a mostly-vertical drag scrolls. A sideways
+                                    // swipe carries a few pixels of dy, which was enough
+                                    // to push the view off the bottom — and the cursor is
+                                    // only drawn at the bottom, so it vanished.
+                                    let dx = (t.abs.x - sx).abs();
+                                    if dy.abs() > dx {
+                                        self.drag_scroll(dy, ch, s_off);
+                                    }
                                     self.redraw(cx);
                                 }
                             }
@@ -2962,6 +3032,12 @@ impl TermViewRef {
             inner.cw = cw;
             inner.ch = ch;
             inner.cursor_block = cursor_block;
+        }
+    }
+    /// The DSL fixes the terminal font at one size; this is what lets A−/A+ change it.
+    fn set_font_size(&self, size: f64) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.draw_text.text_style.font_size = size as f32;
         }
     }
     fn reset_scroll(&self) {
@@ -3280,25 +3356,45 @@ live_design! {
                 // them. Ctrl/Alt are sticky: tap to arm, then the next character is sent
                 // with the modifier applied. Hidden on desktop, which has a real keyboard.
                 key_bar = <View> {
-                    width: Fill, height: 44, flow: Right
+                    // Two rows of 36 + 3 spacing + 3 padding top/bottom. Keep in step with
+                    // KEY_BAR_H, which handle_resize subtracts from the grid.
+                    width: Fill, height: 81, flow: Down
                     show_bg: true
                     draw_bg: { color: #x252526 }
-                    align: { y: 0.5 }
-                    padding: { left: 3, right: 3 }
+                    padding: { left: 3, right: 3, top: 3, bottom: 3 }
                     spacing: 3
-                    k_esc = <KeyBtn> { text: "Esc" }
-                    k_tab = <KeyBtn> { text: "Tab" }
-                    k_ctrl = <KeyBtn> { text: "Ctrl" }
-                    k_alt = <KeyBtn> { text: "Alt" }
-                    k_left = <KeyBtn> { text: "←" }
-                    k_down = <KeyBtn> { text: "↓" }
-                    k_up = <KeyBtn> { text: "↑" }
-                    k_right = <KeyBtn> { text: "→" }
-                    // Clipboard, both directions. Selecting is a long press on the
-                    // terminal (which copies on release); these two cover the rest:
-                    // paste from any other app, and re-copy the current selection.
-                    k_paste = <ClipBtn> { text: "Tempel" }
-                    k_copy = <ClipBtn> { text: "Salin" }
+                    <View> {
+                        width: Fill, height: Fit, flow: Right, spacing: 3
+                        k_esc = <KeyBtn> { text: "Esc" }
+                        k_tab = <KeyBtn> { text: "Tab" }
+                        // Claude Code and most TUIs cycle backwards with Shift+Tab, which
+                        // the Android soft keyboard cannot produce at all. CSI Z is the
+                        // back-tab every terminal sends for it.
+                        k_stab = <KeyBtn> { text: "⇧Tab" }
+                        k_ctrl = <KeyBtn> { text: "Ctrl" }
+                        k_alt = <KeyBtn> { text: "Alt" }
+                        k_left = <KeyBtn> { text: "←" }
+                        k_down = <KeyBtn> { text: "↓" }
+                        k_up = <KeyBtn> { text: "↑" }
+                        k_right = <KeyBtn> { text: "→" }
+                    }
+                    <View> {
+                        width: Fill, height: Fit, flow: Right, spacing: 3
+                        // Enters tmux copy-mode (prefix `[`). A drag reports the wheel,
+                        // but whatever runs inside tmux may be holding the mouse itself
+                        // and drop it — this asks tmux directly, so scrolling back works
+                        // no matter what the program on the other end does.
+                        k_scroll = <KeyBtn> { text: "Gulir" }
+                        k_pgup = <KeyBtn> { text: "PgUp" }
+                        k_pgdn = <KeyBtn> { text: "PgDn" }
+                        k_font_dn = <KeyBtn> { text: "A−" }
+                        k_font_up = <KeyBtn> { text: "A+" }
+                        // Clipboard, both directions. Selecting is a long press on the
+                        // terminal (which copies on release); these two cover the rest:
+                        // paste from any other app, and re-copy the current selection.
+                        k_paste = <ClipBtn> { text: "Tempel" }
+                        k_copy = <ClipBtn> { text: "Salin" }
+                    }
                 }
 
                 // Status bar
@@ -3805,6 +3901,12 @@ impl App {
         let block = self.config.cursor_style == "block";
         self.ui.term_view(id!(terminal)).set_cell_size(self.config.cell_width, self.config.cell_height, block);
         self.ui.term_view(id!(terminal2)).set_cell_size(self.config.cell_width, self.config.cell_height, block);
+        self.ui.term_view(id!(terminal)).set_font_size(self.config.font_size);
+        self.ui.term_view(id!(terminal2)).set_font_size(self.config.font_size);
+        // The sidebar takes 150 px out of a ~390 px phone window, so it starts folded
+        // there; the toggle remembers what the user picked.
+        self.sidebar_hidden = self.config.sidebar_hidden;
+        self.ui.widget(id!(tab_sidebar)).set_visible(cx, !self.sidebar_hidden);
         self.update_tab_label(cx);
         cx.start_interval(0.033);
         // NOTE: do NOT call show_text_ime here — invoking the IME during Startup
@@ -3871,6 +3973,33 @@ impl App {
         set_tab!(tab2, 2);
         set_tab!(tab3, 3);
         set_tab!(tab4, 4);
+    }
+
+    /// Step the terminal font up or down, and re-measure: fewer, bigger cells or more,
+    /// smaller ones. There is no other way to change how many columns the phone shows,
+    /// and 23 columns is what made tmux status lines and Claude's option boxes wrap.
+    fn nudge_font(&mut self, cx: &mut Cx, delta: f64) {
+        let size = (self.config.font_size + delta).clamp(FONT_SIZE_MIN, FONT_SIZE_MAX);
+        if (size - self.config.font_size).abs() < f64::EPSILON {
+            return;
+        }
+        self.config.font_size = size;
+        let (cw, ch) = cell_box_for(size);
+        self.config.cell_width = cw;
+        self.config.cell_height = ch;
+        let block = self.config.cursor_style == "block";
+        for id in [id!(terminal), id!(terminal2)] {
+            self.ui.term_view(id).set_font_size(size);
+            self.ui.term_view(id).set_cell_size(cw, ch, block);
+        }
+        let _ = self.config.save();
+        // Re-measure now; otherwise the column count stays where it was until something
+        // else forces a resize, and the text is drawn at a size the grid does not match.
+        let (w, h) = self.last_size;
+        if w > 0.0 && h > 0.0 {
+            self.handle_resize(w, h);
+        }
+        self.ui.redraw(cx);
     }
 
     /// Show which sticky modifiers are armed, so the bar reflects real state.
@@ -4778,6 +4907,13 @@ impl App {
     }
 
     fn write_to_active(&mut self, data: &[u8]) {
+        // Anything typed puts the view back at the bottom, the way a real terminal
+        // does. Without it the on-screen arrows and Esc left the pane scrolled up —
+        // where the cursor is not drawn at all, so it looked like the cursor was gone.
+        self.ui.term_view(id!(terminal)).reset_scroll();
+        if self.split_active {
+            self.ui.term_view(id!(terminal2)).reset_scroll();
+        }
         if self.split_active {
             if let Some(split) = &mut self.tabs[self.active_tab].split {
                 split.write(data);
@@ -4809,7 +4945,7 @@ impl App {
         // from the grid. Without accounting for them the terminal reflows wider/taller
         // than its pane and the text runs off the edge.
         let sidebar_w = if self.sidebar_hidden { 0.0 } else { 150.0 };
-        let key_bar_h = if cfg!(target_os = "android") { 44.0 } else { 0.0 };
+        let key_bar_h = if cfg!(target_os = "android") { KEY_BAR_H } else { 0.0 };
         let cw = self.config.cell_width;
         let ch = self.config.cell_height;
         let avail_w = width - 24.0 - sidebar_w;
@@ -4851,6 +4987,12 @@ impl App {
                 _ => {
                     tab.resize(full_cols, full_rows);
                 }
+            }
+            // A tab still at the built-in prompt has to re-print it: the block on
+            // screen was wrapped for the old width.
+            #[cfg(target_os = "android")]
+            if tab.repl_active() {
+                tab.repl_reflow();
             }
         }
     }
@@ -4896,6 +5038,8 @@ impl MatchEvent for App {
         if self.ui.button(id!(btn_cmd_export)).clicked(&actions) { self.export_commands_file(cx); }
         if self.ui.button(id!(sidebar_btn)).clicked(&actions) {
             self.sidebar_hidden = !self.sidebar_hidden;
+            self.config.sidebar_hidden = self.sidebar_hidden;
+            let _ = self.config.save();
             self.ui.widget(id!(tab_sidebar)).set_visible(cx, !self.sidebar_hidden);
             // The sidebar's 150 px come straight out of the grid's width, so the grid has
             // to be re-measured now. Without this the text kept the old column count until
@@ -4907,12 +5051,21 @@ impl MatchEvent for App {
             }
             self.ui.redraw(cx);
         }
-        if self.ui.button(id!(k_esc)).clicked(&actions) { self.write_to_active(b"\x1b"); }
-        if self.ui.button(id!(k_tab)).clicked(&actions) { self.write_to_active(b"\t"); }
-        if self.ui.button(id!(k_left)).clicked(&actions) { self.write_to_active(b"\x1b[D"); }
-        if self.ui.button(id!(k_down)).clicked(&actions) { self.write_to_active(b"\x1b[B"); }
-        if self.ui.button(id!(k_up)).clicked(&actions) { self.write_to_active(b"\x1b[A"); }
-        if self.ui.button(id!(k_right)).clicked(&actions) { self.write_to_active(b"\x1b[C"); }
+        for (id, key) in [
+            (id!(k_esc), "esc"), (id!(k_tab), "tab"), (id!(k_stab), "shift_tab"),
+            (id!(k_left), "left"), (id!(k_down), "down"),
+            (id!(k_up), "up"), (id!(k_right), "right"),
+            (id!(k_pgup), "pgup"), (id!(k_pgdn), "pgdn"),
+            (id!(k_scroll), "tmux_copy_mode"),
+        ] {
+            if self.ui.button(id).clicked(&actions) {
+                if let Some(seq) = key_bar_seq(key) {
+                    self.write_to_active(seq);
+                }
+            }
+        }
+        if self.ui.button(id!(k_font_dn)).clicked(&actions) { self.nudge_font(cx, -0.5); }
+        if self.ui.button(id!(k_font_up)).clicked(&actions) { self.nudge_font(cx, 0.5); }
         if self.ui.button(id!(k_paste)).clicked(&actions) { self.paste_clipboard(cx); }
         if self.ui.button(id!(k_copy)).clicked(&actions) { self.copy_selection(cx); }
         if self.ui.button(id!(k_ctrl)).clicked(&actions) {
@@ -6606,6 +6759,44 @@ mod tests {
         let p = cfg.identity_key_path("poco");
         assert_eq!(p.parent(), Some(ssh::key_dir().as_path()));
         assert_eq!(p.file_name().unwrap(), "id_poco");
+    }
+
+    // ── Terminal sizing ──
+
+    #[test]
+    fn test_key_bar_sends_the_right_sequences() {
+        // Shift+Tab is the one the soft keyboard cannot make at all, and the reason the
+        // key exists: CSI Z, not a tab with some modifier flag.
+        assert_eq!(key_bar_seq("shift_tab"), Some(&b"\x1b[Z"[..]));
+        assert_eq!(key_bar_seq("tab"), Some(&b"\t"[..]));
+        assert_eq!(key_bar_seq("esc"), Some(&b"\x1b"[..]));
+        assert_eq!(key_bar_seq("pgup"), Some(&b"\x1b[5~"[..]));
+        assert_eq!(key_bar_seq("pgdn"), Some(&b"\x1b[6~"[..]));
+        // tmux prefix C-b (0x02) then `[`.
+        assert_eq!(key_bar_seq("tmux_copy_mode"), Some(&b"\x02["[..]));
+        assert_eq!(key_bar_seq("nope"), None);
+    }
+
+    #[test]
+    fn test_cell_box_tracks_the_font_size() {
+        // The shipped 12.0 defaults are the anchor; anything else scales from them, so
+        // the grid keeps matching the glyphs when A-/A+ change the size.
+        let (w, h) = cell_box_for(12.0);
+        assert!((w - 9.2).abs() < 1e-9, "{w}");
+        assert!((h - 20.0).abs() < 1e-9, "{h}");
+        let (w2, h2) = cell_box_for(6.0);
+        assert!((w2 - 4.6).abs() < 1e-9, "{w2}");
+        assert!((h2 - 10.0).abs() < 1e-9, "{h2}");
+    }
+
+    #[test]
+    fn test_smaller_font_buys_columns() {
+        // 23 columns is what made tmux status lines and Claude's option boxes wrap.
+        // Same window, no sidebar: halving the cell width has to roughly double them.
+        let avail_w = 393.0 - 24.0;
+        let cols = |size: f64| (avail_w / cell_box_for(size).0) as usize;
+        assert!(cols(8.5) > cols(12.0));
+        assert!(cols(6.0) >= 2 * cols(12.0) - 2);
     }
 
     #[test]

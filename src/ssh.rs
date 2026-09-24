@@ -66,7 +66,15 @@ impl SshProfile {
     fn startup_cmd(&self) -> String {
         match &self.startup {
             Some(s) if !s.trim().is_empty() => s.clone(),
-            _ => format!("tmux new -A -s {}", quote_session(&self.session)),
+            // `set -g mouse on` first, so it applies to the session this command is
+            // about to create *and* to one that already exists. Without it a finger
+            // drag sends wheel events that tmux throws away, which is what "cannot
+            // scroll up" on the phone actually was — the app was reporting the wheel
+            // correctly and nothing on the other end was listening.
+            _ => format!(
+                "tmux set -g mouse on \\; new -A -s {}",
+                quote_session(&self.session)
+            ),
         }
     }
 
@@ -88,6 +96,29 @@ impl SshProfile {
 // Android has no home directory: `dirs::home_dir()` comes back empty and the process CWD
 // is `/`, so the desktop defaults below would resolve to an unwritable `/.ssh/id_rsa` and
 // `/leuwi-panjang/known_hosts`. Anchor both on the app`s own directories instead.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_startup_turns_on_tmux_mouse() {
+        // Without this a finger drag reports wheel events that tmux discards, which is
+        // what "cannot scroll up" on the phone was. `set` comes first so it applies to
+        // a session that already exists, not only the one being created.
+        let p = SshProfile::nvgpu("main", 80, 24);
+        let cmd = p.startup_cmd();
+        assert!(cmd.starts_with("tmux set -g mouse on \\;"), "{cmd}");
+        assert!(cmd.ends_with("new -A -s main"), "{cmd}");
+    }
+
+    #[test]
+    fn test_explicit_startup_is_left_alone() {
+        let mut p = SshProfile::nvgpu("main", 80, 24);
+        p.startup = Some("tmux new -A -s main \\; choose-tree -Zs".into());
+        assert_eq!(p.startup_cmd(), "tmux new -A -s main \\; choose-tree -Zs");
+    }
+}
+
 #[cfg(target_os = "android")]
 pub(crate) const ANDROID_PKG: &str = "com.situkangsayur.leuwipanjang";
 #[cfg(target_os = "android")]
