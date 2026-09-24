@@ -3,12 +3,29 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.8
+## Download — v0.1.9
 
-- **[⬇ leuwipanjang_v0.1.8.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.8.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.9.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.9.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
 ~59 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.9
+
+- **The command profile actually saves the key you pick.** The Perintah page opened on
+  a blank "new profile" form that is prefilled with the same host, port, user and
+  session as the real entry — so it looked like the configured profile with only the
+  scrolled-off name empty. Pressing Simpan failed with a complaint rendered below the
+  fold, nothing was saved, and connecting kept using the old key. The page now opens on
+  the first profile, the result appears directly under Simpan, a blank name is derived
+  from the connect word, and an unknown key name warns instead of discarding the whole
+  profile.
+- **Generate keypair reports where you pressed it.** Its result used to go only to a
+  label at the very bottom of the page, so the button looked inert. Keys are also
+  written to the first directory that can actually be written to, and the six-key cap
+  no longer blocks regenerating a key whose file went missing with the old phone.
+- **Public key export**: *Salin public key* to the clipboard, or
+  *Ekspor public key (.txt)* into the import folder to share through a file manager.
 
 ## What's new in 0.1.8
 
