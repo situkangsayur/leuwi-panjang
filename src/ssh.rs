@@ -177,6 +177,25 @@ pub(crate) fn default_key_path() -> PathBuf {
     key_dir().join("id_ed25519")
 }
 
+/// The first directory in `key_dirs()` we can actually create and write into, else
+/// `key_dir()`. Generating a key used to dead-end when its one destination could not
+/// be created — on a phone where the app data dir is somewhere else than assumed there
+/// was then no way to make a key at all. `probe` is written and removed, because
+/// `create_dir_all` succeeding says nothing about being allowed to write inside.
+pub(crate) fn writable_key_dir() -> PathBuf {
+    for d in key_dirs() {
+        if std::fs::create_dir_all(&d).is_err() {
+            continue;
+        }
+        let probe = d.join(".leuwi-write-test");
+        if std::fs::write(&probe, b"").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            return d;
+        }
+    }
+    key_dir()
+}
+
 /// Turn a key path recorded in config.toml into one that exists on *this* device.
 /// The recorded path is absolute, so a config that travels to another phone (cloud
 /// restore, an imported config.toml, the app reinstalled under a different Android

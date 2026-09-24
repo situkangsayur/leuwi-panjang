@@ -385,11 +385,13 @@ fn key_file_name(name: &str) -> String {
     format!("id_{safe}")
 }
 
-/// Where a key called `name` is written. Always the app's own key directory — it used
-/// to follow whatever directory the *default* key happened to live in, which made the
-/// destination depend on unrelated files and differ from phone to phone.
+/// Where a key called `name` is written. The app's own key directory when that is
+/// writable, otherwise the first directory in `ssh::key_dirs()` that is — it used to
+/// follow whatever directory the *default* key happened to live in (so the destination
+/// depended on unrelated files and differed from phone to phone), and then to be a
+/// single fixed path that simply failed when the app data dir was elsewhere.
 fn key_file_for(name: &str) -> std::path::PathBuf {
-    ssh::key_dir().join(key_file_name(name))
+    ssh::writable_key_dir().join(key_file_name(name))
 }
 
 /// One connectable host, exposed to the REPL as `<name>-s <session>` (connect) and
@@ -3392,13 +3394,18 @@ live_design! {
                             <FormLabel> { text: "Password (kosong = pakai SSH key)" }
                             in_pass = <FormInput> { is_password: true, empty_text: "" }
                             btn_save = <FormBtn> { text: "Simpan" }
+                            form_msg = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #x6E7681, text_style: { font_size: 9.0 } }
+                            }
                             btn_cmd_del = <DangerBtn> { text: "Hapus perintah ini" }
 
                             <SecTitle> { text: "Muat dari file" }
                             <FormHint> { text: "commands.toml di folder import (lihat pesan di bawah untuk path lengkap)." }
                             btn_cmd_import = <FormBtn> { text: "Muat commands.toml" }
                             btn_cmd_export = <AltBtn> { text: "Ekspor commands.toml" }
-                            form_msg = <Label> {
+                            file_msg = <Label> {
                                 width: Fill
                                 text: ""
                                 draw_text: { color: #x6E7681, text_style: { font_size: 9.0 } }
@@ -3421,10 +3428,23 @@ live_design! {
                                 key5 = <ListRow> {}
                             }
 
+                            <SecTitle> { text: "Public key (untuk authorized_keys)" }
+                            btn_key_pub_copy = <FormBtn> { text: "Salin public key" }
+                            btn_key_pub_txt = <AltBtn> { text: "Ekspor public key (.txt)" }
+
                             <SecTitle> { text: "Buat key baru" }
                             <FormLabel> { text: "Nama key" }
                             in_key_name = <FormInput> { empty_text: "poco-x6" }
                             btn_keygen = <FormBtn> { text: "Generate keypair ed25519" }
+                            // The full result goes to `key_pub` at the bottom of the
+                            // page — off-screen from here, so pressing the button
+                            // looked like it did nothing. This line sits where the
+                            // finger already is.
+                            keygen_msg = <Label> {
+                                width: Fill
+                                text: ""
+                                draw_text: { color: #x7EE787, text_style: { font_size: 9.0 } }
+                            }
 
                             <SecTitle> { text: "Atau tempel key yang sudah ada" }
                             <FormLabel> { text: "Private key (OPENSSH PEM lengkap)" }
@@ -4180,7 +4200,13 @@ impl App {
         match which {
             CfgTab::Cmd => {
                 self.refresh_cmd_list(cx);
-                let sel = self.sel_cmd;
+                // Default to the first profile rather than a blank "new profile" form.
+                // The blank form is prefilled from CommandProfile::default() — the same
+                // host, port, user and session as the real nvgpu entry — so it looked
+                // like the configured profile with only the (scrolled-off) name empty.
+                // Editing it and pressing Simpan then failed with a message below the
+                // fold and saved nothing.
+                let sel = self.sel_cmd.or(if self.config.commands.is_empty() { None } else { Some(0) });
                 self.load_cmd_form(cx, sel);
             }
             CfgTab::Key => {
@@ -4222,16 +4248,17 @@ impl App {
                     cx, &format!("{}{}  ·  {}", marker, k.name, if has { "ok" } else { "file hilang" }));
             }
         }
+        let dir_line = format!("folder key: {}", ssh::writable_key_dir().display());
         let info = if self.config.identities.is_empty() {
-            "belum ada key — generate atau tempel di bawah".to_string()
+            format!("belum ada key — generate atau tempel di bawah\n{dir_line}")
         } else {
             match self.sel_key.and_then(|i| self.config.identities.get(i)) {
                 Some(k) => {
                     let path = ssh::resolve_key_path(std::path::Path::new(&k.key_path));
-                    format!("terpilih: {}\n{}{}", k.name, path.display(),
+                    format!("terpilih: {}\n{}{}\n{dir_line}", k.name, path.display(),
                         if path.is_file() { "" } else { "\n(file tidak ada di hp ini — Generate ulang atau Muat dari folder import)" })
                 }
-                None => "pilih satu key untuk melihat detailnya".to_string(),
+                None => format!("pilih satu key untuk melihat detailnya\n{dir_line}"),
             }
         };
         self.ui.widget(id!(key_info)).set_text(cx, &info);
@@ -4265,7 +4292,11 @@ impl App {
             format!("key '{}' tidak ada di daftar — akan jatuh ke default", c.identity)
         };
         self.ui.widget(id!(id_hint)).set_text(cx, &hint);
-        self.ui.widget(id!(form_msg)).set_text(cx, "");
+        // The blank form is prefilled from the defaults, so say plainly that this is a
+        // new entry and that the name at the top is the one field with nothing in it.
+        self.ui.widget(id!(form_msg)).set_text(cx, if self.sel_cmd.is_none() {
+            "profil BARU — isi Nama profil di atas (kolom lain sudah diisi contoh)"
+        } else { "" });
         self.refresh_cmd_list(cx);
         self.ui.redraw(cx);
     }
@@ -4282,9 +4313,23 @@ impl App {
         let identity = self.ui.widget(id!(in_identity)).text().trim().to_string();
         let password = self.ui.widget(id!(in_pass)).text();
 
-        if name.is_empty() {
-            return self.form_err(cx, "nama profil wajib diisi");
-        }
+        // A blank name used to abort the save outright, with the complaint rendered
+        // below the fold — and the form opens prefilled, so the empty field is easy
+        // to miss. Derive one from the connect word (`nvgpu-s` -> `nvgpu`), else the
+        // host, and only refuse when there is nothing at all to go on.
+        let name = if name.is_empty() {
+            let w = cmd_connect.trim();
+            let derived = w.strip_suffix("-s").unwrap_or(w);
+            if !derived.is_empty() {
+                derived.to_string()
+            } else if !host.is_empty() {
+                host.clone()
+            } else {
+                return self.form_err(cx, "isi Nama profil (di bagian atas form) dulu");
+            }
+        } else {
+            name
+        };
         if host.is_empty() {
             return self.form_err(cx, "host wajib diisi");
         }
@@ -4292,10 +4337,16 @@ impl App {
             Ok(p) if p > 0 => p,
             _ => return self.form_err(cx, "port harus angka 1-65535"),
         };
-        if !identity.is_empty() && !self.config.identities.iter().any(|i| i.name == identity) {
-            return self.form_err(cx, "nama SSH key tidak ada di tab SSH Key");
-        }
+        // An identity the list does not hold is a *warning*, not a refusal. Refusing
+        // discarded the whole profile — host, port, user, the lot — so a key that
+        // failed to generate, or a name typed as the file name, left the command
+        // still pointing at the old key and no way to change it. `identity_key_path`
+        // resolves a stray name by file name anyway.
+        let unknown_identity = !identity.is_empty()
+            && !self.config.identities.iter().any(|i| i.name == identity)
+            && !self.config.identity_key_path(&identity).is_file();
 
+        let identity_for_msg = identity.clone();
         let entry = CommandProfile {
             name, host, port, user,
             password, identity, session,
@@ -4326,10 +4377,25 @@ impl App {
             }
         }
         let msg = match self.config.save() {
+            Ok(()) if unknown_identity => format!(
+                "tersimpan, TAPI key '{}' tidak ditemukan — profil ini akan memakai key default ({}). Buat key itu di tab SSH Key.",
+                identity_for_msg, ssh::default_key_path().display()),
             Ok(()) => format!("tersimpan — pakai `{} <sesi>` di prompt", connect_word),
             Err(e) => format!("gagal: {e}"),
         };
         self.ui.widget(id!(form_msg)).set_text(cx, &msg);
+        // The "pakai key ..." line is filled in by load_cmd_form, so without this it
+        // kept describing the key the profile had *before* the save.
+        let hint = {
+            let path = self.config.identity_key_path(&identity_for_msg);
+            if identity_for_msg.trim().is_empty() {
+                format!("pakai key default: {}", ssh::default_key_path().display())
+            } else {
+                format!("pakai key '{}': {}{}", identity_for_msg, path.display(),
+                    if path.is_file() { "" } else { "  ← file tidak ada" })
+            }
+        };
+        self.ui.widget(id!(id_hint)).set_text(cx, &hint);
         self.refresh_cmd_list(cx);
         self.ui.redraw(cx);
     }
@@ -4356,6 +4422,7 @@ impl App {
     fn run_keygen(&mut self, cx: &mut Cx) {
         let name = self.ui.widget(id!(in_key_name)).text().trim().to_string();
         if name.is_empty() {
+            self.ui.widget(id!(keygen_msg)).set_text(cx, "isi nama key dulu");
             self.ui.widget(id!(key_pub)).set_text(cx, "isi nama key dulu");
             self.ui.redraw(cx);
             return;
@@ -4363,15 +4430,20 @@ impl App {
         // A name is only "taken" while the key behind it still exists. After a phone
         // swap the entry is there but the file is not, and refusing to regenerate left
         // no way to get a working key under the name the command profiles refer to.
-        if let Some(i) = self.config.identities.iter().position(|i| i.name == name) {
+        let existing = self.config.identities.iter().position(|i| i.name == name);
+        if let Some(i) = existing {
             let path = ssh::resolve_key_path(std::path::Path::new(&self.config.identities[i].key_path));
             if path.is_file() {
+                self.ui.widget(id!(keygen_msg)).set_text(cx, "nama key itu sudah dipakai");
                 self.ui.widget(id!(key_pub)).set_text(cx, "nama key itu sudah dipakai");
                 self.ui.redraw(cx);
                 return;
             }
         }
-        if self.config.identities.len() >= MAX_KEY_ROWS {
+        // The cap counts *new* entries. Replacing a broken one adds no row, and
+        // refusing it at six keys left the repair impossible without deleting first.
+        if existing.is_none() && self.config.identities.len() >= MAX_KEY_ROWS {
+            self.ui.widget(id!(keygen_msg)).set_text(cx, "maksimum 6 key");
             self.ui.widget(id!(key_pub)).set_text(cx, "maksimum 6 key");
             self.ui.redraw(cx);
             return;
@@ -4386,6 +4458,12 @@ impl App {
             }
             Err(e) => format!("gagal: {e}"),
         };
+        let short = if text.starts_with("gagal") {
+            text.clone()
+        } else {
+            format!("✓ key '{}' dibuat di {}", name, path.display())
+        };
+        self.ui.widget(id!(keygen_msg)).set_text(cx, &short);
         self.refresh_key_list(cx);
         self.ui.widget(id!(key_pub)).set_text(cx, &text);
         self.ui.redraw(cx);
@@ -4484,6 +4562,62 @@ impl App {
         self.ui.redraw(cx);
     }
 
+    /// The public key of the selected identity: the cached line when there is one,
+    /// otherwise read back from the key file. Returns the name alongside it, because
+    /// both callers report which key they acted on.
+    fn selected_pubkey(&self) -> Result<(String, String), String> {
+        let k = self
+            .sel_key
+            .and_then(|i| self.config.identities.get(i))
+            .ok_or_else(|| "pilih satu key dulu di daftar di atas".to_string())?;
+        if !k.public_key.trim().is_empty() {
+            return Ok((k.name.clone(), k.public_key.trim().to_string()));
+        }
+        let path = ssh::resolve_key_path(std::path::Path::new(&k.key_path));
+        ssh::public_key_of(&path).map(|p| (k.name.clone(), p))
+    }
+
+    /// Public key to the clipboard — the usual way it reaches `authorized_keys`.
+    fn copy_pubkey(&mut self, cx: &mut Cx) {
+        let text = match self.selected_pubkey() {
+            Ok((name, pubkey)) => {
+                clip::set(&pubkey);
+                format!("{pubkey}\n\n✓ public key '{name}' disalin ke papan klip\ntempel ke ~/.ssh/authorized_keys di server")
+            }
+            Err(e) => format!("gagal: {e}"),
+        };
+        self.ui.widget(id!(key_pub)).set_text(cx, &text);
+        self.ui.redraw(cx);
+    }
+
+    /// Public key as a plain `.txt` in the import dir, for when the clipboard is not
+    /// the route out — sharing the file through a file manager, chat or email.
+    fn export_pubkey_txt(&mut self, cx: &mut Cx) {
+        let text = match self.selected_pubkey() {
+            Err(e) => format!("gagal: {e}"),
+            Ok((name, pubkey)) => {
+                let dir = Config::import_dir();
+                match std::fs::create_dir_all(&dir) {
+                    Err(e) => format!("buat {}: {e}", dir.display()),
+                    Ok(()) => {
+                        let file = dir.join(format!("{}.pub.txt", key_file_name(&name)));
+                        match std::fs::write(&file, format!("{pubkey}\n")) {
+                            Err(e) => format!("tulis {}: {e}", file.display()),
+                            Ok(()) => {
+                                clip::set(&pubkey);
+                                format!(
+                                    "public key '{}' ditulis ke:\n{}\n\n(juga disalin ke papan klip)\nbuka lewat aplikasi Berkas, lalu kirim/bagikan isinya ke ~/.ssh/authorized_keys di server",
+                                    name, file.display())
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        self.ui.widget(id!(key_pub)).set_text(cx, &text);
+        self.ui.redraw(cx);
+    }
+
     /// Copy the selected key out to the import dir, and create that dir under the
     /// app`s uid so hand-placed files land readable.
     fn export_key_files(&mut self, cx: &mut Cx) {
@@ -4493,7 +4627,7 @@ impl App {
             Ok(()) => match self.sel_key.and_then(|i| self.config.identities.get(i)) {
                 None => format!("folder siap:\n{}\n\npilih satu key kalau mau ikut diekspor", dir.display()),
                 Some(k) => {
-                    let src = std::path::PathBuf::from(&k.key_path);
+                    let src = ssh::resolve_key_path(std::path::Path::new(&k.key_path));
                     let e1 = std::fs::copy(&src, dir.join("id_ed25519")).err();
                     let e2 = std::fs::copy(src.with_extension("pub"), dir.join("id_ed25519.pub")).err();
                     match (e1, e2) {
@@ -4515,8 +4649,8 @@ impl App {
             Ok(n) => format!("{n} perintah dimuat dari {}", Config::import_dir().display()),
             Err(e) => e,
         };
-        self.load_cmd_form(cx, None);
-        self.ui.widget(id!(form_msg)).set_text(cx, &msg);
+        self.load_cmd_form(cx, Some(0));
+        self.ui.widget(id!(file_msg)).set_text(cx, &msg);
         self.ui.redraw(cx);
     }
 
@@ -4526,7 +4660,7 @@ impl App {
             Ok(p) => format!("ditulis ke {}\nedit lalu tekan Muat untuk memuat kembali", p.display()),
             Err(e) => e,
         };
-        self.ui.widget(id!(form_msg)).set_text(cx, &msg);
+        self.ui.widget(id!(file_msg)).set_text(cx, &msg);
         self.ui.redraw(cx);
     }
 
@@ -4756,6 +4890,8 @@ impl MatchEvent for App {
         // Provision from files dropped into the app's external import dir.
         if self.ui.button(id!(btn_key_load)).clicked(&actions) { self.import_key_files(cx); }
         if self.ui.button(id!(btn_key_export)).clicked(&actions) { self.export_key_files(cx); }
+        if self.ui.button(id!(btn_key_pub_copy)).clicked(&actions) { self.copy_pubkey(cx); }
+        if self.ui.button(id!(btn_key_pub_txt)).clicked(&actions) { self.export_pubkey_txt(cx); }
         if self.ui.button(id!(btn_cmd_import)).clicked(&actions) { self.import_commands_file(cx); }
         if self.ui.button(id!(btn_cmd_export)).clicked(&actions) { self.export_commands_file(cx); }
         if self.ui.button(id!(sidebar_btn)).clicked(&actions) {
