@@ -3,12 +3,25 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.11
+## Download — v0.1.12
 
-- **[⬇ leuwipanjang_v0.1.11.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.11.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.12.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.12.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
 ~59 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.12
+
+- **The screen is drawn all the way down.** The visible window used to end at the
+  *cursor's* row, so everything below the caret was never drawn: the tmux status bar,
+  the bottom border and hint line of an input box, the rest of any full-screen program.
+- **The caret is drawn on its own row**, not on whichever row happened to be drawn
+  last. Moving through a long wrapped line, or backspacing (which unwraps it), no longer
+  makes it jump away or vanish.
+- **It no longer blinks.** The blink was counted in frames drawn, and an idle terminal
+  only repaints twice a second — so each phase lasted about 7.5 seconds.
+- **`DECTCEM` is honoured**, so a program that hides the caret no longer gets a stray
+  block drawn over its redraw.
 
 ## What's new in 0.1.11
 
