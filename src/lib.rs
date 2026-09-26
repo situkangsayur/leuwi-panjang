@@ -1131,6 +1131,7 @@ impl TermTab {
     #[cfg(target_os = "android")]
     fn spawn(id: usize, cfg: &Config) -> Self {
         let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
+        grid.lock().unwrap_or_else(|e| e.into_inner()).max_scrollback = cfg.scrollback.max(100);
         {
             let mut g = grid.lock().unwrap_or_else(|e| e.into_inner());
             g.process(Repl::banner().as_bytes());
@@ -1726,6 +1727,7 @@ impl TermTab {
     #[cfg(not(target_os = "android"))]
     fn spawn_ssh(id: usize, cfg: &Config, profile: ssh::SshProfile) -> Self {
         let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
+        grid.lock().unwrap_or_else(|e| e.into_inner()).max_scrollback = cfg.scrollback.max(100);
         let sink_grid = grid.clone();
         // Same inline reply path as the Android tab — see start_pending_ssh.
         let reply: Arc<Mutex<Option<ssh::SshWriter>>> = Arc::new(Mutex::new(None));
@@ -1769,6 +1771,7 @@ impl TermTab {
             return Self::spawn_ssh(id, cfg, cfg.ssh_profile_for_tab(id));
         }
         let grid = Arc::new(Mutex::new(TermGrid::new(cfg.cols, cfg.rows)));
+        grid.lock().unwrap_or_else(|e| e.into_inner()).max_scrollback = cfg.scrollback.max(100);
         let pty_system = portable_pty::native_pty_system();
         let size = portable_pty::PtySize { rows: cfg.rows as u16, cols: cfg.cols as u16, pixel_width: 0, pixel_height: 0 };
         let pair = pty_system.openpty(size).unwrap();
@@ -1927,7 +1930,10 @@ struct TermGrid {
     cols: usize,
     rows: usize,
     cells: Vec<Vec<Cell>>,
-    scrollback: Vec<Vec<Cell>>,
+    /// Oldest-first ring of rows that have scrolled off the top. A `VecDeque` because
+    /// the eviction at the far end happens once per scrolled line, on the SSH reader
+    /// thread, while it holds the grid lock — see `newline`.
+    scrollback: std::collections::VecDeque<Vec<Cell>>,
     max_scrollback: usize,
     cur_r: usize,
     cur_c: usize,
@@ -1974,8 +1980,10 @@ impl TermGrid {
         Self {
             cols, rows,
             cells: vec![vec![Cell::default(); cols]; rows],
-            scrollback: Vec::new(),
-            max_scrollback: 5000,
+            scrollback: std::collections::VecDeque::new(),
+            // Overwritten from `config.scrollback` at the call sites that have a
+            // config; the literal is only the fallback for `TermGrid::new` in tests.
+            max_scrollback: default_scrollback(),
             cur_r: 0, cur_c: 0, cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false, cur_underline: false,
             mouse_reporting: false, bracketed_paste: false, app_cursor_keys: false, response_buf: Vec::new(), dirty: true,
             alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
@@ -2045,15 +2053,32 @@ impl TermGrid {
 
     fn newline(&mut self) {
         if self.cur_r == self.scroll_bottom {
-            // Scroll within region
+            // Scroll within region.
             let top = self.cells.remove(self.scroll_top);
-            if self.scroll_top == 0 && !self.in_alt_screen {
-                self.scrollback.push(top);
+            // Where the new blank bottom row comes from. Nothing is allocated per line:
+            // the row leaving the top is reused, or — when it is being kept — the row
+            // evicted from the far end of the scrollback is.
+            //
+            // This used to be `scrollback.remove(0)` on a 5000-entry Vec, i.e. a ~120 KB
+            // memmove for every single line scrolled, plus a fresh row allocation. It
+            // only started once the scrollback filled up, which is why the app ran fine
+            // for a while and then locked up: the cost is paid on the SSH reader thread
+            // while it holds the grid lock, so a fast-scrolling program (a build log, an
+            // AI CLI streaming output) starved the UI thread of the lock it needs to
+            // paint a frame.
+            let mut fresh = if self.scroll_top == 0 && !self.in_alt_screen {
+                self.scrollback.push_back(top);
                 if self.scrollback.len() > self.max_scrollback {
-                    self.scrollback.remove(0);
+                    self.scrollback.pop_front().unwrap_or_default()
+                } else {
+                    Vec::new()
                 }
-            }
-            self.cells.insert(self.scroll_bottom, vec![Cell::default(); self.cols]);
+            } else {
+                top
+            };
+            fresh.clear();
+            fresh.resize(self.cols, Cell::default());
+            self.cells.insert(self.scroll_bottom, fresh);
         } else if self.cur_r + 1 < self.rows {
             self.cur_r += 1;
         }
@@ -2684,6 +2709,13 @@ const KEY_BAR_H: f64 = 81.0;
 const LONG_PRESS_SECS: f64 = 0.4;
 /// Finger travel (px) still counted as "held still" while waiting for a long press.
 const LONG_PRESS_SLOP: f64 = 12.0;
+/// Foreground a cell is actually drawn in: bold brightens the eight base colours, the
+/// way every terminal does. Runs are batched by this value, not by `cell.fg`, so two
+/// cells that only differ in a flag that does not change the colour stay in one run.
+fn cell_fg(cell: &Cell) -> u32 {
+    if cell.bold && cell.fg < 8 && !is_truecolor(cell.fg) { cell.fg + 8 } else { cell.fg }
+}
+
 /// Terminal lines per wheel notch, matching what a desktop wheel sends.
 const WHEEL_LINES: f64 = 3.0;
 
@@ -2925,7 +2957,8 @@ impl Widget for TermView {
 
         let px = rect.pos.x + pad_x;
         let py = rect.pos.y + pad_y;
-        let mut char_buf = [0u8; 4];
+        let mut run_buf = String::with_capacity(256);
+        let has_selection = grid.sel_start.is_some() && grid.sel_end.is_some();
         let mut screen_row: usize = 0;
 
         for abs_row in start_row..end_row {
@@ -2940,28 +2973,51 @@ impl Widget for TermView {
                 if grid_row < grid.rows { &grid.cells[grid_row] } else { screen_row += 1; continue; }
             };
 
-            for (c, cell) in row_cells.iter().enumerate() {
+            // PASS 1: backgrounds, one quad per *run* of equal colour rather than one
+            // per cell. A tmux status line or a syntax-highlighted block is dozens of
+            // identical cells in a row; at 68 columns that was 68 draw calls a line.
+            let mut c = 0usize;
+            while c < row_cells.len() {
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
-
-                // PASS 1: backgrounds only
-                let has_bg = cell.bg != DEFAULT_BG;
-                if has_bg {
-                    self.draw_cell_bg.color = color_to_vec4(cell.bg);
-                    self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
+                let bg = row_cells[c].bg;
+                let mut run = 1usize;
+                while c + run < row_cells.len()
+                    && row_cells[c + run].bg == bg
+                    && px + ((c + run) as f64) * cw <= rect.pos.x + rect.size.x
+                {
+                    run += 1;
                 }
-                let selected = grid.is_selected(abs_row, c);
-                if selected {
+                if bg != DEFAULT_BG {
+                    self.draw_cell_bg.color = color_to_vec4(bg);
+                    self.draw_cell_bg.draw_abs(
+                        cx, Rect { pos: dvec2(x, y), size: dvec2(cw * run as f64, ch) });
+                }
+                c += run;
+            }
+            // Selection and search highlights are almost always absent; checking the
+            // whole row once beats calling `is_selected` per cell (and scanning every
+            // highlight per cell) on every frame.
+            if has_selection {
+                let mut c = 0usize;
+                while c < row_cells.len() {
+                    if !grid.is_selected(abs_row, c) { c += 1; continue; }
+                    let start = c;
+                    while c < row_cells.len() && grid.is_selected(abs_row, c) { c += 1; }
+                    let x = px + (start as f64) * cw;
                     self.draw_cell_bg.color = vec4(0.20, 0.40, 0.65, 0.5);
-                    self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
+                    self.draw_cell_bg.draw_abs(
+                        cx, Rect { pos: dvec2(x, y), size: dvec2(cw * (c - start) as f64, ch) });
                 }
-                // Search highlight
-                for &(hr, hc, hlen) in &self.search_highlights {
-                    if abs_row == hr && c >= hc && c < hc + hlen {
-                        self.draw_cell_bg.color = vec4(0.60, 0.50, 0.10, 0.6);
-                        self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y), size: dvec2(cw, ch) });
-                    }
-                }
+            }
+            for &(hr, hc, hlen) in &self.search_highlights {
+                if hr != abs_row { continue; }
+                let end = (hc + hlen).min(row_cells.len());
+                if hc >= end { continue; }
+                let x = px + (hc as f64) * cw;
+                self.draw_cell_bg.color = vec4(0.60, 0.50, 0.10, 0.6);
+                self.draw_cell_bg.draw_abs(
+                    cx, Rect { pos: dvec2(x, y), size: dvec2(cw * (end - hc) as f64, ch) });
             }
             screen_row += 1;
         }
@@ -2979,19 +3035,48 @@ impl Widget for TermView {
                 if grid_row < grid.rows { &grid.cells[grid_row] } else { screen_row += 1; continue; }
             };
 
-            for (c, cell) in row_cells.iter().enumerate() {
-                if cell.ch == ' ' { continue; }
+            // PASS 2: text, batched into runs of the same colour. One `draw_abs` per
+            // character meant ~2000 of them per frame at 68x30 — the single biggest
+            // per-frame cost, and it grew with the column count.
+            let mut c = 0usize;
+            while c < row_cells.len() {
                 let x = px + (c as f64) * cw;
                 if x > rect.pos.x + rect.size.x { break; }
-
-                let fg = if cell.bold && cell.fg < 8 && !is_truecolor(cell.fg) { cell.fg + 8 } else { cell.fg };
+                let cell = &row_cells[c];
+                if cell.ch == ' ' || cell.ch == '\0' {
+                    c += 1;
+                    continue;
+                }
+                let fg = cell_fg(cell);
+                run_buf.clear();
+                let start = c;
+                while c < row_cells.len() {
+                    let cur = &row_cells[c];
+                    if cur.ch == ' ' || cur.ch == '\0' || cell_fg(cur) != fg {
+                        break;
+                    }
+                    if px + (c as f64) * cw > rect.pos.x + rect.size.x { break; }
+                    run_buf.push(cur.ch);
+                    c += 1;
+                }
+                if run_buf.is_empty() {
+                    c += 1;
+                    continue;
+                }
                 self.draw_text.color = color_to_vec4(fg);
-                let s = cell.ch.encode_utf8(&mut char_buf);
-                self.draw_text.draw_abs(cx, dvec2(x, y), s);
+                self.draw_text.draw_abs(cx, dvec2(x, y), &run_buf);
 
-                if cell.underline {
+                // Underline is per-cell state, but it also comes in runs.
+                let mut u = start;
+                while u < c {
+                    if !row_cells[u].underline { u += 1; continue; }
+                    let us = u;
+                    while u < c && row_cells[u].underline { u += 1; }
                     self.draw_cell_bg.color = color_to_vec4(fg);
-                    self.draw_cell_bg.draw_abs(cx, Rect { pos: dvec2(x, y + ch - 2.0), size: dvec2(cw, 1.0) });
+                    self.draw_cell_bg.draw_abs(cx, Rect {
+                        pos: dvec2(px + (us as f64) * cw, y + ch - 2.0),
+                        size: dvec2(cw * (u - us) as f64, 1.0),
+                    });
                 }
             }
             screen_row += 1;
@@ -5897,6 +5982,54 @@ mod tests {
         g.restore_cursor();
         assert_eq!(g.cur_r, 5);
         assert_eq!(g.cur_c, 10);
+    }
+
+    // ── Scrollback eviction ──
+    // The freeze: dropping the oldest row was `Vec::remove(0)` on a 5000-entry buffer,
+    // i.e. a memmove per scrolled line once it filled, run while holding the grid lock.
+
+    #[test]
+    fn test_scrollback_keeps_the_newest_rows_in_order() {
+        let mut g = new_grid(20, 3);
+        g.max_scrollback = 4;
+        for i in 0..12 {
+            g.process(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(g.scrollback.len(), 4);
+        let rows: Vec<String> = g
+            .scrollback
+            .iter()
+            .map(|r| r.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .collect();
+        // Oldest first, and everything older than the newest four has been dropped.
+        assert_eq!(rows, vec!["line6", "line7", "line8", "line9"]);
+    }
+
+    #[test]
+    fn test_recycled_row_comes_back_blank() {
+        // The new bottom row reuses an evicted allocation instead of allocating; if it
+        // were not cleared, old text would reappear at the bottom of the screen.
+        let mut g = new_grid(20, 3);
+        g.max_scrollback = 2;
+        for i in 0..10 {
+            g.process(format!("xxxx{i}\r\n").as_bytes());
+        }
+        let bottom: String = g.cells[g.rows - 1].iter().map(|c| c.ch).collect();
+        assert!(bottom.trim().is_empty(), "bottom row not blank: {bottom:?}");
+        for row in &g.cells {
+            assert_eq!(row.len(), g.cols);
+        }
+    }
+
+    #[test]
+    fn test_alt_screen_does_not_fill_the_scrollback() {
+        let mut g = new_grid(20, 3);
+        g.max_scrollback = 100;
+        g.process(b"\x1b[?1049h");
+        for i in 0..20 {
+            g.process(format!("alt{i}\r\n").as_bytes());
+        }
+        assert_eq!(g.scrollback.len(), 0);
     }
 
     // ── Search ──
