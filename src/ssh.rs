@@ -629,7 +629,7 @@ where
                     }
                 };
                 rt.block_on(async move {
-                    if let Err(e) = run_session(&profile, &mut sink, rx, &exited_worker).await {
+                    if let Err(e) = run_session(&profile, &mut sink, rx, exited_worker.clone()).await {
                         sink(format!("\r\n\x1b[31m{}\x1b[0m\r\n", e).as_bytes());
                     }
                 });
@@ -648,7 +648,9 @@ async fn run_session<S>(
     p: &SshProfile,
     sink: &mut S,
     mut rx: mpsc::UnboundedReceiver<InMsg>,
-    exited: &AtomicBool,
+    // Owned, not borrowed: the writer half runs in its own task and has to keep a
+    // handle to it (see the split below).
+    exited: Arc<AtomicBool>,
 ) -> Result<(), String>
 where
     S: FnMut(&[u8]),
@@ -673,39 +675,58 @@ where
         .await
         .map_err(|e| format!("exec tmux: {}", e))?;
 
-    loop {
-        tokio::select! {
-            msg = channel.wait() => {
-                match msg {
-                    Some(ChannelMsg::Data { data }) => sink(&data),
-                    Some(ChannelMsg::ExtendedData { data, .. }) => sink(&data),
-                    Some(ChannelMsg::ExitStatus { exit_status }) => {
-                        // The remote command finished on its own terms. Recorded before
-                        // the loop ends so the tab knows this was `exit`, not a drop.
-                        exited.store(true, Ordering::Relaxed);
-                        sink(format!("\r\n\x1b[2m[sesi berakhir, status {}]\x1b[0m\r\n", exit_status).as_bytes());
-                    }
-                    Some(ChannelMsg::Eof) | None => break,
-                    _ => {}
-                }
-            }
-            inbound = rx.recv() => {
-                match inbound {
-                    Some(InMsg::Data(d)) => {
-                        channel.data(&d[..]).await.map_err(|e| format!("write: {}", e))?;
-                    }
-                    Some(InMsg::Resize(c, r)) => {
-                        let _ = channel.window_change(c as u32, r as u32, 0, 0).await;
-                    }
-                    Some(InMsg::Close) | None => {
-                        exited.store(true, Ordering::Relaxed);
-                        let _ = channel.eof().await;
+    // Reading and writing must not share a task.
+    //
+    // They used to: one `select!` that both drained `channel.wait()` and awaited
+    // `channel.data(...)`. A write parks until the channel's send window has room, and
+    // the window only reopens when the server's WINDOW_ADJUST is processed — but russh
+    // delivers *incoming* data to this channel over a bounded queue with a blocking
+    // send, so once that queue filled (because we were parked on the write and not
+    // draining it) russh's own session loop blocked too, and neither side could move
+    // again. The socket stays up and the UI keeps painting, so it looks like a live
+    // connection that has simply stopped: nothing typed arrives, nothing comes back.
+    //
+    // Splitting the channel means a stalled write can never stop us reading, which is
+    // what lets the window reopen.
+    let (mut read_half, write_half) = channel.split();
+    let writer_exited = exited.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                InMsg::Data(d) => {
+                    if write_half.data_bytes(d).await.is_err() {
                         break;
                     }
                 }
+                InMsg::Resize(c, r) => {
+                    let _ = write_half.window_change(c as u32, r as u32, 0, 0).await;
+                }
+                InMsg::Close => {
+                    // A deliberate close, so the tab must read this as `exit` and not
+                    // as a dropped link it should redial.
+                    writer_exited.store(true, Ordering::Relaxed);
+                    let _ = write_half.eof().await;
+                    break;
+                }
             }
         }
+    });
+
+    while let Some(msg) = read_half.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => sink(&data),
+            ChannelMsg::ExtendedData { data, .. } => sink(&data),
+            ChannelMsg::ExitStatus { exit_status } => {
+                // The remote command finished on its own terms. Recorded before the
+                // loop ends so the tab knows this was `exit`, not a drop.
+                exited.store(true, Ordering::Relaxed);
+                sink(format!("\r\n\x1b[2m[sesi berakhir, status {}]\x1b[0m\r\n", exit_status).as_bytes());
+            }
+            ChannelMsg::Eof => break,
+            _ => {}
+        }
     }
+    writer.abort();
     Ok(())
 }
 
