@@ -1943,6 +1943,8 @@ struct TermGrid {
     cur_underline: bool,
     // Modes
     mouse_reporting: bool,
+    /// DECTCEM (`ESC[?25h` / `ESC[?25l`). Programs hide the caret while they redraw.
+    cursor_visible: bool,
     bracketed_paste: bool,
     app_cursor_keys: bool,
     // Response buffer (for DA, DSR replies sent back to PTY)
@@ -1985,7 +1987,7 @@ impl TermGrid {
             // config; the literal is only the fallback for `TermGrid::new` in tests.
             max_scrollback: default_scrollback(),
             cur_r: 0, cur_c: 0, cur_fg: DEFAULT_FG, cur_bg: DEFAULT_BG, cur_bold: false, cur_underline: false,
-            mouse_reporting: false, bracketed_paste: false, app_cursor_keys: false, response_buf: Vec::new(), dirty: true,
+            mouse_reporting: false, cursor_visible: true, bracketed_paste: false, app_cursor_keys: false, response_buf: Vec::new(), dirty: true,
             alt_cells: None, alt_cur_r: 0, alt_cur_c: 0, in_alt_screen: false,
             saved_cur_r: 0, saved_cur_c: 0,
             scroll_top: 0, scroll_bottom: rows.saturating_sub(1),
@@ -2385,6 +2387,9 @@ impl TermGrid {
                                                 match p {
                                                     1049 | 47 | 1047 => self.enter_alt_screen(),
                                                     1000 | 1002 | 1003 | 1006 => self.mouse_reporting = true,
+                                                    // DECTCEM. Was ignored, so a program
+                                                    // that hides the caret still got one.
+                                                    25 => self.cursor_visible = true,
                                                     2004 => self.bracketed_paste = true,
                                                     1 => self.app_cursor_keys = true, // DECCKM
                                                     12 | 25 | 1004 | 1005 | 7 => {}
@@ -2399,6 +2404,7 @@ impl TermGrid {
                                                 match p {
                                                     1049 | 47 | 1047 => self.leave_alt_screen(),
                                                     1000 | 1002 | 1003 | 1006 => self.mouse_reporting = false,
+                                                    25 => self.cursor_visible = false,
                                                     2004 => self.bracketed_paste = false,
                                                     1 => self.app_cursor_keys = false,
                                                     12 | 25 | 1004 | 1005 | 7 => {}
@@ -2667,8 +2673,6 @@ pub struct TermView {
     #[layout] layout: Layout,
     #[rust] grid_ref: Option<Arc<Mutex<TermGrid>>>,
     #[rust] scroll_offset: i64,
-    #[rust] blink_on: bool,
-    #[rust] blink_counter: u32,
     #[rust] cw: f64,
     #[rust] ch: f64,
     #[rust] cursor_block: bool,
@@ -2709,6 +2713,19 @@ const KEY_BAR_H: f64 = 81.0;
 const LONG_PRESS_SECS: f64 = 0.4;
 /// Finger travel (px) still counted as "held still" while waiting for a long press.
 const LONG_PRESS_SLOP: f64 = 12.0;
+/// Which absolute rows (scrollback followed by the screen) are visible, as `start..end`.
+///
+/// The bottom of the window is the bottom of the *screen*. It used to be the cursor's
+/// row — `sb_len + cur_r + 1` — which meant every row below the caret was never drawn:
+/// a tmux status bar, the bottom border and hint line of an input box, the rest of a
+/// full-screen program. It also left the caret painted on whichever row happened to be
+/// drawn last rather than on its own, so moving through a long wrapped line (or
+/// backspacing, which unwraps it) made the caret jump somewhere else or vanish.
+fn view_window(sb_len: usize, rows: usize, view_rows: usize, scroll_offset: usize) -> (usize, usize) {
+    let end = (sb_len + rows).saturating_sub(scroll_offset);
+    (end.saturating_sub(view_rows), end)
+}
+
 /// Foreground a cell is actually drawn in: bold brightens the eight base colours, the
 /// way every terminal does. Runs are batched by this value, not by `cell.fg`, so two
 /// cells that only differ in a flag that does not change the colour stay in one run.
@@ -2939,8 +2956,7 @@ impl Widget for TermView {
         // Build all rows: scrollback + visible
         let sb = &grid.scrollback;
         let sb_len = sb.len();
-        let vis_last = grid.cur_r;
-        let total_rows = sb_len + vis_last + 1;
+        let total_rows = sb_len + grid.rows;
 
         // How many rows fit in window
         let view_rows = ((rect.size.y - pad_y * 2.0) / ch) as usize;
@@ -2951,9 +2967,8 @@ impl Widget for TermView {
             self.scroll_offset = self.scroll_offset.min(max_scroll);
         }
 
-        // Which rows to show (from bottom - scroll_offset)
-        let end_row = total_rows.saturating_sub(self.scroll_offset as usize);
-        let start_row = end_row.saturating_sub(view_rows);
+        let (start_row, end_row) =
+            view_window(sb_len, grid.rows, view_rows, self.scroll_offset as usize);
 
         let px = rect.pos.x + pad_x;
         let py = rect.pos.y + pad_y;
@@ -3082,16 +3097,21 @@ impl Widget for TermView {
             screen_row += 1;
         }
 
-        // Blinking cursor
-        self.blink_counter += 1;
-        if self.blink_counter % 15 == 0 { self.blink_on = !self.blink_on; }
-
-        if self.scroll_offset == 0 && self.blink_on {
-            let cursor_y = py + (screen_row.saturating_sub(1usize) as f64) * ch;
-            let cursor_x = px + (grid.cur_c as f64) * cw;
-            self.draw_cursor.color = vec4(0.345, 0.608, 0.976, 0.8);
-            let cursor_w = if self.cursor_block { cw } else { 2.0 };
-            self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(cursor_w, ch) });
+        // Steady caret. It used to blink on a counter of *frames drawn*, but an idle
+        // terminal only repaints twice a second — that is the optimisation that keeps
+        // the phone from burning a core — so each phase lasted about 7.5 seconds and
+        // the caret simply looked gone. Blinking properly would mean repainting far
+        // more often; a caret that is always there is better on a phone anyway.
+        if self.scroll_offset == 0 && grid.cursor_visible {
+            // On the caret's own row, not on whatever was drawn last.
+            let cursor_abs = sb_len + grid.cur_r;
+            if cursor_abs >= start_row && cursor_abs < end_row {
+                let cursor_y = py + ((cursor_abs - start_row) as f64) * ch;
+                let cursor_x = px + (grid.cur_c as f64) * cw;
+                self.draw_cursor.color = vec4(0.345, 0.608, 0.976, 0.8);
+                let cursor_w = if self.cursor_block { cw } else { 2.0 };
+                self.draw_cursor.draw_abs(cx, Rect { pos: dvec2(cursor_x, cursor_y), size: dvec2(cursor_w, ch) });
+            }
         }
 
         // Focus border indicator (thin colored line on focused pane edge)
@@ -5982,6 +6002,55 @@ mod tests {
         g.restore_cursor();
         assert_eq!(g.cur_r, 5);
         assert_eq!(g.cur_c, 10);
+    }
+
+    // ── Caret ──
+
+    #[test]
+    fn test_cursor_visibility_follows_dectcem() {
+        let mut g = new_grid(20, 5);
+        assert!(g.cursor_visible, "a fresh terminal shows its caret");
+        g.process(b"\x1b[?25l");
+        assert!(!g.cursor_visible);
+        g.process(b"\x1b[?25h");
+        assert!(g.cursor_visible);
+    }
+
+    #[test]
+    fn test_dectcem_does_not_disturb_other_private_modes() {
+        // `?25` sits next to `?1049` and `?1000` in the same parser arm; make sure
+        // adding it did not shift what those do.
+        let mut g = new_grid(20, 5);
+        g.process(b"\x1b[?25l");
+        assert!(!g.in_alt_screen);
+        assert!(!g.mouse_reporting);
+        g.process(b"\x1b[?1049h\x1b[?1000h");
+        assert!(g.in_alt_screen);
+        assert!(g.mouse_reporting);
+        assert!(!g.cursor_visible, "alt screen must not silently re-show the caret");
+    }
+
+    // ── Visible-row window ──
+
+    #[test]
+    fn test_view_window_shows_the_whole_screen() {
+        // 30-row screen, nothing scrolled off, a 30-row viewport: the window is the
+        // screen. It used to end at the cursor's row, so with the caret at row 10
+        // everything from row 11 down — a tmux status bar, the bottom of an input
+        // box — was never drawn.
+        assert_eq!(view_window(0, 30, 30, 0), (0, 30));
+        assert_eq!(view_window(100, 30, 30, 0), (100, 130));
+    }
+
+    #[test]
+    fn test_view_window_scrolls_into_the_scrollback() {
+        // Scrolling back moves both ends up by the offset.
+        assert_eq!(view_window(100, 30, 30, 10), (90, 120));
+        // A viewport taller than the screen pulls in scrollback above it.
+        assert_eq!(view_window(100, 30, 40, 0), (90, 130));
+        // Nothing to scroll into: the window clamps at the start rather than wrapping.
+        assert_eq!(view_window(0, 30, 40, 0), (0, 30));
+        assert_eq!(view_window(0, 5, 30, 99), (0, 0));
     }
 
     // ── Scrollback eviction ──
