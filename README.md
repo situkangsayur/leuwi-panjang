@@ -3,12 +3,26 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.12
+## Download — v0.1.13
 
-- **[⬇ leuwipanjang_v0.1.12.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.12.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.13.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.13.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
 ~59 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.13
+
+**"Connected but frozen": nothing can be typed.** A different hang from 0.1.11, and not
+in the screen at all. Reading and writing shared one loop: a write parks until the SSH
+send window reopens, and russh hands incoming data to the channel over a bounded queue
+with a blocking send — so the parked write stopped us draining, the full queue stopped
+russh's session loop, and the message that would have reopened the send window was never
+processed. Both directions stop while the socket stays up, which is why it looks alive.
+The channel is split now, so a stalled write can never stop the reads.
+
+Proved by a regression test against a local sshd: a command that floods output and never
+reads stdin, then 8 MB pushed at it. On the old loop output stops at exactly the same
+byte count (126879 before the write and after); with the split, 6.4 MB more arrives.
 
 ## What's new in 0.1.12
 
