@@ -1053,7 +1053,7 @@ impl Repl {
             "  help           tampilkan bantuan ini\r\n",
             "\x1b[2mperintah lain diteruskan ke /system/bin/sh (non-interaktif)\x1b[0m\r\n",
             "\r\n\x1b[2mtombol layar:\x1b[0m\r\n",
-            "  ⇧Tab          Shift+Tab (mundur di menu Claude/TUI)\r\n",
+            "  Shift+Tab     mundur di menu Claude/TUI\r\n",
             "  Gulir         masuk mode gulir tmux (Esc untuk keluar)\r\n",
             "  PgUp/PgDn     naik/turun satu layar\r\n",
             "  A− / A+       perkecil/perbesar huruf (menambah kolom)\r\n",
@@ -3475,13 +3475,27 @@ live_design! {
                         // Claude Code and most TUIs cycle backwards with Shift+Tab, which
                         // the Android soft keyboard cannot produce at all. CSI Z is the
                         // back-tab every terminal sends for it.
-                        k_stab = <KeyBtn> { text: "⇧Tab" }
+                        //
+                        // Spelled out rather than "⇧Tab": the ⇧ glyph is the standard
+                        // Shift mark but it does not read as one — it was taken for "a
+                        // second Tab key with an arrow on it", and the Shift the user
+                        // was looking for seemed to be missing. Smaller type so the
+                        // longer label still fits the key.
+                        k_stab = <KeyBtn> {
+                            text: "Shift+Tab"
+                            // Small enough that the whole word fits inside the key at
+                            // phone width — at 8.0 the final letter was clipped.
+                            draw_text: { text_style: { font_size: 7.0 } }
+                            padding: { left: 1, right: 1, top: 4, bottom: 4 }
+                        }
                         k_ctrl = <KeyBtn> { text: "Ctrl" }
                         k_alt = <KeyBtn> { text: "Alt" }
-                        k_left = <KeyBtn> { text: "←" }
-                        k_down = <KeyBtn> { text: "↓" }
-                        k_up = <KeyBtn> { text: "↑" }
-                        k_right = <KeyBtn> { text: "→" }
+                        // The arrows need far less room than a word, and giving it back
+                        // is what lets "Shift+Tab" fit on the same row.
+                        k_left = <KeyBtn> { width: 30, text: "←" }
+                        k_down = <KeyBtn> { width: 30, text: "↓" }
+                        k_up = <KeyBtn> { width: 30, text: "↑" }
+                        k_right = <KeyBtn> { width: 30, text: "→" }
                     }
                     <View> {
                         width: Fill, height: Fit, flow: Right, spacing: 3
