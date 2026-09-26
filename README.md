@@ -3,12 +3,28 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.10
+## Download — v0.1.11
 
-- **[⬇ leuwipanjang_v0.1.10.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.10.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.11.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.11.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
 ~59 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.11
+
+**The freeze.** Every line scrolling off the top dropped the oldest row with
+`Vec::remove(0)` on a 5000-entry buffer — a ~120 KB memmove *per line*, plus a row
+allocation. It costs nothing until the buffer fills, which is why the app ran fine for a
+while and then locked up, and it runs on the SSH reader thread while it holds the grid
+lock, so the UI thread could not paint. Eviction is O(1) now and the evicted row is
+recycled, so a scrolled line costs no memmove and no allocation.
+
+Drawing was one call per *character* — about 2000 a frame at 68 columns, against ~760 at
+23. That is why 0.1.10, whose whole point was more columns, froze sooner. Runs of the
+same colour now draw in one call, and the same for backgrounds and highlights.
+
+Load test against a real SSH+tmux session: 400,000 lines streaming while commands were
+typed into the same session — still responsive, no ANR, memory flat at ~185 MB.
 
 ## What's new in 0.1.10
 
