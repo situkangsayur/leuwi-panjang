@@ -3,12 +3,19 @@
 SSH + tmux client for a remote dev box (arm64-v8a). Each terminal tab is its own
 tmux session, with an on-screen modifier bar, vertical tabs and drag-to-scroll.
 
-## Download — v0.1.13
+## Download — v0.1.14
 
-- **[⬇ leuwipanjang_v0.1.13.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.13.apk)** (versioned)
+- **[⬇ leuwipanjang_v0.1.14.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang_v0.1.14.apk)** (versioned)
 - **[⬇ leuwipanjang.apk](https://github.com/situkangsayur/leuwi-panjang/raw/apk/leuwipanjang.apk)** (always latest)
 
 ~59 MB · `com.situkangsayur.leuwipanjang` · arm64-v8a · minSdk 29
+
+## What's new in 0.1.14
+
+- **The Shift+Tab key says so.** It has been on the key bar since 0.1.10, labelled
+  `⇧Tab` — the standard Shift mark, but on a phone key bar it reads as a second Tab key
+  with an arrow, so the Shift people went looking for seemed to be missing. It is spelled
+  out now; the arrow keys give up a little width to make room.
 
 ## What's new in 0.1.13
 
